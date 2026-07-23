@@ -1,0 +1,69 @@
+installation:
+  version: 6.10.0
+  installDate: 2026-07-19T11:22:09.906Z
+  lastUpdated: 2026-07-23T01:58:06.483Z
+modules:
+  - name: core
+    version: 6.10.0
+    installDate: 2026-07-19T11:22:09.294Z
+    lastUpdated: 2026-07-23T01:58:06.476Z
+    source: built-in
+    npmPackage: null
+    repoUrl: null
+  - name: bmm
+    version: 6.10.0
+    installDate: 2026-07-19T11:22:09.266Z
+    lastUpdated: 2026-07-23T01:58:06.477Z
+    source: built-in
+    npmPackage: null
+    repoUrl: null
+  - name: bmad-loop
+    version: main
+    installDate: 2026-07-19T11:22:09.303Z
+    lastUpdated: 2026-07-23T01:58:06.479Z
+    source: external
+    npmPackage: null
+    repoUrl: https://github.com/bmad-code-org/bmad-loop
+    channel: next
+    sha: cd125260a23e8ec72d577d307b6b885292090667
+  - name: tea
+    version: main
+    installDate: 2026-07-19T11:22:09.570Z
+    lastUpdated: 2026-07-23T01:58:06.480Z
+    source: external
+    npmPackage: bmad-method-test-architecture-enterprise
+    repoUrl: https://github.com/bmad-code-org/bmad-method-test-architecture-enterprise
+    channel: next
+    sha: f3efa5527822a8370c8ac5bf0f581bb248c93a21
+  - name: bmb
+    version: main
+    installDate: 2026-07-19T11:22:09.619Z
+    lastUpdated: 2026-07-23T01:58:06.481Z
+    source: external
+    npmPackage: bmad-builder
+    repoUrl: https://github.com/bmad-code-org/bmad-builder
+    channel: next
+    sha: e6935f2776c34ffd9b18f4ef1e334584ef10a50f
+  - name: cis
+    version: main
+    installDate: 2026-07-19T11:22:09.631Z
+    lastUpdated: 2026-07-23T01:58:06.482Z
+    source: external
+    npmPackage: bmad-creative-intelligence-suite
+    repoUrl: https://github.com/bmad-code-org/bmad-module-creative-intelligence-suite
+    channel: next
+    sha: 07a8dd03d196a762f21c241d985293fe5b0f90e7
+  - name: wds
+    version: main
+    installDate: 2026-07-19T11:22:09.844Z
+    lastUpdated: 2026-07-23T01:58:06.483Z
+    source: external
+    npmPackage: bmad-wds
+    repoUrl: https://github.com/bmad-code-org/bmad-method-wds-expansion
+    channel: next
+    sha: cc16f09fcfab26d35635af1491f36a38a8431c8d
+ides:
+  - claude-code
+  - codex
+  - kimi-code
+  - zcode

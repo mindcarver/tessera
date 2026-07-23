@@ -1,0 +1,8 @@
+# Seed fixture directory for the Claude Code Provider adapter (AD-3/AD-14).
+#
+# Epic 2 fills this with the Claude Code Supported Artifact Matrix fixtures:
+#   ~/.claude/projects/<project>/memory/ MEMORY.md + topic Markdown.
+#
+# Fixture content is local and desensitized — never live Agent Memory body
+# (AD-12/NFR-1). Phase 0 only reserves the path so the architecture-spine
+# contract anchor exists.

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Forge Report · User-owned Agent Memory Explorer</title>
+  <style>
+    :root { color-scheme: dark; --ink:#f3eadc; --muted:#b9ab98; --panel:#171512; --line:#3a3128; --gold:#d8a84e; --red:#8f2f2f; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:#0e0d0b; color:var(--ink); font:16px/1.65 ui-sans-serif,system-ui,-apple-system,"PingFang SC",sans-serif; }
+    main { width:min(980px,calc(100% - 32px)); margin:40px auto 72px; }
+    header { display:grid; grid-template-columns:1fr 190px; gap:28px; align-items:center; padding:34px; border:1px solid var(--line); background:linear-gradient(145deg,#211c16,var(--panel)); border-radius:22px; }
+    h1 { margin:0 0 10px; font:700 clamp(32px,5vw,58px)/1.05 ui-serif,Georgia,serif; }
+    .subtitle { margin:0; color:var(--muted); max-width:650px; }
+    .seal { width:170px; height:170px; justify-self:end; filter:drop-shadow(0 8px 22px #0008); }
+    section { margin-top:20px; padding:26px 30px; border:1px solid var(--line); background:var(--panel); border-radius:18px; }
+    h2 { margin:0 0 14px; font-size:20px; color:var(--gold); }
+    ul { margin:0; padding-left:20px; }
+    li + li { margin-top:8px; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:20px; }
+    .flow { display:flex; flex-wrap:wrap; align-items:center; gap:10px; color:#efe2cc; }
+    .flow span { padding:8px 12px; border:1px solid #564737; background:#211c17; border-radius:999px; }
+    .flow b { color:var(--gold); }
+    .weak { border-color:#633d32; }
+    .people { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .person { padding:14px; background:#201c18; border-radius:12px; }
+    .person strong { display:block; }
+    .person small { color:var(--muted); }
+    footer { margin-top:18px; color:var(--muted); text-align:center; font-size:13px; }
+    @media (max-width:700px) { header { grid-template-columns:1fr; } .seal { justify-self:start; } .grid,.people { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>User-owned Agent<br>Memory Explorer</h1>
+      <p class="subtitle">跨 Codex、Claude Code、Hermes 与 OpenClaw 的本地只读记忆资产盘点、可视化与统一搜索。</p>
+    </div>
+    <svg class="seal" viewBox="0 0 200 200" role="img" aria-label="HARDENED seal">
+      <defs><path id="ring" d="M100,100 m-70,0 a70,70 0 1,1 140,0 a70,70 0 1,1 -140,0"/></defs>
+      <circle cx="100" cy="100" r="88" fill="#7a2828" stroke="#d8a84e" stroke-width="5"/>
+      <circle cx="100" cy="100" r="68" fill="none" stroke="#e4bd72" stroke-width="2" stroke-dasharray="3 5"/>
+      <text fill="#f8e6c2" font-size="18" font-weight="800" letter-spacing="2"><textPath href="#ring" startOffset="7%">BMAD · FORGE IDEA · 2026-07-20 ·</textPath></text>
+      <text x="100" y="94" text-anchor="middle" fill="#fff0d1" font-size="25" font-weight="900">HARDENED</text>
+      <text x="100" y="119" text-anchor="middle" fill="#e4bd72" font-size="12" letter-spacing="2">LOCAL FIRST</text>
+    </svg>
+  </header>
+
+  <section>
+    <h2>最终判断</h2>
+    <p>方向成立，但首版不是“完整 Brain OS”。可构建的切口是一个本地只读的 Agent Memory Explorer：先让用户看见、理解并搜索已经散落在多个 Agent 中的记忆资产，再决定如何治理和迁移。</p>
+  </section>
+
+  <div class="grid">
+    <section>
+      <h2>锁定的产品原则</h2>
+      <ul>
+        <li>Agent 可替换，用户数据不可被 Agent 厂商绑住。</li>
+        <li>兼容不同记忆方式，不强制统一后端或分类。</li>
+        <li>本地服务 + 本地 Web UI，内容默认不上云。</li>
+        <li>原始聊天是事件，不是默认记忆资产。</li>
+        <li>跨域默认隔离，个人核心才可默认共享。</li>
+      </ul>
+    </section>
+    <section>
+      <h2>MVP 明确排除</h2>
+      <ul>
+        <li>不修改、删除、回写原始记忆。</li>
+        <li>不做聊天记录搜索。</li>
+        <li>不自动生成总结答案。</li>
+        <li>不自动裁决冲突。</li>
+        <li>不做云端托管或全量迁移。</li>
+      </ul>
+    </section>
+  </div>
+
+  <section>
+    <h2>Aha 闭环</h2>
+    <div class="flow">
+      <span>自动发现</span><b>→</b><span>用户确认</span><b>→</b><span>只读索引</span><b>→</b><span>搜索真实项目</span><b>→</b><span>看到多个 Agent 的带出处记忆</span>
+    </div>
+  </section>
+
+  <section class="weak">
+    <h2>仍需实证的弱点</h2>
+    <ul>
+      <li>四类 Agent 的真实记忆位置、格式、权限与稳定读取方式尚需逐一审计。</li>
+      <li>“全部记忆”必须以连接器实际能力声明为准，不能先承诺完整覆盖。</li>
+      <li>纯索引不能提供供应商退出保障；可导出归档属于下一阶段的关键设计。</li>
+      <li>需要用真实用户数据证明统一搜索比文件搜索带来足够明显的价值。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>压力测试角色</h2>
+    <div class="people">
+      <div class="person"><strong>📋 John · 产品经理</strong><small>追问高频用户任务与购买理由，区分产品价值和技术机制。</small></div>
+      <div class="person"><strong>🏗️ Winston · 系统架构师</strong><small>检验隔离、作用域、可替换性与最小稳定内核。</small></div>
+      <div class="person"><strong>📊 Mary · 业务分析师</strong><small>把“另一个知识库”改写为跨源发现和统一可见性。</small></div>
+      <div class="person"><strong>🚢 Dana · 务实派</strong><small>砍掉首版写入与治理，把范围压缩为可交付只读闭环。</small></div>
+      <div class="person"><strong>🎨 Sally · UX 设计师</strong><small>确立自动发现、用户确认和手动连接器的接入体验。</small></div>
+      <div class="person"><strong>💻 Amelia · 工程师</strong><small>要求先审计真实数据源，拒绝凭假设统一四类 Agent。</small></div>
+      <div class="person"><strong>🧪 Murat · 测试架构师</strong><small>把“能对接”转成可复现、可验收的 Aha 场景。</small></div>
+      <div class="person"><strong>🧳 数据迁移架构师 · 生成角色</strong><small>指出仅能搜索但不能归档时，仍无法真正抵御供应商退出风险。</small></div>
+    </div>
+  </section>
+
+  <footer>BMAD Forge Idea · Outcome: HARDENED · Tessera</footer>
+</main>
+</body>
+</html>

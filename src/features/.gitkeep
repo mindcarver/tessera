@@ -1,0 +1,14 @@
+/**
+ * `features` — feature-sliced UI surfaces (Phase 0 seed).
+ *
+ * Phase 0 leaves this directory empty; it is reserved so the architecture-
+ * spine structural seed exists on disk. Later Stories populate it:
+ *   - `features/inventory`  (1.2/1.3/1.8): Source Inventory + Health.
+ *   - `features/search`     (1.6): keyword search + result cards.
+ *   - `features/browse`     (1.7): open original memory location.
+ *   - `features/projects`   (later): Tessera Project mapping UI.
+ *
+ * Every feature slice consumes the typed API client in `src/api` and never
+ * touches Providers, the filesystem, or SQLite directly (AD-1).
+ */
+export {};

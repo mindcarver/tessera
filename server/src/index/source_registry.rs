@@ -1,0 +1,248 @@
+//! `index::source_registry` — persistence for confirmed / rejected / disabled
+//! Sources (Story 1.3).
+//!
+//! The registry is the persistence layer over the `source_registry` SQLite
+//! table (created by migration id `2`). It owns row ↔ [`Source`] mapping and
+//! the `source_id` (`src_<rowid>`) <-> rowid translation. Application code
+//! never sees the raw rowid; IPC never sees the fingerprint.
+//!
+//! Architecture invariants honoured (AD-33/AD-35):
+//! - **Exact-match by fingerprint.** [`SourceRegistry::find_by_fingerprint`]
+//!   is an equality lookup against the unique index. No fuzzy merge: a path
+//!   or inode change produces a different fingerprint and therefore a
+//!   different row.
+//! - **AUTOINCREMENT rowid → stable handle.** `source_id = src_<id>`; the id
+//!   is never reused, so a deleted Source's handle cannot be reattached to a
+//!   different row by accident (no remove command ships in 1.3 — A-7).
+//! - **No content reads.** Every method here is pure SQL over the registry
+//!   table; the Source filesystem is never touched (NFR-1/NFR-5).
+//!
+//! The registry is intentionally lock-free: the IPC layer holds the
+//! `IndexState { conn: Mutex<Connection> }` and hands the registry a `&Connection`
+//! for the duration of a single command. 1.3 commands are synchronous (no
+//! `.await`), so the existing std Mutex is correct; a tokio Mutex becomes
+//! necessary only when the first async DB command lands (1.4 deferred item).
+
+use rusqlite::{params, Connection, Row};
+
+use crate::domain::ports::provider_adapter::CoverageLevel;
+use crate::domain::source::{
+    HealthState, Source, SourceFingerprint, SourceId, SourceKind, SourceLifecycle,
+};
+
+/// SQL columns for the `source_registry` table, in the order the row mapper
+/// reads them. Centralized so every query stays in lock-step with the schema.
+const SELECT_COLS: &str = concat!(
+    "id, provider, source_kind, lifecycle_state, health_state, ",
+    "coverage_level, normalized_root_path, fingerprint, native_project"
+);
+
+/// The Source Registry. Borrows the Derived Index connection for its lifetime;
+/// the borrow is bounded by the IPC command's hold of the `IndexState` mutex.
+#[derive(Debug)]
+pub struct SourceRegistry<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> SourceRegistry<'a> {
+    /// Construct a registry view over a connection. The connection must have
+    /// had migration `v1_source_registry` applied (the boot path in `lib.rs`
+    /// guarantees this for the live app; tests use a fresh in-memory DB with
+    /// [`crate::index::migrations::apply`]).
+    pub fn new(conn: &'a Connection) -> Self {
+        SourceRegistry { conn }
+    }
+
+    /// Look up a Source by its fingerprint. Returns `Ok(None)` when no row has
+    /// this fingerprint (AD-35 exact match — no fuzzy merge). The unique index
+    /// guarantees at most one row. A DB error surfaces as `Err(_)` so the
+    /// application layer can map it to `internal`.
+    pub fn find_by_fingerprint(
+        &self,
+        fingerprint: &SourceFingerprint,
+    ) -> rusqlite::Result<Option<Source>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {SELECT_COLS} FROM source_registry WHERE fingerprint = ?1"))?;
+        let mut rows = stmt.query(params![fingerprint.0])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_source(row))),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert a new Source row, returning the materialized [`Source`] with its
+    /// allocated `source_id`. Caller supplies all domain fields. The
+    /// `fingerprint` must be unique (enforced by the unique index; a duplicate
+    /// insert surfaces as a constraint error). Use [`Self::find_by_fingerprint`]
+    /// first to implement idempotent confirm/reject.
+    ///
+    /// `last_insert_rowid()` is the SQLite function that returns the
+    /// AUTOINCREMENT id of the just-inserted row; rusqlite exposes it via
+    /// [`Connection::last_insert_rowid`].
+    pub fn upsert_by_fingerprint(
+        &self,
+        fields: &SourceInsert<'_>,
+    ) -> rusqlite::Result<Source> {
+        self.conn.execute(
+            "INSERT INTO source_registry
+                (provider, source_kind, lifecycle_state, health_state, coverage_level,
+                 normalized_root_path, fingerprint, native_project)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                fields.provider,
+                fields.source_kind.as_str(),
+                lifecycle_to_str(fields.lifecycle_state),
+                fields.health_state.as_str(),
+                coverage_to_str(fields.coverage_level),
+                fields.normalized_root_path,
+                fields.fingerprint.0,
+                fields.native_project,
+            ],
+        )?;
+        let rowid = self.conn.last_insert_rowid();
+        // Re-read the row so the returned Source is exactly what is persisted
+        // (no risk of drift between caller-supplied fields and DB state).
+        self.get_by_rowid(rowid)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    /// Flip a Source's lifecycle state. Returns `Ok(Some(updated))` on success,
+    /// `Ok(None)` when the `source_id` does not match any row. Used by confirm
+    /// (wake-up path), reject, and disable.
+    pub fn set_lifecycle(
+        &self,
+        source_id: &SourceId,
+        target: SourceLifecycle,
+    ) -> rusqlite::Result<Option<Source>> {
+        let Some(rowid) = source_id.to_rowid() else {
+            return Ok(None);
+        };
+        let updated = self.conn.execute(
+            "UPDATE source_registry SET lifecycle_state = ?1 WHERE id = ?2",
+            params![lifecycle_to_str(target), rowid],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        self.get_by_rowid(rowid)
+    }
+
+    /// Fetch a Source by its `source_id`. Returns `Ok(None)` when the id does
+    /// not match any row (e.g. unknown id passed to `disable_source`).
+    pub fn get(&self, source_id: &SourceId) -> rusqlite::Result<Option<Source>> {
+        match source_id.to_rowid() {
+            Some(rowid) => self.get_by_rowid(rowid),
+            None => Ok(None),
+        }
+    }
+
+    /// List every Source row, ordered by id for stable UI ordering. Used by
+    /// `list_sources`.
+    pub fn list(&self) -> rusqlite::Result<Vec<Source>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {SELECT_COLS} FROM source_registry ORDER BY id ASC"))?;
+        // `query_map` requires a `FnMut(&Row) -> Result<T>` closure; wrap the
+        // infallible mapper so the signature matches.
+        let rows = stmt.query_map([], |row| Ok(row_to_source(row)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn get_by_rowid(&self, rowid: i64) -> rusqlite::Result<Option<Source>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {SELECT_COLS} FROM source_registry WHERE id = ?1"))?;
+        let mut rows = stmt.query(params![rowid])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_source(row))),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Fields needed to insert a new Source row. Kept as a borrowed-arg struct so
+/// callers do not have to construct a full [`Source`] (which would require
+/// inventing a `source_id` that only the DB can allocate).
+#[derive(Debug, Clone)]
+pub struct SourceInsert<'a> {
+    pub provider: &'a str,
+    pub source_kind: SourceKind,
+    pub lifecycle_state: SourceLifecycle,
+    pub health_state: HealthState,
+    pub coverage_level: CoverageLevel,
+    pub normalized_root_path: &'a str,
+    pub fingerprint: &'a SourceFingerprint,
+    pub native_project: Option<&'a str>,
+}
+
+/// Map a `rusqlite::Row` into a [`Source`]. Field order MUST match
+/// [`SELECT_COLS`]. Returns `Source` directly (not `Result`) so it can be used
+/// with both `query_map` (which wraps it in `Result` via the closure) and
+/// manual `next()`.
+fn row_to_source(row: &Row<'_>) -> Source {
+    // Columns (per SELECT_COLS): id, provider, source_kind, lifecycle_state,
+    // health_state, coverage_level, normalized_root_path, fingerprint,
+    // native_project.
+    let rowid: i64 = row.get_unwrap(0);
+    let provider: String = row.get_unwrap(1);
+    let source_kind: String = row.get_unwrap(2);
+    let lifecycle_state: String = row.get_unwrap(3);
+    let health_state: String = row.get_unwrap(4);
+    let coverage_level: String = row.get_unwrap(5);
+    let normalized_root_path: String = row.get_unwrap(6);
+    let fingerprint: String = row.get_unwrap(7);
+    let native_project: Option<String> = row.get_unwrap(8);
+
+    Source {
+        source_id: SourceId::from_rowid(rowid),
+        provider,
+        source_kind: SourceKind::parse_str(&source_kind).unwrap_or(SourceKind::AgentMemory),
+        lifecycle_state: lifecycle_from_str(&lifecycle_state).unwrap_or(SourceLifecycle::Confirmed),
+        health_state: HealthState::parse_str(&health_state).unwrap_or(HealthState::Unknown),
+        coverage_level: coverage_from_str(&coverage_level).unwrap_or(CoverageLevel::Full),
+        normalized_root_path,
+        native_project,
+        fingerprint: SourceFingerprint(fingerprint),
+    }
+}
+
+fn lifecycle_to_str(state: SourceLifecycle) -> &'static str {
+    match state {
+        SourceLifecycle::Confirmed => "confirmed",
+        SourceLifecycle::Disabled => "disabled",
+        SourceLifecycle::Rejected => "rejected",
+    }
+}
+
+fn lifecycle_from_str(s: &str) -> Option<SourceLifecycle> {
+    match s {
+        "confirmed" => Some(SourceLifecycle::Confirmed),
+        "disabled" => Some(SourceLifecycle::Disabled),
+        "rejected" => Some(SourceLifecycle::Rejected),
+        _ => None,
+    }
+}
+
+fn coverage_to_str(level: CoverageLevel) -> &'static str {
+    match level {
+        CoverageLevel::Full => "full",
+        CoverageLevel::SearchOnly => "search_only",
+        CoverageLevel::ExistenceOnly => "existence_only",
+        CoverageLevel::Unsupported => "unsupported",
+    }
+}
+
+fn coverage_from_str(s: &str) -> Option<CoverageLevel> {
+    match s {
+        "full" => Some(CoverageLevel::Full),
+        "search_only" => Some(CoverageLevel::SearchOnly),
+        "existence_only" => Some(CoverageLevel::ExistenceOnly),
+        "unsupported" => Some(CoverageLevel::Unsupported),
+        _ => None,
+    }
+}

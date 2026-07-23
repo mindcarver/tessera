@@ -1,0 +1,496 @@
+//! `adapters::codex` — Codex Provider adapter.
+//!
+//! Story 1.2 ships the **discovery slice** of the Codex adapter: it resolves
+//! the local Codex Agent Memory root and reports whether that root appears to
+//! exist. It does NOT read memory content (NFR-5), does NOT enumerate files
+//! (Story 1.5), and does NOT canonicalize the root or allocate `source_id`
+//! (Story 1.3). The Codex data boundary is enforced by the Supported Artifact
+//! Matrix (AD-11): transcripts, session JSONL and human-authored rule files
+//! are out of scope here — at discovery time we only check the *memories
+//! directory* exists, and even then we do not look at what is inside.
+//!
+//! ## `CODEX_HOME` priority
+//!
+//! Per spec I/O matrix:
+//! - If `CODEX_HOME` is set AND non-empty (after trimming whitespace), probe
+//!   `$CODEX_HOME/memories` only. Do NOT fall back to `~/.codex/memories` — an
+//!   explicit `CODEX_HOME` means the user has relocated their Codex home and
+//!   silently double-reporting the default location would violate capability
+//!   honesty (AD-3) and produce a misleading candidate list. An explicit but
+//!   invalid `CODEX_HOME` (relative, or pointing at a missing/non-dir path)
+//!   yields no candidate rather than a silent fallback.
+//! - Otherwise probe `$HOME/.codex/memories`.
+//! - Empty / whitespace-only values are treated as "unset" (Design Notes).
+//!
+//! ## Root validity
+//!
+//! A candidate root must be an **absolute**, **existing directory** with a
+//! **UTF-8** path:
+//! - Absolute: a relative `CODEX_HOME`/`HOME` would resolve against the
+//!   process CWD and produce a candidate whose root drifts between launches.
+//!   `ponytail:` roots are absolute by nature; reject relative rather than
+//!   emit CWD-dependent candidates.
+//! - Directory (`is_dir`, not `exists`): a regular file named `memories` is
+//!   not a usable root, and a broken symlink correctly reports false. A
+//!   symlink-to-dir is followed and accepted.
+//! - UTF-8: a non-UTF-8 root would stringify to `U+FFFD` replacement chars —
+//!   a display path that does not exist on disk and cannot be confirmed in
+//!   1.3. Drop rather than emit garbage.
+//!
+//! ## Testability
+//!
+//! Path resolution is factored into [`resolve_codex_memories_root`] as a pure
+//! function of `(codex_home, home)` — no env reads. Discovery is factored into
+//! [`CodexAdapter::discover_with_env`], which takes the same injected values
+//! and runs the full path (resolver → directory check → candidate
+//! construction). Both are deliberate: under `cargo test`'s parallel executor
+//! `std::env::set_var` races other tests and is `unsafe` on edition 2024, so
+//! tests inject tempdir paths directly and exercise the adapter's own code
+//! (not a test-local mirror of it). `discover()` is three steps of glue: read
+//! env → `discover_with_env`.
+
+use std::env;
+use std::path::{Path, PathBuf};
+
+use crate::domain::ports::provider_adapter::{
+    CandidateSource, CoverageLevel, DiscoveryBasis, EnumerateError, FileUnit, ProviderAdapter,
+};
+
+/// Codex Provider adapter (Story 1.2 discovery slice; Story 1.4 adds the
+/// enumeration slice).
+///
+/// Unit struct — both slices are stateless. The adapter reads provider files
+/// but never writes them (NFR-1 zero-write); enumeration reads metadata only,
+/// never body content (NFR-5).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CodexAdapter;
+
+const PROVIDER_ID: &str = "codex";
+
+/// The three known first-level filenames in the Supported Artifact Matrix
+/// (AD-11). Only these exact names at the root's first level are indexed;
+/// everything else at the first level is skipped.
+const KNOWN_ROOT_FILES: &[&str] = &["MEMORY.md", "memory_summary.md", "raw_memories.md"];
+
+/// The one directory whose direct `*.md` children are indexed (AD-11). Only
+/// direct children (one level, not recursive) are considered.
+const ROLLOUT_SUMMARIES_DIR: &str = "rollout_summaries";
+
+impl ProviderAdapter for CodexAdapter {
+    fn provider_id(&self) -> &'static str {
+        PROVIDER_ID
+    }
+
+    fn coverage_level(&self) -> CoverageLevel {
+        // Codex's memories root is a local directory tree that the adapter
+        // will be able to enumerate in full once `enumerate` lands in Story
+        // 1.5. Declaring `Full` here is honest capability disclosure (AD-3 /
+        // AD-18): it describes the *provider surface*, not the slice that
+        // ships in this Story. The actual enumeration implementation belongs
+        // to 1.5; declaring Full now does not bypass that — the trait only
+        // grows the discovery slice in 1.2.
+        CoverageLevel::Full
+    }
+
+    fn discover(&self) -> Vec<CandidateSource> {
+        // Three-step glue (Design Notes): read env → injected-env discover.
+        // All input validation (trim, absolute) lives in the resolver; all FS
+        // checks + candidate building live in `candidate_if_existing_dir`.
+        // `discover_with_env` is the testable seam tests drive directly.
+        let codex_home = env::var("CODEX_HOME").ok();
+        let home = env::var("HOME").ok();
+        self.discover_with_env(codex_home.as_deref(), home.as_deref())
+    }
+
+    fn enumerate_file_units(&self, root: &Path) -> Result<Vec<FileUnit>, EnumerateError> {
+        enumerate_codex_file_units(root)
+    }
+}
+
+impl CodexAdapter {
+    /// Discovery driven by injected env values rather than `std::env`, so the
+    /// full discover path (resolver → directory check → candidate construction)
+    /// is exercisable under `cargo test` parallelism without env mutation.
+    /// [`ProviderAdapter::discover`] reads `CODEX_HOME`/`HOME` and delegates
+    /// here.
+    pub fn discover_with_env(
+        &self,
+        codex_home: Option<&str>,
+        home: Option<&str>,
+    ) -> Vec<CandidateSource> {
+        match resolve_codex_memories_root(codex_home, home) {
+            Some((basis, root)) => self.candidate_if_existing_dir(basis, &root),
+            None => Vec::new(),
+        }
+    }
+
+    /// Build the single candidate for a resolved root iff the root is an
+    /// existing UTF-8 directory. A regular file, a missing path, a broken
+    /// symlink, or a non-UTF-8 root yields no candidate. NFR-5: this is an
+    /// existence/type check only — directory contents are never read.
+    fn candidate_if_existing_dir(
+        &self,
+        basis: DiscoveryBasis,
+        root: &Path,
+    ) -> Vec<CandidateSource> {
+        if !root.is_dir() {
+            return Vec::new();
+        }
+        // Non-UTF-8 root: `to_string_lossy` would emit U+FFFD, producing a
+        // display path that does not exist on disk and cannot be confirmed
+        // (1.3). Drop instead of emitting garbage.
+        let Some(path_str) = root.to_str() else {
+            return Vec::new();
+        };
+        vec![CandidateSource {
+            provider: PROVIDER_ID.to_string(),
+            root_path: path_str.to_string(),
+            basis,
+            coverage_level: self.coverage_level(),
+            // Codex memories are a global store with no discoverable
+            // per-project split (Design Notes). Story 1.5 may revisit if the
+            // parsed content lets us infer a project boundary; until then,
+            // honestly report "unknown".
+            native_project: None,
+        }]
+    }
+}
+
+/// Pure path resolver for the Codex memories root.
+///
+/// Extracted from [`CodexAdapter::discover`] so tests can exercise the
+/// `CODEX_HOME`-priority rule without touching the process environment
+/// (env-mutation races under `cargo test` parallelism; edition 2024 marks
+/// `set_var` unsafe). The function does no FS I/O — `discover_with_env` ->
+/// `candidate_if_existing_dir` applies the directory check to the returned
+/// path.
+///
+/// Validation (applied here, the single source of truth):
+/// - Empty / whitespace-only values are treated as unset.
+/// - Values must be absolute; a relative root would resolve against the
+///   process CWD and drift between launches, so it is rejected (returns
+///   `None`, never a fallback for an explicit-but-invalid `CODEX_HOME`).
+///
+/// Returns `None` when neither a usable `codex_home` nor a usable `home` is
+/// supplied, or when a supplied value fails validation.
+pub fn resolve_codex_memories_root(
+    codex_home: Option<&str>,
+    home: Option<&str>,
+) -> Option<(DiscoveryBasis, PathBuf)> {
+    // Priority 1: explicit CODEX_HOME (non-empty after trim, absolute). No
+    // fallback to ~/.codex — an explicit override is final, even when invalid.
+    if let Some(ch) = codex_home.filter(|s| !s.trim().is_empty()) {
+        let p = Path::new(ch);
+        if p.is_absolute() {
+            return Some((DiscoveryBasis::CodexHomeEnv, p.join("memories")));
+        }
+        return None;
+    }
+    // Priority 2: default home (non-empty after trim, absolute).
+    let home = home.filter(|s| !s.trim().is_empty())?;
+    let p = Path::new(home);
+    if !p.is_absolute() {
+        return None;
+    }
+    Some((DiscoveryBasis::DefaultHome, p.join(".codex").join("memories")))
+}
+
+/// Enumerate the in-matrix file-level units under a confirmed Codex root
+/// (Story 1.4 — AD-11).
+///
+/// Boundary rules (Supported Artifact Matrix + spec Design Notes "枚举边界"):
+/// - The three known filenames at the root's first level.
+/// - `rollout_summaries/` direct `*.md` children only (one level, NOT
+///   recursive — a `rollout_summaries/nested/x.md` is skipped).
+/// - Everything else (`sessions/`, JSONL, `CLAUDE.md`, unknown files) is
+///   skipped, not indexed.
+/// - Symlink escape: every candidate file's realpath must `starts_with` the
+///   canonical root; a file that escapes (e.g. a symlinked `MEMORY.md`
+///   pointing outside) is skipped.
+/// - `root` itself must be canonicalize-able; if the root cannot be resolved
+///   the whole enumeration returns `Err(())` (the application layer maps this
+///   to a scan failure).
+///
+/// Metadata only — body content is never read here (NFR-5).
+fn enumerate_codex_file_units(root: &Path) -> Result<Vec<FileUnit>, EnumerateError> {
+    // Canonicalize the root once so every realpath containment check compares
+    // against the true on-disk absolute path.
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|_| EnumerateError::RootUnresolvable)?;
+    // Open the confirmed root before treating an empty enumeration as valid.
+    // Without this preflight, a root that cannot be listed can be mistaken
+    // for an intentionally empty memory directory.
+    std::fs::read_dir(&canonical_root).map_err(|_| EnumerateError::Unreadable)?;
+    let mut units = Vec::new();
+
+    // The three known first-level filenames.
+    for name in KNOWN_ROOT_FILES {
+        let candidate = canonical_root.join(name);
+        if candidate.is_file() {
+            if let Some(unit) = file_unit_if_contained(&canonical_root, &candidate) {
+                units.push(unit);
+            }
+        }
+    }
+
+    // `rollout_summaries/` direct `*.md` children only (one level).
+    let rollout_dir = canonical_root.join(ROLLOUT_SUMMARIES_DIR);
+    if rollout_dir.is_dir() {
+        let real_rollout =
+            std::fs::canonicalize(&rollout_dir).map_err(|_| EnumerateError::Unreadable)?;
+        // A symlinked rollout directory may itself escape the confirmed root;
+        // reject it before opening the directory or observing its children.
+        if real_rollout.starts_with(&canonical_root) {
+            let entries =
+                std::fs::read_dir(&real_rollout).map_err(|_| EnumerateError::Unreadable)?;
+            for entry in entries {
+                let entry = entry.map_err(|_| EnumerateError::Unreadable)?;
+                let path = entry.path();
+                // Only regular files with a `.md` extension, one level deep.
+                if !path.is_file() {
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                if let Some(unit) = file_unit_if_contained(&canonical_root, &path) {
+                    units.push(unit);
+                }
+            }
+        }
+    }
+
+    // Stable ordering + dedup by relative path: an in-root symlink alias that
+    // canonicalizes to the same relative/real path as another unit collapses
+    // to ONE entry (spec Design Notes — "计数诚实"). Sorting is by relative
+    // path so the manifest (and therefore `manifest_revision`) is deterministic
+    // regardless of read_dir order.
+    units.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    units.dedup_by(|a, b| a.relative_path == b.relative_path);
+    Ok(units)
+}
+
+/// Build a [`FileUnit`] for `path` iff its realpath is contained inside
+/// `canonical_root` (AD-4 / symlink-escape rejection). Returns `None` for a
+/// file whose realpath escapes, a non-UTF-8 path, or a file whose metadata
+/// cannot be read. No body content is read (NFR-5).
+fn file_unit_if_contained(canonical_root: &Path, path: &Path) -> Option<FileUnit> {
+    // Realpath the file itself — resolves any symlink in its path.
+    let real = std::fs::canonicalize(path).ok()?;
+    // Containment: the realpath must be inside the canonical root.
+    if !real.starts_with(canonical_root) {
+        return None;
+    }
+    // Relative path from the root (used as native_unit_id). Must be UTF-8.
+    let relative = real.strip_prefix(canonical_root).ok()?;
+    let relative_str = relative.to_str()?;
+    let meta = std::fs::metadata(&real).ok()?;
+    // Sub-second precision (AD-34 / spec Design Notes — "manifest 时间精度"):
+    // nanoseconds since the Unix epoch, NOT whole seconds, so a same-second
+    // same-size rewrite still changes the manifest.
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+    Some(FileUnit {
+        relative_path: relative_str.to_string(),
+        absolute_path: real,
+        size: meta.len(),
+        mtime,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pure resolver: CODEX_HOME non-empty wins, returns memories under it.
+    /// No fallback to ~/.codex (AD-3 honesty — explicit override is final).
+    #[test]
+    fn resolver_prefers_codex_home_when_set() {
+        let (basis, root) = resolve_codex_memories_root(Some("/x"), Some("/home/u"))
+            .expect("codex_home set → Some");
+        assert_eq!(basis, DiscoveryBasis::CodexHomeEnv);
+        assert_eq!(root, PathBuf::from("/x/memories"));
+    }
+
+    /// Empty CODEX_HOME is treated as unset → falls back to default home.
+    #[test]
+    fn resolver_treats_empty_codex_home_as_unset() {
+        let (basis, root) = resolve_codex_memories_root(Some(""), Some("/home/u"))
+            .expect("home set → Some");
+        assert_eq!(basis, DiscoveryBasis::DefaultHome);
+        assert_eq!(root, PathBuf::from("/home/u/.codex/memories"));
+    }
+
+    /// Whitespace-only CODEX_HOME is treated as unset (same as empty).
+    #[test]
+    fn resolver_treats_whitespace_codex_home_as_unset() {
+        let (basis, _) = resolve_codex_memories_root(Some("   "), Some("/home/u"))
+            .expect("whitespace codex_home → fallback to home");
+        assert_eq!(basis, DiscoveryBasis::DefaultHome);
+    }
+
+    /// Relative CODEX_HOME is rejected (would resolve against CWD); it does
+    /// NOT fall back to ~/.codex — an explicit override is final.
+    #[test]
+    fn resolver_rejects_relative_codex_home_without_fallback() {
+        // Even when a valid default home is supplied, an explicit (relative)
+        // CODEX_HOME yields None rather than silently using the default.
+        assert!(resolve_codex_memories_root(Some("relative/path"), Some("/home/u")).is_none());
+    }
+
+    /// Relative HOME is rejected (would resolve against CWD).
+    #[test]
+    fn resolver_rejects_relative_home() {
+        assert!(resolve_codex_memories_root(None, Some("./home")).is_none());
+    }
+
+    /// No CODEX_HOME but HOME set → default home basis.
+    #[test]
+    fn resolver_falls_back_to_default_home() {
+        let (basis, root) = resolve_codex_memories_root(None, Some("/home/u"))
+            .expect("home set → Some");
+        assert_eq!(basis, DiscoveryBasis::DefaultHome);
+        assert_eq!(root, PathBuf::from("/home/u/.codex/memories"));
+    }
+
+    /// Neither CODEX_HOME nor HOME → None. No candidate, no error.
+    #[test]
+    fn resolver_returns_none_when_neither_env_set() {
+        assert!(resolve_codex_memories_root(None, None).is_none());
+        // Empty/whitespace strings count as unset too.
+        assert!(resolve_codex_memories_root(Some(""), Some("")).is_none());
+        assert!(resolve_codex_memories_root(Some("  "), None).is_none());
+        // CODEX_HOME set but HOME empty/whitespace: CODEX_HOME path is used.
+        let (basis, root) = resolve_codex_memories_root(Some("/x"), Some(""))
+            .expect("codex_home set with empty home still resolves");
+        assert_eq!(basis, DiscoveryBasis::CodexHomeEnv);
+        assert_eq!(root, PathBuf::from("/x/memories"));
+    }
+
+    /// Adapter declares Codex capability honestly (AD-3).
+    #[test]
+    fn adapter_declares_codex_id_and_full_coverage() {
+        let adapter = CodexAdapter;
+        assert_eq!(adapter.provider_id(), "codex");
+        assert_eq!(adapter.coverage_level(), CoverageLevel::Full);
+    }
+
+    // --- Story 1.4: enumerate_file_units (AD-11 boundary) ------------------
+
+    /// Enumeration indexes only in-matrix files: the three known root files +
+    /// `rollout_summaries/*.md` direct children. Excluded files (sessions,
+    /// JSONL, CLAUDE.md, unknown names) are skipped (AD-11).
+    #[test]
+    fn enumerate_indexes_only_supported_artifact_matrix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("MEMORY.md"), "mem").expect("w");
+        std::fs::write(root.join("memory_summary.md"), "sum").expect("w");
+        std::fs::write(root.join("raw_memories.md"), "raw").expect("w");
+        // Excluded: human instruction file, unknown name, sessions dir + JSONL.
+        std::fs::write(root.join("CLAUDE.md"), "rules").expect("w");
+        std::fs::write(root.join("unknown.md"), "unknown").expect("w");
+        std::fs::create_dir_all(root.join("sessions")).expect("mkdir sessions");
+        std::fs::write(root.join("sessions").join("foo.jsonl"), "{}").expect("w");
+        // rollout_summaries with an .md and a non-.md child.
+        std::fs::create_dir_all(root.join("rollout_summaries")).expect("mkdir rollout");
+        std::fs::write(root.join("rollout_summaries").join("2026-07-01.md"), "r").expect("w");
+        std::fs::write(root.join("rollout_summaries").join("notes.txt"), "r").expect("w");
+
+        let units = enumerate_codex_file_units(root).expect("enumerate ok");
+        let mut rels: Vec<&str> = units.iter().map(|u| u.relative_path.as_str()).collect();
+        rels.sort_unstable();
+        assert_eq!(
+            rels,
+            vec![
+                "MEMORY.md",
+                "memory_summary.md",
+                "raw_memories.md",
+                "rollout_summaries/2026-07-01.md",
+            ],
+            "only in-matrix files are enumerated"
+        );
+    }
+
+    /// `rollout_summaries/` is NOT recursive: a nested subdirectory's `.md` is
+    /// skipped (one-level rule, spec Design Notes "枚举边界").
+    #[test]
+    fn enumerate_rollout_summaries_is_not_recursive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let nested = root.join("rollout_summaries").join("nested");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        std::fs::write(root.join("rollout_summaries").join("top.md"), "r").expect("w");
+        std::fs::write(nested.join("deep.md"), "r").expect("w");
+
+        let units = enumerate_codex_file_units(root).expect("enumerate ok");
+        let rels: Vec<&str> = units.iter().map(|u| u.relative_path.as_str()).collect();
+        assert_eq!(rels, vec!["rollout_summaries/top.md"], "nested .md skipped");
+    }
+
+    /// A symlinked file whose realpath escapes the canonical root is skipped
+    /// (AD-4 / spec Block If — symlink escape). The in-root file is kept.
+    #[cfg(unix)]
+    #[test]
+    fn enumerate_skips_symlink_escape() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        // Real in-root file.
+        std::fs::write(root.join("MEMORY.md"), "mem").expect("w");
+        // A file outside the root, symlinked in as memory_summary.md.
+        std::fs::write(outside.join("secret.md"), "secret").expect("w");
+        std::os::unix::fs::symlink(
+            outside.join("secret.md"),
+            root.join("memory_summary.md"),
+        )
+        .expect("symlink");
+
+        let units = enumerate_codex_file_units(&root).expect("enumerate ok");
+        let rels: Vec<&str> = units.iter().map(|u| u.relative_path.as_str()).collect();
+        assert_eq!(rels, vec!["MEMORY.md"], "escaping symlink skipped");
+    }
+
+    /// A symlinked `rollout_summaries` directory that resolves outside the
+    /// confirmed root is skipped before it is opened; only in-root supported
+    /// artifacts remain enumerable.
+    #[cfg(unix)]
+    #[test]
+    fn enumerate_skips_rollout_directory_symlink_escape() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::fs::write(root.join("MEMORY.md"), "mem").expect("w root");
+        std::fs::write(outside.join("secret.md"), "secret").expect("w outside");
+        std::os::unix::fs::symlink(&outside, root.join(ROLLOUT_SUMMARIES_DIR))
+            .expect("symlink rollout dir");
+
+        let units = enumerate_codex_file_units(&root).expect("enumerate ok");
+        let rels: Vec<&str> = units.iter().map(|u| u.relative_path.as_str()).collect();
+        assert_eq!(rels, vec!["MEMORY.md"], "external rollout directory skipped");
+    }
+
+    /// Enumeration of an empty directory succeeds with zero units (spec I/O
+    /// matrix — empty directory scan is a complete success).
+    #[test]
+    fn enumerate_empty_directory_succeeds_with_zero_units() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let units = enumerate_codex_file_units(tmp.path()).expect("enumerate ok");
+        assert!(units.is_empty());
+    }
+
+    /// Enumeration of a non-existent root returns Err (root unresolvable).
+    #[test]
+    fn enumerate_fails_for_missing_root() {
+        let bogus = Path::new("/this/does/not/exist/tessera-1-4-enum");
+        assert!(enumerate_codex_file_units(bogus).is_err());
+    }
+}

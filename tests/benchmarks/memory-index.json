@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Tessera Phase 0 benchmark placeholder (AD-22 / A-16 / NFR-11). Path is fixed by the architecture spine: `tests/benchmarks/memory-index.json`. Per A-16, thresholds and baseline values MUST be left null until Phase 0 establishes the real baseline on Carver's desensitized Codex fixtures (Story 1.9). Filling these in with fabricated numbers before the baseline is measured is an explicit spec violation.",
+  "version": "0",
+  "fixture": {
+    "$comment": "Identifier for the desensitized fixture set used to establish the baseline. Filled in when Story 1.9 measures the baseline.",
+    "name": null,
+    "seed_path": null
+  },
+  "metrics": {
+    "cold_scan": {
+      "$comment": "Wall time to scan a Confirmed Source from cold into a fresh Derived Index. Higher is worse.",
+      "unit": "milliseconds",
+      "baseline": null,
+      "threshold": null
+    },
+    "query": {
+      "$comment": "P50 and P95 wall time for a keyword query against the active generation. Higher is worse.",
+      "unit": "milliseconds",
+      "baseline_p50": null,
+      "baseline_p95": null,
+      "threshold_p50": null,
+      "threshold_p95": null
+    },
+    "memory": {
+      "$comment": "Tessera process RSS while the active generation is loaded. Higher is worse.",
+      "unit": "bytes",
+      "baseline": null,
+      "threshold": null
+    },
+    "index_size": {
+      "$comment": "On-disk size of the Tessera Derived Index SQLite file (including FTS5). Higher is worse.",
+      "unit": "bytes",
+      "baseline": null,
+      "threshold": null
+    }
+  },
+  "gate": {
+    "$comment": "Quality-gate policy. Phase 0 leaves the gate OPEN (no thresholds) until the baseline is measured by Story 1.9. Once thresholds are set, a regression is any metric exceeding its threshold on the same fixture, and the change must report numbers and pass the gate before entering the default build (AD-22).",
+    "enforce": false
+  }
+}

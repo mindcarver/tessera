@@ -1,0 +1,12 @@
+/**
+ * `components` — shared, feature-agnostic React components (Phase 0 seed).
+ *
+ * Phase 0 leaves this directory empty; it is reserved for the structural
+ * seed. Later Stories add:
+ *   - Result cards, Source status rows, Provenance views, EmptyState.
+ *
+ * Visual components must never become the only way to reach a feature
+ * (AD-21); every component here is paired with a keyboard-reachable path
+ * verified by `tests/ui/accessibility.spec.ts`.
+ */
+export {};

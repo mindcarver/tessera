@@ -1,0 +1,23 @@
+# Build artifacts
+dist/
+node_modules/
+playwright-report/
+test-results/
+*.tsbuildinfo
+
+# Local agent runtime copies
+.agents/
+.claude/
+.zcode/
+
+# Rust / Cargo
+# NOTE: server/Cargo.lock is intentionally COMMITTED (not ignored). Tessera
+# ships a binary crate and the spec (Always-boundary) mandates exact-patch
+# reproducibility via the lockfile. Only build artifacts are ignored.
+server/target/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.log

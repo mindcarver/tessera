@@ -1,0 +1,8 @@
+# Seed fixture directory for the Codex Provider adapter (AD-3/AD-14).
+#
+# Story 1.5 fills this with the Codex Supported Artifact Matrix fixtures:
+#   MEMORY.md, memory_summary.md, raw_memories.md, rollout_summaries/*.md
+#
+# Fixture content is local and desensitized — never live Agent Memory body
+# (AD-12/NFR-1). Phase 0 only reserves the path so the architecture-spine
+# contract anchor exists.

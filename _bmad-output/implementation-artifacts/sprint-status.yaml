@@ -1,0 +1,92 @@
+# generated: 2026-07-21
+# last_updated: 2026-07-23
+# project: tessera
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: _bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; sprint-status surfaces open ones
+
+generated: 2026-07-21
+last_updated: 2026-07-23
+project: tessera
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+
+development_status:
+  # === Epic 1: 本机 Codex 记忆发现与搜索（Foundation + 首个端到端闭环） ===
+  epic-1: in-progress
+  1-1-phase0-scaffold: done                 # 本地应用骨架与可启动运行（Phase 0 脚手架）
+  1-2-codex-discover: done                  # Codex Candidate Source 自动发现与展示
+  1-3-source-confirm: done                  # Source 确认/拒绝/停用与持久身份
+  1-4-scan-pipeline-atomic: done            # 只读扫描管线与原子代际切换（骨架）
+  1-5-codex-parse-canonical: backlog        # Codex 记忆解析、边界限定与 canonical 记录
+  1-6-search-provenance: backlog            # 关键词搜索与 Provenance 结果展示
+  1-7-open-original-location: backlog       # 从结果打开原始记忆位置
+  1-8-inventory-health-rescan: backlog      # Source Inventory、健康状态与手动重扫
+  1-9-perf-baseline-gate: backlog           # Phase 0 性能基准门禁
+  epic-1-retrospective: optional
+
+  # === Epic 2: 跨 Agent 联邦（Claude Code + 跨 Provider 搜索与全景 Inventory） ===
+  epic-2: backlog
+  2-1-claude-discover: backlog              # Claude Code Candidate Source 发现与确认
+  2-2-claude-parse-index: backlog           # Claude Code 记忆解析、边界限定与只读索引
+  2-3-cross-agent-search: backlog           # 跨 Provider 关键词搜索与来源对比
+  2-4-cross-provider-filters: backlog       # 跨 Provider 组合筛选与范围可见性
+  2-5-multi-provider-inventory: backlog     # 多 Provider Source Inventory 全景与跨源健康
+  epic-2-retrospective: optional
+
+  # === Epic 3: 无查询浏览与记忆结构可视化 ===
+  epic-3: backlog
+  3-1-browse-page-entry: backlog            # BrowsePage 查询契约与无查询浏览入口
+  3-2-browse-grouping: backlog              # 按维度分组与最近变化浏览
+  3-3-drill-down-visualize: backlog         # 记忆结构 drill-down 导航与可视化
+  epic-3-retrospective: optional
+
+  # === Epic 4: 健康诊断、失败隔离与索引重建 ===
+  epic-4: backlog
+  4-1-watcher-reconcile: backlog            # 文件变化 watcher hint 与 reconcile 自动刷新
+  4-2-failure-isolation: backlog            # Connector 失败隔离与 stale 上一成功结果
+  4-3-path-change-degraded: backlog         # 路径/权限/身份变化的重发现与 degraded 处理
+  4-4-rebuild-index: backlog                # Derived Index 整体重建
+  epic-4-retrospective: optional
+
+  # === Epic 5: Tessera Project 跨 Agent 项目联邦视图 ===
+  epic-5: backlog
+  5-1-project-mapping: backlog              # Tessera Project 创建与 Native Project 显式映射
+  5-2-project-projection: backlog           # 按 Tessera Project 浏览与搜索（projection）
+  epic-5-retrospective: optional

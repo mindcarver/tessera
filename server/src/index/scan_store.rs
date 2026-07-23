@@ -1,0 +1,448 @@
+//! `index::scan_store` — persistence for scan runs and memory-record staging
+//! generations (Story 1.4).
+//!
+//! This is the persistence layer over the `scan_runs` and `memory_records`
+//! SQLite tables (created by migration id `3`). It owns the fencing-token
+//! allocation, the state-machine transitions, the staging-generation writes,
+//! and the single-transaction CAS commit that makes a generation visible
+//! (AD-5/AD-16/AD-28/AD-32).
+//!
+//! Architecture invariants honoured here:
+//! - **Fencing token (AD-28/AD-32):** `fencing_token = MAX(fencing_token)+1`
+//!   per `source_id`, computed inside [`ScanStore::begin_run`]'s INSERT
+//!   transaction. `UNIQUE(source_id, fencing_token)` enforces monotonicity at
+//!   the storage layer; SQLite's single-writer model guarantees the MAX+1 read
+//!   and the INSERT are serialized.
+//! - **Generation (Design Notes):** `generation = gen_<scan_run_id>` — both
+//!   come from the same AUTOINCREMENT sequence, no clock/rand dependency.
+//! - **Atomic CAS commit (AD-32):** [`ScanStore::commit_cas`] runs the CAS
+//!   UPDATE against the per-source `MAX(fencing_token)` (the holder must be
+//!   the LATEST owner — comparing only against its own row is no fence at
+//!   all), the `tessera_meta.active_generation` write, the old-generation
+//!   cleanup, and the `succeeded` mark in ONE transaction. A 0-row CAS rolls
+//!   the whole transaction back — the active generation never moves.
+//! - **Generation isolation is physical (NFR-9):** `memory_records` primary
+//!   key is the composite `(record_id, generation)` and staging uses plain
+//!   `INSERT` (never `INSERT OR REPLACE`). A `record_id` recurs across
+//!   generations (locator-based, AD-15), so single-field PK + REPLACE would
+//!   let staging overwrite ACTIVE generation rows.
+//! - **Boot recovery (AD-16):** [`ScanStore::recover_stale_runs`] flips stale
+//!   in-flight runs to `failed` with `error_code='stale_recovered'` and
+//!   deletes ALL non-active-generation `memory_records` rows (in-flight
+//!   staging + historical failed staging), preserving only the active
+//!   generation's records.
+//! - **Corruption is loud:** [`ScanStore::latest_run`] returns an error on an
+//!   unparseable persisted state string — it does NOT silently map an unknown
+//!   state to `failed` (spec: unknown state = data corruption, surfaced as
+//!   `Internal`).
+
+use rusqlite::{params, Connection};
+
+use crate::domain::scan::{Generation, ScanRunState};
+use crate::domain::source::SourceId;
+
+/// The `tessera_meta` key prefix for the active-generation marker. The full
+/// key is `active_generation:<source_rowid>` (Design Notes — active
+/// generation 存哪). The meta table is the reserved home for Tessera app-data
+/// scalars like this.
+const ACTIVE_GENERATION_KEY_PREFIX: &str = "active_generation:";
+
+/// The stable `error_code` written by boot recovery when it flips a stale
+/// in-flight run to `failed` (spec Design Notes — "error_code 稳定词汇").
+/// This is the one vocabulary value that is NOT a `ScanError` variant — it is
+/// written only here.
+const ERROR_CODE_STALE_RECOVERED: &str = "stale_recovered";
+
+/// A staged file-level record to insert into a staging generation. Carries
+/// everything `memory_records` persists except the generation (supplied by
+/// the caller) — the application layer builds these from enumerated file
+/// units + content hashes.
+#[derive(Debug, Clone)]
+pub struct StagedRecord {
+    pub record_id: String,
+    pub source_rowid: i64,
+    pub provider: String,
+    pub unit_kind: String,
+    pub native_unit_id: String,
+    pub native_locator: String,
+    pub content_hash: String,
+    pub parser_version: String,
+}
+
+/// A single row read back from `scan_runs` for status reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRunRow {
+    pub scan_id: i64,
+    pub state: ScanRunState,
+    pub generation: Generation,
+    pub error_code: Option<String>,
+}
+
+/// The Scan Store. Borrows the Derived Index connection for its lifetime; the
+/// borrow is bounded by the IPC command's hold of the `IndexState` mutex. All
+/// methods are synchronous — the 1.4 commands are synchronous and the std
+/// Mutex serializes them (single owner per Source, AD-5).
+#[derive(Debug)]
+pub struct ScanStore<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> ScanStore<'a> {
+    /// Construct a scan-store view over a connection that has had migration
+    /// `v2_scan_generations` applied (boot guarantees this for the live app;
+    /// tests use a fresh in-memory DB with [`crate::index::migrations::apply`]).
+    pub fn new(conn: &'a Connection) -> Self {
+        ScanStore { conn }
+    }
+
+    /// Begin a new scan run for `source_id`: allocate the next fencing token
+    /// (MAX+1 per source), insert a `queued` row, and return
+    /// `(scan_id, fencing_token, generation)`. The whole operation is one
+    /// transaction so the token read and the INSERT are atomic.
+    ///
+    /// `manifest_revision` is captured at scan start (AD-34) and stored on the
+    /// row; `intent` is the generation intent committed under CAS (in 1.4 the
+    /// same string as `generation`).
+    pub fn begin_run(
+        &self,
+        source_rowid: i64,
+        manifest_revision: &str,
+    ) -> rusqlite::Result<(i64, i64, Generation)> {
+        // `unchecked_transaction` borrows `&Connection` (the store holds a
+        // shared ref); exclusivity is guaranteed by the caller holding the
+        // `IndexState` mutex for the whole command, and each store method runs
+        // a single transaction at a time.
+        let tx = self.conn.unchecked_transaction()?;
+        // Next monotonic fencing token for this source. UNIQUE(source_id,
+        // fencing_token) + SQLite single-writer make this race-free.
+        let next_token: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(fencing_token), 0) + 1 FROM scan_runs WHERE source_id = ?1",
+            params![source_rowid],
+            |row| row.get(0),
+        )?;
+        // Insert with a placeholder generation first so we can read the
+        // AUTOINCREMENT id, then set generation = gen_<id> and intent = same.
+        tx.execute(
+            "INSERT INTO scan_runs
+                (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (?1, '', ?2, ?3, '', ?4)",
+            params![source_rowid, ScanRunState::Queued.as_str(), next_token, manifest_revision],
+        )?;
+        let scan_id = tx.last_insert_rowid();
+        let generation = Generation::from_rowid(scan_id);
+        tx.execute(
+            "UPDATE scan_runs SET generation = ?1, intent = ?1 WHERE id = ?2",
+            params![generation.0, scan_id],
+        )?;
+        tx.commit()?;
+        Ok((scan_id, next_token, generation))
+    }
+
+    /// Move a run to a new state. Used for the `queued → running → staging →
+    /// committing` progression. Returns the number of rows affected (1 on
+    /// success). Does NOT set `finished_at` — that is written only by
+    /// `fail_run` / `commit_cas`.
+    pub fn set_state(&self, scan_id: i64, state: ScanRunState) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE scan_runs SET state = ?1 WHERE id = ?2",
+            params![state.as_str(), scan_id],
+        )
+    }
+
+    /// Replace the placeholder manifest revision captured at `begin_run` with
+    /// the real one once the first enumeration has produced the manifest
+    /// (AD-34; the run must exist BEFORE the first enumeration so a crash
+    /// during enumeration leaves a recoverable row). Returns rows affected.
+    pub fn set_manifest_revision(
+        &self,
+        scan_id: i64,
+        manifest_revision: &str,
+    ) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE scan_runs SET manifest_revision = ?1 WHERE id = ?2",
+            params![manifest_revision, scan_id],
+        )
+    }
+
+    /// Insert a batch of staged records into a staging generation. Each record
+    /// is tagged with `generation`; only a generation whose CAS commit
+    /// succeeds becomes visible. Batched in one transaction.
+    ///
+    /// **Plain `INSERT`, never `INSERT OR REPLACE` (NFR-9 / spec Design Notes
+    /// — "generation 隔离是物理的").** The composite `(record_id, generation)`
+    /// primary key means the same `record_id` staged under a NEW generation is
+    /// a distinct row from the ACTIVE generation's row — staging can never
+    /// overwrite the active index. A duplicate `(record_id, generation)` pair
+    /// within one staging batch is a genuine conflict and surfaces as an
+    /// error (the enumerator dedups by relative path, so this should not
+    /// occur in practice).
+    pub fn stage_records(
+        &self,
+        generation: &Generation,
+        records: &[StagedRecord],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO memory_records
+                    (record_id, source_id, generation, provider, unit_kind,
+                     native_unit_id, native_locator, content_hash, parser_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for r in records {
+                stmt.execute(params![
+                    r.record_id,
+                    r.source_rowid,
+                    generation.0,
+                    r.provider,
+                    r.unit_kind,
+                    r.native_unit_id,
+                    r.native_locator,
+                    r.content_hash,
+                    r.parser_version,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Commit a staging generation as the new active generation, atomically
+    /// (AD-32).
+    ///
+    /// Single transaction:
+    /// 1. **CAS UPDATE** — `SET state='succeeded', finished_at=? WHERE id=?
+    ///    AND state='committing' AND fencing_token = (SELECT MAX(fencing_token)
+    ///    FROM scan_runs WHERE source_id=?)`. The token is compared against
+    ///    the per-source CURRENT MAXIMUM, not merely the holder's own row:
+    ///    comparing only against its own `begin_run` row is no fence at all
+    ///    (a holder always matches itself). Once a SECOND owner begins a run
+    ///    (allocating a higher token), the FIRST owner's commit must affect 0
+    ///    rows and lose. A 0-row result rolls the WHOLE transaction back and
+    ///    returns `Ok(false)` — `active_generation` never moves.
+    /// 2. On a 1-row CAS, write `tessera_meta.active_generation:<source_rowid>`.
+    /// 3. Delete every OTHER generation's `memory_records` rows for this
+    ///    source (AD-2: old derived data is rebuildable).
+    /// 4. Commit.
+    ///
+    /// Returns `Ok(true)` when the CAS succeeded and the generation is now
+    /// active; `Ok(false)` on a lost CAS.
+    pub fn commit_cas(
+        &self,
+        scan_id: i64,
+        fencing_token: i64,
+        generation: &Generation,
+        source_rowid: i64,
+    ) -> rusqlite::Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let cas_rows = tx.execute(
+            "UPDATE scan_runs SET state = ?1, finished_at = ?2
+             WHERE id = ?3 AND state = ?4
+               AND fencing_token = (
+                   SELECT MAX(fencing_token) FROM scan_runs WHERE source_id = ?5
+               )",
+            params![
+                ScanRunState::Succeeded.as_str(),
+                unix_seconds_now_i64(),
+                scan_id,
+                ScanRunState::Committing.as_str(),
+                source_rowid,
+            ],
+        )?;
+        // `fencing_token` is retained in the signature for API stability and
+        // debuggability (the holder's own token is still a useful correlation
+        // id in logs), even though the CAS predicate now keys on the per-source
+        // MAX. Debug-assert the holder's belief matches its row.
+        debug_assert_eq!(
+            fencing_token,
+            tx.query_row::<i64, _, _>(
+                "SELECT fencing_token FROM scan_runs WHERE id = ?1",
+                params![scan_id],
+                |row| row.get(0)
+            )
+            .unwrap_or(fencing_token),
+            "holder token must match its own scan_runs row"
+        );
+        if cas_rows == 0 {
+            // Lost the CAS: this run is not the current (latest) owner. Roll
+            // back the whole transaction — the active generation marker is NOT
+            // written. The run stays in `committing` for the next boot to
+            // recover (spec Design Notes — CAS 失败不留半态的唯一例外).
+            drop(tx);
+            return Ok(false);
+        }
+        // CAS succeeded in this same transaction: flip the visible generation.
+        let key = format!("{ACTIVE_GENERATION_KEY_PREFIX}{source_rowid}");
+        tx.execute(
+            "INSERT OR REPLACE INTO tessera_meta(key, value) VALUES (?1, ?2)",
+            params![key, generation.0],
+        )?;
+        // Remove every other generation's records for this source (AD-2).
+        tx.execute(
+            "DELETE FROM memory_records WHERE source_id = ?1 AND generation != ?2",
+            params![source_rowid, generation.0],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Mark a run `failed` with a MANDATORY stable `error_code` from the
+    /// vocabulary (spec Design Notes — "error_code 稳定词汇":
+    /// `dirty_after_validation` / `read_failed` / `enumeration_failed` /
+    /// `stale_recovered` / `internal`). Sets `finished_at`. Used by the
+    /// orchestrator on every failure path EXCEPT a lost commit CAS (which is
+    /// not re-marked — the run is left for boot recovery).
+    pub fn fail_run(&self, scan_id: i64, error_code: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE scan_runs SET state = ?1, error_code = ?2, finished_at = ?3
+             WHERE id = ?4 AND state IN (?5, ?6, ?7, ?8)",
+            params![
+                ScanRunState::Failed.as_str(),
+                error_code,
+                unix_seconds_now_i64(),
+                scan_id,
+                ScanRunState::Queued.as_str(),
+                ScanRunState::Running.as_str(),
+                ScanRunState::Staging.as_str(),
+                ScanRunState::Committing.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Boot recovery (AD-16). Flip every stale in-flight run
+    /// (`queued/running/staging/committing`) to `failed` with
+    /// `error_code='stale_recovered'`, then delete ALL `memory_records` rows
+    /// whose generation is not the active one for their source (in-flight
+    /// staging + historical failed staging). The active generation and its
+    /// records are preserved.
+    pub fn recover_stale_runs(&self) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE scan_runs SET state = ?1, error_code = ?2, finished_at = ?3
+             WHERE state IN (?4, ?5, ?6, ?7)",
+            params![
+                ScanRunState::Failed.as_str(),
+                ERROR_CODE_STALE_RECOVERED,
+                unix_seconds_now_i64(),
+                ScanRunState::Queued.as_str(),
+                ScanRunState::Running.as_str(),
+                ScanRunState::Staging.as_str(),
+                ScanRunState::Committing.as_str(),
+            ],
+        )?;
+        // Delete every non-active-generation record. A record's generation is
+        // active iff it equals the value stored at
+        // `tessera_meta.active_generation:<source_rowid>` for its source.
+        tx.execute(
+            "DELETE FROM memory_records
+             WHERE generation != COALESCE(
+                 (SELECT value FROM tessera_meta
+                   WHERE key = ?1 || memory_records.source_id),
+                 ''
+             )",
+            params![ACTIVE_GENERATION_KEY_PREFIX],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The active generation for a source, or `None` when no generation has
+    /// committed successfully yet.
+    pub fn active_generation(&self, source_rowid: i64) -> rusqlite::Result<Option<Generation>> {
+        let key = format!("{ACTIVE_GENERATION_KEY_PREFIX}{source_rowid}");
+        match self.conn.query_row(
+            "SELECT value FROM tessera_meta WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(v) => Ok(Some(Generation(v))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The most recent run for a source (highest `scan_id`), or `None` when
+    /// the source has never been scanned. Used by `get_scan_status`.
+    ///
+    /// Returns an `Err` when the persisted `state` string does not parse into a
+    /// known [`ScanRunState`] — an unknown state is DATA CORRUPTION and must
+    /// surface (the application layer maps it to `Internal`), NOT be silently
+    /// coerced to `failed` (spec: no `unwrap_or(Failed)`).
+    pub fn latest_run(&self, source_rowid: i64) -> rusqlite::Result<Option<ScanRunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, state, generation, error_code FROM scan_runs
+             WHERE source_id = ?1 ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![source_rowid])?;
+        match rows.next()? {
+            Some(row) => {
+                let state_str: String = row.get(1)?;
+                let generation_str: String = row.get(2)?;
+                let state = ScanRunState::parse_str(&state_str).ok_or_else(|| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("scan_runs.state is corrupt: unparseable value {state_str:?}"),
+                    )))
+                })?;
+                Ok(Some(ScanRunRow {
+                    scan_id: row.get(0)?,
+                    state,
+                    generation: Generation(generation_str),
+                    error_code: row.get(3)?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Count the records in a SPECIFIC generation for a source. Used by the
+    /// orchestrator to report `records_indexed` as the post-commit actual row
+    /// count of the committed generation (spec Design Notes — "计数诚实"),
+    /// which is guaranteed to match the staged vec length because the
+    /// enumerator dedups by relative path.
+    pub fn count_generation_records(
+        &self,
+        source_rowid: i64,
+        generation: &Generation,
+    ) -> rusqlite::Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_records WHERE source_id = ?1 AND generation = ?2",
+            params![source_rowid, generation.0],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Count the records in the currently-active generation for a source
+    /// (`0` when there is no active generation). Used by `get_scan_status`.
+    pub fn count_active_records(&self, source_rowid: i64) -> rusqlite::Result<u64> {
+        let active = self.active_generation(source_rowid)?;
+        let Some(gen) = active else {
+            return Ok(0);
+        };
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memory_records WHERE source_id = ?1 AND generation = ?2",
+            params![source_rowid, gen.0],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Resolve a `SourceId` handle to its registry rowid. Returns `None` for a
+    /// malformed id. (Rowid existence is the caller's check — this is a pure
+    /// handle translation.)
+    pub fn source_rowid(source_id: &SourceId) -> Option<i64> {
+        source_id.to_rowid()
+    }
+}
+
+/// Unix epoch seconds as an `i64`, or `0` if the system clock is before the
+/// epoch (broken RTC). Mirrors the `migrations::unix_seconds_now` style — the
+/// audit column is for human inspection; correctness never depends on it.
+fn unix_seconds_now_i64() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => 0,
+    }
+}

@@ -1,0 +1,6 @@
+# Tessera — Phase 0 locked toolchain.
+# Spec (spec-1-1-phase0-scaffold.md) pins Rust stable 1.97.x at exact patch.
+# Patch resolved at bootstrap via `rustup toolchain install 1.97.0 --profile minimal`.
+[toolchain]
+channel = "1.97.0"
+profile = "minimal"

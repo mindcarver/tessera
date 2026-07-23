@@ -1,0 +1,63 @@
+# Tessera — Phase 0 scaffold (spec-1-1-phase0-scaffold.md), reworked 2026-07-22
+# for the local-web delivery form (sprint-change-proposal-2026-07-22): the
+# Tauri desktop shell is gone; the Rust core now embeds a loopback-only HTTP
+# server (AD-9 revised). Versions are pinned to the minor versions locked by
+# Phase 0 / ARCHITECTURE-SPINE. Exact patch versions are resolved by Cargo.lock.
+[package]
+name = "tessera"
+version = "0.0.1"
+description = "Tessera — local-only Agent Memory federation server (local web app)"
+authors = ["Carver"]
+edition = "2021"
+rust-version = "1.97.0"
+license = "Private"
+default-run = "tessera"
+
+[lib]
+name = "tessera_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"
+
+# AD-1: Rust core is the sole application boundary. The browser UI may not
+# touch providers, filesystem, or SQLite directly; it only calls the versioned
+# loopback-only HTTP API (AD-9/AD-17).
+[dependencies]
+# Synchronous HTTP server for the local web delivery form (AD-9). Runs one
+# thread per connection, so handlers stay synchronous — the std::sync::Mutex
+# single-owner scan pattern (AD-5, Story 1.4 spec) carries over unchanged.
+# Bound to 127.0.0.1 only (AD-12); never listens on an external interface.
+tiny_http = { version = "0.12", features = [] }
+
+# OS-managed app-data path resolution (AD-20). Replaces the resolved
+# app_data_dir the Tauri shell previously provided.
+dirs = "6"
+
+# Open the user's default browser at the local UI address after boot (Story
+# 1.1 rework: the browser is the application shell). Loopback URL only.
+open = "5"
+
+# Serialization for the versioned API envelope (AD-17/A-6) and error envelope
+# (AD-13). Long-form structured payloads use versioned serde types.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Derived Index storage (AD-2/AD-7/AD-15/AD-29). `bundled` ships a SQLite 3.x
+# build with FTS5 enabled; the index/migrations module asserts FTS5 availability.
+# Tessera owns only its projection — Sources are read-only.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+# Filesystem watcher hints (AD-8). Watchers only produce debounced dirty hints;
+# reconcile remains truth. Declared as part of the Phase 0 locked stack even
+# though the first watcher lands in Story 1.4 — the spec pins notify here.
+notify = "8.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Reserved for future capability gates. Default build ships local-only Phase A
+# behavior; no network-oriented feature is enabled.
+default = []
