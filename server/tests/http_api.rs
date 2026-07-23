@@ -21,11 +21,7 @@ fn boot_test_server() -> u16 {
     let dir = tempfile::tempdir().expect("scratch app-data dir");
     let state = tessera_lib::boot(dir.path()).expect("boot must succeed on scratch dir");
     let server = bind("127.0.0.1:0");
-    let port = server
-        .server_addr()
-        .to_ip()
-        .expect("bound addr")
-        .port();
+    let port = server.server_addr().to_ip().expect("bound addr").port();
     std::thread::spawn(move || {
         // Keep the tempdir alive for the server's lifetime.
         let _dir = dir;
@@ -48,9 +44,7 @@ fn raw_http(port: u16, request: &str) -> String {
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .expect("set read timeout");
-                stream
-                    .write_all(request.as_bytes())
-                    .expect("write request");
+                stream.write_all(request.as_bytes()).expect("write request");
                 let mut buf = String::new();
                 stream.read_to_string(&mut buf).expect("read response");
                 return buf;
@@ -71,18 +65,31 @@ fn ping_round_trip_carries_versioned_envelope_and_security_headers() {
     let port = boot_test_server();
     let response = raw_http(
         port,
-        &format!(
-            "GET /api/ping HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-        ),
+        &format!("GET /api/ping HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
     );
     assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
-    assert!(response.contains("\"api_version\":\"1\""), "got:\n{response}");
-    assert!(response.contains("\"name\":\"tessera\""), "got:\n{response}");
+    assert!(
+        response.contains("\"api_version\":\"1\""),
+        "got:\n{response}"
+    );
+    assert!(
+        response.contains("\"name\":\"tessera\""),
+        "got:\n{response}"
+    );
     // AD-9 security headers on the wire.
-    assert!(response.contains("Content-Security-Policy"), "got:\n{response}");
+    assert!(
+        response.contains("Content-Security-Policy"),
+        "got:\n{response}"
+    );
     assert!(response.contains("connect-src 'self'"), "got:\n{response}");
-    assert!(response.contains("X-Content-Type-Options: nosniff"), "got:\n{response}");
-    assert!(response.contains("Cache-Control: no-store"), "got:\n{response}");
+    assert!(
+        response.contains("X-Content-Type-Options: nosniff"),
+        "got:\n{response}"
+    );
+    assert!(
+        response.contains("Cache-Control: no-store"),
+        "got:\n{response}"
+    );
 }
 
 /// A request addressed to a foreign Host (DNS-rebinding shape) is rejected
@@ -128,7 +135,10 @@ fn own_loopback_origin_is_accepted() {
         ),
     );
     assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
-    assert!(response.contains("\"api_version\":\"1\""), "got:\n{response}");
+    assert!(
+        response.contains("\"api_version\":\"1\""),
+        "got:\n{response}"
+    );
 }
 
 /// A malformed JSON body on a `source_id` endpoint surfaces `bad_request`,
@@ -147,6 +157,75 @@ fn malformed_scan_body_is_bad_request() {
     );
     assert!(response.starts_with("HTTP/1.1 400"), "got:\n{response}");
     assert!(response.contains("bad_request"), "got:\n{response}");
+}
+
+#[test]
+fn malformed_confirmed_source_returns_safe_scan_failure_on_wire() {
+    let source_root = tempfile::tempdir().expect("source root");
+    let memory = source_root.path().join("MEMORY.md");
+    std::fs::write(&memory, "# Valid\nbody\n").expect("valid source");
+    let port = boot_test_server();
+    let confirm_body = serde_json::json!({
+        "candidate": {
+            "provider": "codex",
+            "root_path": source_root.path(),
+            "basis": "codex_home_env",
+            "coverage_level": "full",
+            "native_project": null
+        }
+    })
+    .to_string();
+    let confirmed = raw_http(
+        port,
+        &format!(
+            "POST /api/sources/confirm HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            confirm_body.len(),
+            confirm_body
+        ),
+    );
+    assert!(confirmed.starts_with("HTTP/1.1 200"), "got:\n{confirmed}");
+    let confirmed_body = confirmed
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("confirmation body");
+    let source_id = serde_json::from_str::<serde_json::Value>(confirmed_body)
+        .expect("confirmation JSON")["payload"]["source_id"]
+        .as_str()
+        .expect("source id")
+        .to_string();
+
+    let secret = "BODY_MUST_NOT_LEAK";
+    let mut malformed = vec![0xff];
+    malformed.extend_from_slice(secret.as_bytes());
+    std::fs::write(&memory, malformed).expect("malformed source");
+    let scan_body = serde_json::json!({ "source_id": source_id }).to_string();
+    let response = raw_http(
+        port,
+        &format!(
+            "POST /api/scan HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            scan_body.len(),
+            scan_body
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 409"), "got:\n{response}");
+    assert!(
+        response.contains("\"code\":\"scan_failed\""),
+        "got:\n{response}"
+    );
+    assert!(response.contains("\"phase\":\"scan\""), "got:\n{response}");
+    assert!(
+        response.contains("\"source_id\":\"src_"),
+        "got:\n{response}"
+    );
+    let source_path = source_root.path().to_string_lossy();
+    assert!(
+        !response.contains(source_path.as_ref()),
+        "source path must not cross the wire: {response}"
+    );
+    assert!(
+        !response.contains(secret),
+        "source body must not cross the wire: {response}"
+    );
 }
 
 /// Static-file path traversal can never escape the UI root (AD-4's allowlist
@@ -177,9 +256,7 @@ fn unknown_api_route_is_structured_404() {
     let port = boot_test_server();
     let response = raw_http(
         port,
-        &format!(
-            "GET /api/nope HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-        ),
+        &format!("GET /api/nope HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
     );
     assert!(response.starts_with("HTTP/1.1 404"), "got:\n{response}");
     assert!(response.contains("not_found"), "got:\n{response}");

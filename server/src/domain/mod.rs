@@ -23,7 +23,8 @@ pub mod source;
 // in Phase 0), `CoverageLevel` (AD-3), `DiscoveryBasis` and `CandidateSource`
 // (AD-4 — pre-confirmation metadata only, no source_id).
 pub use ports::provider_adapter::{
-    CandidateSource, CoverageLevel, DiscoveryBasis, EnumerateError, FileUnit, ProviderAdapter,
+    ArtifactDiagnostic, ArtifactEnumeration, CandidateSource, CoverageLevel, DiscoveryBasis,
+    EnumerateError, FileUnit, ProviderAdapter, ProviderMemoryType, SupportedArtifact,
 };
 
 // Story 1.3 adds the persistent Source identity + lifecycle + fingerprint

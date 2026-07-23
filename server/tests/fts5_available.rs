@@ -44,13 +44,13 @@ fn fts5_virtual_table_can_be_created() {
     // both work, not just the DDL.
     conn.execute(
         "INSERT INTO fts5_basic(title, body) VALUES (?1, ?2)",
-        &["hello", "world"],
+        ["hello", "world"],
     )
     .expect("insert into fts5_basic");
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM fts5_basic WHERE fts5_basic MATCH ?1",
-            &["hello OR world"],
+            ["hello OR world"],
             |row| row.get(0),
         )
         .expect("fts5 MATCH query");
@@ -82,13 +82,13 @@ fn fts5_trigram_tokenizer_is_available() {
     // Story 1.6 concern (see docs/phase-0-verification.md).
     conn.execute(
         "INSERT INTO fts5_trigram(body) VALUES (?1)",
-        &["记忆管理与本地优先"],
+        ["记忆管理与本地优先"],
     )
     .expect("insert CJK row");
     let hits: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM fts5_trigram WHERE fts5_trigram MATCH ?1",
-            &["记忆管理"],
+            ["记忆管理"],
             |row| row.get(0),
         )
         .expect("trigram MATCH query");

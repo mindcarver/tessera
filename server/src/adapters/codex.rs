@@ -49,11 +49,13 @@
 //! (not a test-local mirror of it). `discover()` is three steps of glue: read
 //! env → `discover_with_env`.
 
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::domain::ports::provider_adapter::{
-    CandidateSource, CoverageLevel, DiscoveryBasis, EnumerateError, FileUnit, ProviderAdapter,
+    ArtifactDiagnostic, ArtifactEnumeration, CandidateSource, CoverageLevel, DiscoveryBasis,
+    EnumerateError, FileUnit, ProviderAdapter, ProviderMemoryType, SupportedArtifact,
 };
 
 /// Codex Provider adapter (Story 1.2 discovery slice; Story 1.4 adds the
@@ -103,7 +105,16 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn enumerate_file_units(&self, root: &Path) -> Result<Vec<FileUnit>, EnumerateError> {
-        enumerate_codex_file_units(root)
+        Ok(self
+            .enumerate_artifacts(root)?
+            .supported
+            .into_iter()
+            .map(|artifact| artifact.file)
+            .collect())
+    }
+
+    fn enumerate_artifacts(&self, root: &Path) -> Result<ArtifactEnumeration, EnumerateError> {
+        enumerate_codex_artifacts(root)
     }
 }
 
@@ -192,114 +203,560 @@ pub fn resolve_codex_memories_root(
     if !p.is_absolute() {
         return None;
     }
-    Some((DiscoveryBasis::DefaultHome, p.join(".codex").join("memories")))
+    Some((
+        DiscoveryBasis::DefaultHome,
+        p.join(".codex").join("memories"),
+    ))
 }
 
-/// Enumerate the in-matrix file-level units under a confirmed Codex root
-/// (Story 1.4 — AD-11).
-///
-/// Boundary rules (Supported Artifact Matrix + spec Design Notes "枚举边界"):
-/// - The three known filenames at the root's first level.
-/// - `rollout_summaries/` direct `*.md` children only (one level, NOT
-///   recursive — a `rollout_summaries/nested/x.md` is skipped).
-/// - Everything else (`sessions/`, JSONL, `CLAUDE.md`, unknown files) is
-///   skipped, not indexed.
-/// - Symlink escape: every candidate file's realpath must `starts_with` the
-///   canonical root; a file that escapes (e.g. a symlinked `MEMORY.md`
-///   pointing outside) is skipped.
-/// - `root` itself must be canonicalize-able; if the root cannot be resolved
-///   the whole enumeration returns `Err(())` (the application layer maps this
-///   to a scan failure).
-///
-/// Metadata only — body content is never read here (NFR-5).
-fn enumerate_codex_file_units(root: &Path) -> Result<Vec<FileUnit>, EnumerateError> {
-    // Canonicalize the root once so every realpath containment check compares
-    // against the true on-disk absolute path.
+/// Parser-version contract. Output changes require a deliberate version
+/// decision rather than silently changing record identities or bodies.
+pub const CODEX_MARKDOWN_PARSER_VERSION: &str = "codex-markdown/v1";
+
+/// Canonical, source-relative Markdown unit. Locators are built by the scan
+/// service because only it owns Source identity and persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalMarkdownUnit {
+    pub unit_kind: String,
+    pub native_unit_id: String,
+    pub title: String,
+    pub body: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkdownParseError;
+
+/// Enumerate allowlisted Codex artifacts and lexical unknowns. A known
+/// artifact that cannot be resolved or inspected is terminal; only a proven
+/// root escape or resolved-role mismatch is silently excluded.
+fn enumerate_codex_artifacts(root: &Path) -> Result<ArtifactEnumeration, EnumerateError> {
     let canonical_root =
         std::fs::canonicalize(root).map_err(|_| EnumerateError::RootUnresolvable)?;
-    // Open the confirmed root before treating an empty enumeration as valid.
-    // Without this preflight, a root that cannot be listed can be mistaken
-    // for an intentionally empty memory directory.
-    std::fs::read_dir(&canonical_root).map_err(|_| EnumerateError::Unreadable)?;
-    let mut units = Vec::new();
+    let entries = std::fs::read_dir(&canonical_root).map_err(|_| EnumerateError::Unreadable)?;
+    let mut supported = Vec::new();
+    let mut diagnostics = Vec::new();
 
-    // The three known first-level filenames.
-    for name in KNOWN_ROOT_FILES {
-        let candidate = canonical_root.join(name);
-        if candidate.is_file() {
-            if let Some(unit) = file_unit_if_contained(&canonical_root, &candidate) {
-                units.push(unit);
+    for entry in entries {
+        let entry = entry.map_err(|_| EnumerateError::Unreadable)?;
+        let lexical_path = entry.path();
+        let name = entry.file_name();
+        let name_utf8 = name.to_str();
+        match name_utf8 {
+            Some(name) if KNOWN_ROOT_FILES.contains(&name) => {
+                let expected = root_memory_type(name).expect("known root artifact");
+                if let Some(artifact) =
+                    resolve_supported_artifact(&canonical_root, &lexical_path, expected, false)?
+                {
+                    supported.push(artifact);
+                }
             }
+            Some(ROLLOUT_SUMMARIES_DIR) => {
+                let real_dir = match std::fs::canonicalize(&lexical_path) {
+                    Ok(path) => path,
+                    Err(_) => return Err(EnumerateError::AllowlistedArtifactUnresolvable),
+                };
+                if !real_dir.starts_with(&canonical_root)
+                    || real_dir.strip_prefix(&canonical_root).ok()
+                        != Some(Path::new(ROLLOUT_SUMMARIES_DIR))
+                    || !std::fs::metadata(&real_dir)
+                        .map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?
+                        .is_dir()
+                {
+                    continue;
+                }
+                let rollout_entries = std::fs::read_dir(&real_dir)
+                    .map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?;
+                for rollout_entry in rollout_entries {
+                    let rollout_entry = rollout_entry
+                        .map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?;
+                    let rollout_path = rollout_entry.path();
+                    let observed = safe_relative_path(&canonical_root, &rollout_path);
+                    let is_markdown = rollout_entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|entry_name| entry_name.ends_with(".md"));
+                    if !is_markdown {
+                        diagnostics.push(unsupported_diagnostic(observed));
+                        continue;
+                    }
+                    if let Some(artifact) = resolve_supported_artifact(
+                        &canonical_root,
+                        &rollout_path,
+                        ProviderMemoryType::RolloutSummary,
+                        true,
+                    )? {
+                        supported.push(artifact);
+                    }
+                }
+            }
+            _ => diagnostics.push(unsupported_diagnostic(safe_relative_path(
+                &canonical_root,
+                &lexical_path,
+            ))),
         }
     }
 
-    // `rollout_summaries/` direct `*.md` children only (one level).
-    let rollout_dir = canonical_root.join(ROLLOUT_SUMMARIES_DIR);
-    if rollout_dir.is_dir() {
-        let real_rollout =
-            std::fs::canonicalize(&rollout_dir).map_err(|_| EnumerateError::Unreadable)?;
-        // A symlinked rollout directory may itself escape the confirmed root;
-        // reject it before opening the directory or observing its children.
-        if real_rollout.starts_with(&canonical_root) {
-            let entries =
-                std::fs::read_dir(&real_rollout).map_err(|_| EnumerateError::Unreadable)?;
-            for entry in entries {
-                let entry = entry.map_err(|_| EnumerateError::Unreadable)?;
-                let path = entry.path();
-                // Only regular files with a `.md` extension, one level deep.
-                if !path.is_file() {
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    continue;
-                }
-                if let Some(unit) = file_unit_if_contained(&canonical_root, &path) {
-                    units.push(unit);
-                }
-            }
-        }
-    }
-
-    // Stable ordering + dedup by relative path: an in-root symlink alias that
-    // canonicalizes to the same relative/real path as another unit collapses
-    // to ONE entry (spec Design Notes — "计数诚实"). Sorting is by relative
-    // path so the manifest (and therefore `manifest_revision`) is deterministic
-    // regardless of read_dir order.
-    units.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    units.dedup_by(|a, b| a.relative_path == b.relative_path);
-    Ok(units)
+    supported.sort_by(|a, b| a.file.relative_path.cmp(&b.file.relative_path));
+    supported.dedup_by(|a, b| a.file.relative_path == b.file.relative_path);
+    diagnostics.sort();
+    diagnostics.dedup();
+    Ok(ArtifactEnumeration {
+        supported,
+        diagnostics,
+    })
 }
 
-/// Build a [`FileUnit`] for `path` iff its realpath is contained inside
-/// `canonical_root` (AD-4 / symlink-escape rejection). Returns `None` for a
-/// file whose realpath escapes, a non-UTF-8 path, or a file whose metadata
-/// cannot be read. No body content is read (NFR-5).
-fn file_unit_if_contained(canonical_root: &Path, path: &Path) -> Option<FileUnit> {
-    // Realpath the file itself — resolves any symlink in its path.
-    let real = std::fs::canonicalize(path).ok()?;
-    // Containment: the realpath must be inside the canonical root.
-    if !real.starts_with(canonical_root) {
+// Retained as a narrow Story 1.4 compatibility seam for the adapter's
+// existing unit tests. Production scanning uses `enumerate_codex_artifacts`
+// so it can validate diagnostics and exact artifact roles as one boundary.
+#[cfg(test)]
+fn enumerate_codex_file_units(root: &Path) -> Result<Vec<FileUnit>, EnumerateError> {
+    Ok(enumerate_codex_artifacts(root)?
+        .supported
+        .into_iter()
+        .map(|artifact| artifact.file)
+        .collect())
+}
+
+fn root_memory_type(name: &str) -> Option<ProviderMemoryType> {
+    match name {
+        "MEMORY.md" => Some(ProviderMemoryType::Memory),
+        "memory_summary.md" => Some(ProviderMemoryType::MemorySummary),
+        "raw_memories.md" => Some(ProviderMemoryType::RawMemories),
+        _ => None,
+    }
+}
+
+fn resolve_supported_artifact(
+    canonical_root: &Path,
+    lexical_path: &Path,
+    expected_type: ProviderMemoryType,
+    is_rollout_child: bool,
+) -> Result<Option<SupportedArtifact>, EnumerateError> {
+    let real = match std::fs::canonicalize(lexical_path) {
+        Ok(path) => path,
+        Err(_) => return Err(EnumerateError::AllowlistedArtifactUnresolvable),
+    };
+    let Ok(relative) = real.strip_prefix(canonical_root) else {
+        return Ok(None);
+    };
+    let role_matches = if is_rollout_child {
+        relative.parent() == Some(Path::new(ROLLOUT_SUMMARIES_DIR))
+            && relative.extension().and_then(|value| value.to_str()) == Some("md")
+    } else {
+        relative
+            .to_str()
+            .and_then(root_memory_type)
+            .is_some_and(|actual| actual == expected_type)
+    };
+    if !role_matches {
+        return Ok(None);
+    }
+    let metadata =
+        std::fs::metadata(&real).map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?;
+    if !metadata.is_file() {
+        return Err(EnumerateError::AllowlistedArtifactUnresolvable);
+    }
+    let relative_path = relative
+        .to_str()
+        .ok_or(EnumerateError::AllowlistedArtifactUnresolvable)?
+        .to_string();
+    let mtime = metadata
+        .modified()
+        .map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?
+        .as_nanos() as i64;
+    Ok(Some(SupportedArtifact {
+        file: FileUnit {
+            relative_path,
+            absolute_path: real,
+            size: metadata.len(),
+            mtime,
+        },
+        memory_type: expected_type,
+    }))
+}
+
+fn unsupported_diagnostic(observed_path: String) -> ArtifactDiagnostic {
+    ArtifactDiagnostic {
+        kind: "unsupported_artifact",
+        observed_path,
+    }
+}
+
+/// Percent-encode an observed lexical path without attempting to turn it into
+/// UTF-8. This representation is reversible and safe for SQLite diagnostics.
+pub fn safe_relative_path(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        percent_encode(relative.as_os_str().as_bytes(), true)
+    }
+    #[cfg(not(unix))]
+    {
+        percent_encode(relative.to_string_lossy().as_bytes(), true)
+    }
+}
+
+/// Build a canonical, percent-encoded file URI. Paths and fragments are
+/// encoded independently; a line display range never participates in record
+/// identity.
+pub fn file_uri(path: &Path) -> Result<String, MarkdownParseError> {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_str().ok_or(MarkdownParseError)?.as_bytes();
+    if !path.is_absolute() {
+        return Err(MarkdownParseError);
+    }
+    Ok(format!("file://{}", percent_encode(bytes, true)))
+}
+
+pub fn percent_encode_fragment(value: &str) -> String {
+    percent_encode(value.as_bytes(), false)
+}
+
+fn percent_encode(bytes: &[u8], preserve_slash: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut output = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        let safe = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        if safe || (preserve_slash && byte == b'/') {
+            output.push(char::from(byte));
+        } else {
+            output.push('%');
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    output
+}
+
+/// Canonicalize one allowlisted Markdown file without rendering or logging
+/// body content. The grammar is intentionally narrow, deterministic, and
+/// dependency-free; unsupported/malformed UTF-8 is a typed parse failure.
+pub fn canonicalize_markdown(
+    bytes: &[u8],
+) -> Result<Vec<CanonicalMarkdownUnit>, MarkdownParseError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| MarkdownParseError)?;
+    let normalized = normalize_line_endings(text);
+    let terminal_newline = normalized.ends_with('\n');
+    let mut lines: Vec<&str> = normalized.split('\n').collect();
+    if normalized.ends_with('\n') {
+        lines.pop();
+    }
+    if lines.is_empty() && !normalized.is_empty() {
+        lines.push("");
+    }
+    let in_fence = fence_lines(&lines);
+    let headings = parse_headings(&lines, &in_fence);
+    if headings.is_empty() {
+        return Ok(vec![CanonicalMarkdownUnit {
+            unit_kind: "file".to_string(),
+            native_unit_id: "file".to_string(),
+            title: "File".to_string(),
+            body: normalized.clone(),
+            start_line: 1,
+            end_line: lines.len().max(1),
+        }]);
+    }
+
+    let mut records = Vec::new();
+    let first = headings[0].start;
+    if first > 0 {
+        records.push(CanonicalMarkdownUnit {
+            unit_kind: "preamble".to_string(),
+            native_unit_id: "preamble".to_string(),
+            title: "Preamble".to_string(),
+            body: join_range(&lines, 0, first, terminal_newline),
+            start_line: 1,
+            end_line: first,
+        });
+    }
+
+    let mut sibling_counts: HashMap<String, usize> = HashMap::new();
+    let mut ancestors: Vec<HeadingFrame> = Vec::new();
+    for (index, heading) in headings.iter().enumerate() {
+        while ancestors
+            .last()
+            .is_some_and(|frame| frame.level >= heading.level)
+        {
+            ancestors.pop();
+        }
+        let parent_key = ancestors
+            .iter()
+            .map(|frame| frame.segment.as_str())
+            .collect::<Vec<_>>()
+            .join("/");
+        let duplicate_key = format!(
+            "{}|{}|{}:{}",
+            parent_key,
+            heading.level,
+            heading.title.len(),
+            heading.title
+        );
+        let ordinal = sibling_counts.entry(duplicate_key).or_insert(0);
+        *ordinal += 1;
+        let segment = format!(
+            "h{}:{}:{}:{}",
+            heading.level,
+            heading.title.len(),
+            heading.title,
+            ordinal
+        );
+        let mut unit_id = String::from("section");
+        for frame in &ancestors {
+            unit_id.push('/');
+            unit_id.push_str(&frame.segment);
+        }
+        unit_id.push('/');
+        unit_id.push_str(&segment);
+        let end = headings
+            .get(index + 1)
+            .map_or(lines.len(), |next| next.start);
+        records.push(CanonicalMarkdownUnit {
+            unit_kind: "section".to_string(),
+            native_unit_id: unit_id,
+            title: heading.title.clone(),
+            body: join_range(&lines, heading.content_start, end, terminal_newline),
+            start_line: heading.start + 1,
+            end_line: end.max(heading.start + 1),
+        });
+        ancestors.push(HeadingFrame {
+            level: heading.level,
+            segment,
+        });
+    }
+    Ok(records)
+}
+
+fn normalize_line_endings(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(ch);
+        }
+    }
+    normalized
+}
+
+#[derive(Debug, Clone)]
+struct ParsedHeading {
+    start: usize,
+    content_start: usize,
+    level: usize,
+    title: String,
+}
+
+#[derive(Debug, Clone)]
+struct HeadingFrame {
+    level: usize,
+    segment: String,
+}
+
+fn parse_headings(lines: &[&str], in_fence: &[bool]) -> Vec<ParsedHeading> {
+    let mut headings = Vec::new();
+    let mut consumed = vec![false; lines.len()];
+    let mut index = 0;
+    while index < lines.len() {
+        if in_fence[index] || consumed[index] {
+            index += 1;
+            continue;
+        }
+        if let Some((level, title)) = parse_atx(lines[index]) {
+            headings.push(ParsedHeading {
+                start: index,
+                content_start: index + 1,
+                level,
+                title,
+            });
+            index += 1;
+            continue;
+        }
+        let setext_level = if index + 1 < lines.len()
+            && !in_fence[index + 1]
+            && !consumed[index + 1]
+            && valid_setext_title(lines[index])
+        {
+            parse_setext_underline(lines[index + 1])
+        } else {
+            None
+        };
+        if let Some(level) = setext_level {
+            headings.push(ParsedHeading {
+                start: index,
+                content_start: index + 2,
+                level,
+                title: trim_ascii(lines[index]).to_string(),
+            });
+            consumed[index + 1] = true;
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    headings
+}
+
+fn fence_lines(lines: &[&str]) -> Vec<bool> {
+    let mut result = vec![false; lines.len()];
+    let mut open: Option<(u8, usize)> = None;
+    for (index, line) in lines.iter().enumerate() {
+        if let Some((marker, width)) = open {
+            result[index] = true;
+            if is_fence_closer(line, marker, width) {
+                open = None;
+            }
+            continue;
+        }
+        if let Some((marker, width)) = parse_fence_opener(line) {
+            result[index] = true;
+            open = Some((marker, width));
+        }
+    }
+    result
+}
+
+fn parse_fence_opener(line: &str) -> Option<(u8, usize)> {
+    let bytes = line.as_bytes();
+    let offset = ascii_indent(bytes)?;
+    let marker = *bytes.get(offset)?;
+    if marker != b'`' && marker != b'~' {
         return None;
     }
-    // Relative path from the root (used as native_unit_id). Must be UTF-8.
-    let relative = real.strip_prefix(canonical_root).ok()?;
-    let relative_str = relative.to_str()?;
-    let meta = std::fs::metadata(&real).ok()?;
-    // Sub-second precision (AD-34 / spec Design Notes — "manifest 时间精度"):
-    // nanoseconds since the Unix epoch, NOT whole seconds, so a same-second
-    // same-size rewrite still changes the manifest.
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as i64;
-    Some(FileUnit {
-        relative_path: relative_str.to_string(),
-        absolute_path: real,
-        size: meta.len(),
-        mtime,
-    })
+    let width = bytes[offset..]
+        .iter()
+        .take_while(|&&value| value == marker)
+        .count();
+    if width < 3 {
+        return None;
+    }
+    let info = &line[offset + width..];
+    if marker == b'`' && info.contains('`') {
+        return None;
+    }
+    Some((marker, width))
+}
+
+fn is_fence_closer(line: &str, marker: u8, width: usize) -> bool {
+    let bytes = line.as_bytes();
+    let Some(offset) = ascii_indent(bytes) else {
+        return false;
+    };
+    if bytes.get(offset) != Some(&marker) {
+        return false;
+    }
+    let actual = bytes[offset..]
+        .iter()
+        .take_while(|&&value| value == marker)
+        .count();
+    actual >= width
+        && bytes[offset + actual..]
+            .iter()
+            .all(|value| matches!(value, b' ' | b'\t'))
+}
+
+fn parse_atx(line: &str) -> Option<(usize, String)> {
+    let bytes = line.as_bytes();
+    let offset = ascii_indent(bytes)?;
+    let level = bytes[offset..]
+        .iter()
+        .take_while(|&&value| value == b'#')
+        .count();
+    if !(1..=6).contains(&level) || !matches!(bytes.get(offset + level), None | Some(b' ' | b'\t'))
+    {
+        return None;
+    }
+    let mut title = trim_ascii(&line[offset + level..]);
+    let without_spaces = trim_ascii_end(title);
+    let hashes = without_spaces
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&value| value == b'#')
+        .count();
+    if hashes > 0 {
+        let before = &without_spaces[..without_spaces.len() - hashes];
+        if before
+            .as_bytes()
+            .last()
+            .is_some_and(|value| matches!(value, b' ' | b'\t'))
+        {
+            title = trim_ascii_end(before);
+        }
+    }
+    Some((level, title.to_string()))
+}
+
+fn parse_setext_underline(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let offset = ascii_indent(bytes)?;
+    let marker = *bytes.get(offset)?;
+    if marker != b'=' && marker != b'-' {
+        return None;
+    }
+    let width = bytes[offset..]
+        .iter()
+        .take_while(|&&value| value == marker)
+        .count();
+    if width == 0
+        || !bytes[offset + width..]
+            .iter()
+            .all(|value| matches!(value, b' ' | b'\t'))
+    {
+        return None;
+    }
+    Some(if marker == b'=' { 1 } else { 2 })
+}
+
+fn valid_setext_title(line: &str) -> bool {
+    ascii_indent(line.as_bytes()).is_some()
+        && !trim_ascii(line).is_empty()
+        && parse_setext_underline(line).is_none()
+        && parse_atx(line).is_none()
+}
+
+fn ascii_indent(bytes: &[u8]) -> Option<usize> {
+    let spaces = bytes.iter().take_while(|&&byte| byte == b' ').count();
+    if spaces <= 3 && bytes.get(spaces) != Some(&b'\t') {
+        Some(spaces)
+    } else {
+        None
+    }
+}
+
+fn trim_ascii(value: &str) -> &str {
+    value.trim_matches(|ch| matches!(ch, ' ' | '\t'))
+}
+
+fn trim_ascii_end(value: &str) -> &str {
+    value.trim_end_matches([' ', '\t'])
+}
+
+fn join_range(lines: &[&str], start: usize, end: usize, terminal_newline: bool) -> String {
+    let start = start.min(lines.len());
+    let end = end.min(lines.len());
+    if start >= end {
+        return String::new();
+    }
+    let mut body = lines[start..end].join("\n");
+    if end < lines.len() || terminal_newline {
+        body.push('\n');
+    }
+    body
 }
 
 #[cfg(test)]
@@ -319,8 +776,8 @@ mod tests {
     /// Empty CODEX_HOME is treated as unset → falls back to default home.
     #[test]
     fn resolver_treats_empty_codex_home_as_unset() {
-        let (basis, root) = resolve_codex_memories_root(Some(""), Some("/home/u"))
-            .expect("home set → Some");
+        let (basis, root) =
+            resolve_codex_memories_root(Some(""), Some("/home/u")).expect("home set → Some");
         assert_eq!(basis, DiscoveryBasis::DefaultHome);
         assert_eq!(root, PathBuf::from("/home/u/.codex/memories"));
     }
@@ -351,8 +808,8 @@ mod tests {
     /// No CODEX_HOME but HOME set → default home basis.
     #[test]
     fn resolver_falls_back_to_default_home() {
-        let (basis, root) = resolve_codex_memories_root(None, Some("/home/u"))
-            .expect("home set → Some");
+        let (basis, root) =
+            resolve_codex_memories_root(None, Some("/home/u")).expect("home set → Some");
         assert_eq!(basis, DiscoveryBasis::DefaultHome);
         assert_eq!(root, PathBuf::from("/home/u/.codex/memories"));
     }
@@ -446,11 +903,8 @@ mod tests {
         std::fs::write(root.join("MEMORY.md"), "mem").expect("w");
         // A file outside the root, symlinked in as memory_summary.md.
         std::fs::write(outside.join("secret.md"), "secret").expect("w");
-        std::os::unix::fs::symlink(
-            outside.join("secret.md"),
-            root.join("memory_summary.md"),
-        )
-        .expect("symlink");
+        std::os::unix::fs::symlink(outside.join("secret.md"), root.join("memory_summary.md"))
+            .expect("symlink");
 
         let units = enumerate_codex_file_units(&root).expect("enumerate ok");
         let rels: Vec<&str> = units.iter().map(|u| u.relative_path.as_str()).collect();
@@ -475,7 +929,11 @@ mod tests {
 
         let units = enumerate_codex_file_units(&root).expect("enumerate ok");
         let rels: Vec<&str> = units.iter().map(|u| u.relative_path.as_str()).collect();
-        assert_eq!(rels, vec!["MEMORY.md"], "external rollout directory skipped");
+        assert_eq!(
+            rels,
+            vec!["MEMORY.md"],
+            "external rollout directory skipped"
+        );
     }
 
     /// Enumeration of an empty directory succeeds with zero units (spec I/O

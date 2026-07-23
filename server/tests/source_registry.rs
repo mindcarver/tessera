@@ -7,7 +7,7 @@
 //! application layer, exactly as the IPC commands would.
 //!
 //! Coverage:
-//! - migration id 2 (`v1_source_registry`) applies and schema_version = 3
+//! - migration id 2 (`v1_source_registry`) applies and schema_version = 4
 //!   (after the appended 1.4 migration id 3, `v2_scan_generations`).
 //! - confirm new candidate → `src_<n>` + `confirmed` + fingerprint persisted.
 //! - idempotent re-confirm → same `source_id`, no new row.
@@ -43,7 +43,7 @@ use tessera_lib::index::SourceRegistry;
 
 /// Open a fresh in-memory DB and apply all migrations (v0_meta +
 /// v1_source_registry + v2_scan_generations). Returns a connection at
-/// schema_version 3 with foreign-key enforcement ON (matching boot).
+/// schema_version 4 with foreign-key enforcement ON (matching boot).
 fn fresh_db() -> Connection {
     let mut conn = Connection::open_in_memory().expect("open in-memory db");
     conn.execute_batch("PRAGMA foreign_keys = ON;")
@@ -101,12 +101,11 @@ fn walk(dir: &std::path::Path, out: &mut Vec<(PathBuf, SystemTime, u64, Vec<u8>)
 // Migration
 // ---------------------------------------------------------------------------
 
-/// Migration id 2 (`v1_source_registry`) applies on a fresh DB. Story 1.4
-/// appended migration id 3 (`v2_scan_generations`), so `schema_version`
-/// advances to 3 (CURRENT_SCHEMA_VERSION); the v1 table and its unique index
-/// still exist and the v1 audit row is still recorded.
+/// Migration id 2 (`v1_source_registry`) applies on a fresh DB. Stories 1.4
+/// and 1.5 append migrations 3 and 4, so `schema_version` advances to 4; the
+/// v1 table and its unique index still exist and the v1 audit row is recorded.
 #[test]
-fn migration_v1_source_registry_applies_and_sets_schema_version_3() {
+fn migration_v1_source_registry_applies_and_sets_schema_version_4() {
     let conn = fresh_db();
     let v: String = conn
         .query_row(
@@ -115,7 +114,7 @@ fn migration_v1_source_registry_applies_and_sets_schema_version_3() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(v, "3", "schema_version must be 3 after migration v2 (1.4)");
+    assert_eq!(v, "4", "schema_version must be 4 after Story 1.5 migration");
 
     // The table + unique index exist.
     let table: i64 = conn
@@ -168,7 +167,10 @@ fn confirm_new_candidate_persists_confirmed_source_with_fingerprint() {
     assert_eq!(source.provider, "codex");
     assert_eq!(source.lifecycle_state, SourceLifecycle::Confirmed);
     assert_eq!(source.coverage_level, CoverageLevel::Full);
-    assert!(source.normalized_root_path.starts_with('/'), "normalized abs");
+    assert!(
+        source.normalized_root_path.starts_with('/'),
+        "normalized abs"
+    );
     assert!(!source.fingerprint.0.is_empty(), "fingerprint stored");
 
     // persisted: re-reading via the fingerprint returns the same row.
@@ -338,10 +340,7 @@ fn disable_unknown_source_id_returns_source_not_found() {
     let registry = SourceRegistry::new(&conn);
     let bogus = SourceId("src_99999".to_string());
     let err = application::disable_source(&registry, &bogus).expect_err("unknown id");
-    assert!(matches!(
-        err,
-        application::SourceError::SourceNotFound
-    ));
+    assert!(matches!(err, application::SourceError::SourceNotFound));
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +393,8 @@ fn find_by_fingerprint_is_exact_equality() {
     let conn = fresh_db();
     let registry = SourceRegistry::new(&conn);
 
-    let source = application::confirm_source(&registry, &candidate_for(&memories)).expect("confirm");
+    let source =
+        application::confirm_source(&registry, &candidate_for(&memories)).expect("confirm");
     let stored = &source.fingerprint;
 
     // Exact match.
@@ -406,9 +406,7 @@ fn find_by_fingerprint_is_exact_equality() {
 
     // Truncated fingerprint does NOT match.
     let truncated = SourceFingerprint(stored.0[..stored.0.len() - 1].to_string());
-    let none = registry
-        .find_by_fingerprint(&truncated)
-        .expect("db ok");
+    let none = registry.find_by_fingerprint(&truncated).expect("db ok");
     assert!(none.is_none(), "truncated fingerprint must not match");
 
     // Empty fingerprint does not match.

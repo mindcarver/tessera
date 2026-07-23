@@ -54,6 +54,11 @@ pub static MIGRATIONS: &[Migration] = &[
         name: "v2_scan_generations",
         apply: v2_scan_generations,
     },
+    Migration {
+        id: 4,
+        name: "v3_canonical_memory_records",
+        apply: v3_canonical_memory_records,
+    },
 ];
 
 /// Ensure the meta tables exist on a fresh DB so [`apply`] can read
@@ -221,6 +226,45 @@ fn v2_scan_generations(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// v3 (migration id `4`) — canonical record provenance and source-scoped
+/// diagnostics (Story 1.5).
+///
+/// The previous file-level records cannot truthfully populate section title,
+/// body, independent display locations, or source-file revisions. The
+/// migration is additive at schema level, then atomically invalidates that
+/// derived state: Source Registry rows remain, while old records, scan runs,
+/// active markers, and their diagnostics are removed for a clean rebuild.
+fn v3_canonical_memory_records(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE memory_records ADD COLUMN title TEXT NOT NULL DEFAULT '';
+        ALTER TABLE memory_records ADD COLUMN body TEXT NOT NULL DEFAULT '';
+        ALTER TABLE memory_records ADD COLUMN native_project TEXT;
+        ALTER TABLE memory_records ADD COLUMN provider_memory_type TEXT NOT NULL DEFAULT '';
+        ALTER TABLE memory_records ADD COLUMN coverage_level TEXT NOT NULL DEFAULT '';
+        ALTER TABLE memory_records ADD COLUMN observed_at INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE memory_records ADD COLUMN source_revision TEXT NOT NULL DEFAULT '';
+        ALTER TABLE memory_records ADD COLUMN display_locator TEXT NOT NULL DEFAULT '';
+
+        CREATE TABLE scan_diagnostics (
+            source_id     INTEGER NOT NULL REFERENCES source_registry(id),
+            generation    TEXT    NOT NULL,
+            kind          TEXT    NOT NULL,
+            observed_path TEXT    NOT NULL,
+            PRIMARY KEY (source_id, generation, kind, observed_path)
+        ) STRICT;
+
+        CREATE INDEX scan_diagnostics_source_generation
+            ON scan_diagnostics(source_id, generation);
+
+        DELETE FROM memory_records;
+        DELETE FROM scan_runs;
+        DELETE FROM tessera_meta WHERE key LIKE 'active_generation:%';
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Apply all pending migrations atomically (AD-29).
 ///
 /// Semantics:
@@ -327,9 +371,10 @@ mod tests {
         // `fresh_db` applies ALL migrations in MIGRATIONS. Phase 0 shipped only
         // v0_meta (id 1) so schema_version was 1; Story 1.3 appended
         // v1_source_registry (id 2) and Story 1.4 appended v2_scan_generations
-        // (id 3), so the post-apply schema_version is now 3.
+        // (id 3), and Story 1.5 appended v3_canonical_memory_records (id 4),
+        // so the post-apply schema_version is now 4.
         // The `0` value remains reserved as the pre-migration sentinel.
-        assert_eq!(v, "3");
+        assert_eq!(v, "4");
     }
 
     #[test]
@@ -361,8 +406,8 @@ mod tests {
             .expect("count");
         // Phase 0 shipped 1 migration (v0_meta); Story 1.3 appended
         // v1_source_registry and Story 1.4 appended v2_scan_generations, so the
-        // idempotent baseline is now 3 audit rows.
-        assert_eq!(count, 3, "exactly three audit rows after idempotent re-run");
+        // v3_canonical_memory_records makes the idempotent baseline four audit rows.
+        assert_eq!(count, 4, "exactly four audit rows after idempotent re-run");
     }
 
     /// AD-29 / A-7: migration is atomic. If a later migration fails mid-batch,
@@ -372,16 +417,16 @@ mod tests {
     /// binding "atomic apply" invariant.
     ///
     /// The current shipping migrations are v0_meta (id 1), v1_source_registry
-    /// (id 2), and v2_scan_generations (id 3). This test starts from a
-    /// fully-migrated DB (schema_version = 3) and simulates a failing migration
-    /// id 4; the rollback must preserve schema_version = 3 and record no audit
-    /// row for id 4.
+    /// (id 2), v2_scan_generations (id 3), and v3_canonical_memory_records
+    /// (id 4). This test starts from a fully-migrated DB (schema_version = 4)
+    /// and simulates a failing migration id 5; the rollback must preserve
+    /// schema_version = 4 and record no audit row for id 5.
     #[test]
     fn failed_migration_batch_rolls_back_atomically() {
         let mut conn = Connection::open_in_memory().expect("open db");
         apply(&mut conn).expect("all shipping migrations apply on first boot");
 
-        // After all shipping migrations: schema_version = 3, three audit rows.
+        // After all shipping migrations: schema_version = 4, four audit rows.
         let pre_version: String = conn
             .query_row(
                 "SELECT value FROM tessera_meta WHERE key = 'schema_version'",
@@ -389,7 +434,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema_version readable");
-        assert_eq!(pre_version, "3");
+        assert_eq!(pre_version, "4");
 
         // Simulate a failing follow-up migration. The failing migration
         // writes a sentinel table first, then errors; the atomic batch must
@@ -404,7 +449,11 @@ mod tests {
         }
 
         let failing_batch: &[Migration] = &[
-            Migration { id: 1, name: "v0_meta", apply: v0_meta },
+            Migration {
+                id: 1,
+                name: "v0_meta",
+                apply: v0_meta,
+            },
             Migration {
                 id: 2,
                 name: "v1_source_registry",
@@ -415,7 +464,16 @@ mod tests {
                 name: "v2_scan_generations",
                 apply: v2_scan_generations,
             },
-            Migration { id: 4, name: "partial_then_fail", apply: partial_then_fail },
+            Migration {
+                id: 4,
+                name: "v3_canonical_memory_records",
+                apply: v3_canonical_memory_records,
+            },
+            Migration {
+                id: 5,
+                name: "partial_then_fail",
+                apply: partial_then_fail,
+            },
         ];
 
         // Manually replay the apply loop with the extended batch so we can
@@ -425,7 +483,10 @@ mod tests {
             .query_row(
                 "SELECT value FROM tessera_meta WHERE key = 'schema_version'",
                 [],
-                |row| row.get::<_, String>(0).map(|s| s.parse::<u32>().unwrap_or(0)),
+                |row| {
+                    row.get::<_, String>(0)
+                        .map(|s| s.parse::<u32>().unwrap_or(0))
+                },
             )
             .unwrap_or(0);
         let pending: Vec<&Migration> = failing_batch.iter().filter(|m| m.id > current).collect();
@@ -465,7 +526,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema_version still readable after rollback");
-        assert_eq!(post_version, "3", "schema_version must not advance on failure");
+        assert_eq!(
+            post_version, "4",
+            "schema_version must not advance on failure"
+        );
 
         let audit_count: i64 = conn
             .query_row(
@@ -474,7 +538,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count");
-        assert_eq!(audit_count, 3, "no audit row recorded for the failed migration");
+        assert_eq!(
+            audit_count, 4,
+            "no audit row recorded for the failed migration"
+        );
 
         // The sentinel table the failing migration created must NOT exist:
         // the entire batch — including DDL inside it — was rolled back.
@@ -485,6 +552,9 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("check sentinel table absence");
-        assert_eq!(table_exists, 0, "DDL from failed migration must be rolled back");
+        assert_eq!(
+            table_exists, 0,
+            "DDL from failed migration must be rolled back"
+        );
     }
 }

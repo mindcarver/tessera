@@ -22,10 +22,11 @@ pub mod source_registry;
 ///
 /// Phase 0 shipped migration id `1` (`v0_meta`). Story 1.3 appended migration
 /// id `2` (`v1_source_registry`); Story 1.4 appended migration id `3`
-/// (`v2_scan_generations`), so the post-1.4 schema version is `3`. The value
+/// (`v2_scan_generations`), and Story 1.5 appended migration id `4`
+/// (`v3_canonical_memory_records`), so the current schema version is `4`. The value
 /// `0` is reserved as the pre-migration sentinel on a fresh database and is
 /// never a valid `CURRENT_SCHEMA_VERSION`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Re-export the registry so application / IPC code can name it without a long
 /// path.

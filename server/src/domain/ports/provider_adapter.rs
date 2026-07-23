@@ -29,6 +29,28 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Codex's four allowlisted memory artifact roles. This is provider metadata,
+/// not inferred from a path or a Markdown body by the application layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMemoryType {
+    Memory,
+    MemorySummary,
+    RawMemories,
+    RolloutSummary,
+}
+
+impl ProviderMemoryType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::MemorySummary => "memory_summary",
+            Self::RawMemories => "raw_memories",
+            Self::RolloutSummary => "rollout_summary",
+        }
+    }
+}
+
 /// Coverage Level declared by a provider adapter (AD-3 / AD-7 / AD-18).
 ///
 /// The level describes *what the provider surface allows*, not what a single
@@ -159,6 +181,49 @@ pub struct FileUnit {
     pub mtime: i64,
 }
 
+/// An allowlisted source artifact plus its provider-declared role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedArtifact {
+    pub file: FileUnit,
+    pub memory_type: ProviderMemoryType,
+}
+
+/// A safe source-scoped observation for an in-root artifact which is not in
+/// the supported matrix. `observed_path` is a reversible percent-encoded
+/// lexical path; it never contains source body text.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArtifactDiagnostic {
+    pub kind: &'static str,
+    pub observed_path: String,
+}
+
+/// Complete artifact observation used as both the initial scan boundary and
+/// the final validation boundary. Diagnostics are part of the observation so
+/// they cannot silently drift between staging and activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactEnumeration {
+    pub supported: Vec<SupportedArtifact>,
+    pub diagnostics: Vec<ArtifactDiagnostic>,
+}
+
+impl ArtifactEnumeration {
+    pub fn from_file_units(units: Vec<FileUnit>) -> Self {
+        Self {
+            supported: units
+                .into_iter()
+                .map(|file| SupportedArtifact {
+                    file,
+                    // This default only supports existing Story 1.4 test
+                    // adapters. The real Codex adapter always supplies its
+                    // exact allowlist role.
+                    memory_type: ProviderMemoryType::Memory,
+                })
+                .collect(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
 /// The error returned by [`ProviderAdapter::enumerate_file_units`].
 ///
 /// The spec forbids `Result<_, ()>` on the port (Code Map: "错误类型由实现
@@ -174,6 +239,10 @@ pub enum EnumerateError {
     /// A directory inside the root (e.g. `rollout_summaries/`) could not be
     /// read during enumeration. Maps to scan `EnumerationFailed`.
     Unreadable,
+    /// An observed allowlisted artifact could not be resolved, inspected, or
+    /// read. This is terminal rather than a diagnostic so a supported memory
+    /// cannot disappear from a successful generation.
+    AllowlistedArtifactUnresolvable,
 }
 
 impl std::fmt::Display for EnumerateError {
@@ -181,6 +250,9 @@ impl std::fmt::Display for EnumerateError {
         match self {
             EnumerateError::RootUnresolvable => f.write_str("root unresolvable"),
             EnumerateError::Unreadable => f.write_str("directory unreadable"),
+            EnumerateError::AllowlistedArtifactUnresolvable => {
+                f.write_str("allowlisted artifact unresolvable")
+            }
         }
     }
 }
@@ -238,4 +310,12 @@ pub trait ProviderAdapter: std::fmt::Debug {
     /// present" result, NOT an error (spec I/O matrix — empty directory scan
     /// succeeds).
     fn enumerate_file_units(&self, root: &Path) -> Result<Vec<FileUnit>, EnumerateError>;
+
+    /// Enumerate the complete provider observation. The default preserves the
+    /// Story 1.4 test seam; real adapters override it to attach exact artifact
+    /// roles and safe unsupported-artifact diagnostics.
+    fn enumerate_artifacts(&self, root: &Path) -> Result<ArtifactEnumeration, EnumerateError> {
+        self.enumerate_file_units(root)
+            .map(ArtifactEnumeration::from_file_units)
+    }
 }

@@ -120,7 +120,7 @@ pub struct ScanOutcome {
     pub scan_id: i64,
     /// The generation that became active as a result of this scan.
     pub generation: Generation,
-    /// Number of file-level records indexed into the active generation.
+    /// Number of canonical records indexed into the active generation.
     pub records_indexed: u64,
 }
 
@@ -169,6 +169,10 @@ pub enum ScanError {
     /// A file read failed during hashing (permissions / vanished mid-scan).
     /// Maps to `scan_failed`.
     ReadFailed,
+    /// An allowlisted Markdown source could not be decoded or canonicalized.
+    /// Its body and path remain out of the error surface; the persisted run is
+    /// marked `parse_failed` and any prior active generation stays visible.
+    ParseFailed,
     /// The final manifest re-validation detected a source change (size /
     /// mtime / file-set drift). Maps to `scan_failed`; the run is marked
     /// `error_code='dirty_after_validation'` and its generation is never
@@ -205,6 +209,7 @@ impl ScanError {
         match self {
             ScanError::DirtyAfterValidation => "dirty_after_validation",
             ScanError::ReadFailed => "read_failed",
+            ScanError::ParseFailed => "parse_failed",
             ScanError::EnumerationFailed | ScanError::EmptyScanWithActiveGeneration => {
                 "enumeration_failed"
             }
@@ -357,8 +362,12 @@ mod tests {
     fn build_record_id_differs_when_any_input_differs() {
         let sid = SourceId("src_1".to_string());
         let base = build_record_id(&sid, "codex", "file:///x/MEMORY.md", "file");
-        let diff_source =
-            build_record_id(&SourceId("src_2".to_string()), "codex", "file:///x/MEMORY.md", "file");
+        let diff_source = build_record_id(
+            &SourceId("src_2".to_string()),
+            "codex",
+            "file:///x/MEMORY.md",
+            "file",
+        );
         let diff_provider = build_record_id(&sid, "claude_code", "file:///x/MEMORY.md", "file");
         let diff_locator = build_record_id(&sid, "codex", "file:///x/other.md", "file");
         let diff_kind = build_record_id(&sid, "codex", "file:///x/MEMORY.md", "section");
@@ -371,18 +380,8 @@ mod tests {
     #[test]
     fn build_record_id_is_injection_safe_against_length_collisions() {
         // Netstring length-prefixing disambiguates variable-length segments.
-        let a = build_record_id(
-            &SourceId("src_1".to_string()),
-            "ab",
-            "file:///c",
-            "file",
-        );
-        let b = build_record_id(
-            &SourceId("src_1".to_string()),
-            "a",
-            "bfile:///c",
-            "file",
-        );
+        let a = build_record_id(&SourceId("src_1".to_string()), "ab", "file:///c", "file");
+        let b = build_record_id(&SourceId("src_1".to_string()), "a", "bfile:///c", "file");
         assert_ne!(a, b);
     }
 
@@ -443,6 +442,7 @@ mod tests {
             ScanError::EnumerationFailed,
             ScanError::EmptyScanWithActiveGeneration,
             ScanError::ReadFailed,
+            ScanError::ParseFailed,
             ScanError::DirtyAfterValidation,
             ScanError::CommitCasFailed,
             ScanError::Internal,
@@ -461,7 +461,11 @@ mod tests {
             "dirty_after_validation"
         );
         assert_eq!(ScanError::ReadFailed.error_code(), "read_failed");
-        assert_eq!(ScanError::EnumerationFailed.error_code(), "enumeration_failed");
+        assert_eq!(ScanError::ParseFailed.error_code(), "parse_failed");
+        assert_eq!(
+            ScanError::EnumerationFailed.error_code(),
+            "enumeration_failed"
+        );
         assert_eq!(
             ScanError::EmptyScanWithActiveGeneration.error_code(),
             "enumeration_failed"

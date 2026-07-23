@@ -22,12 +22,13 @@ use std::time::SystemTime;
 use rusqlite::Connection;
 use tempfile::tempdir;
 
-use tessera_lib::adapters::codex::CodexAdapter;
+use tessera_lib::adapters::codex::{file_uri, percent_encode_fragment, CodexAdapter};
 use tessera_lib::application;
 use tessera_lib::domain::ports::provider_adapter::{
-    CandidateSource, CoverageLevel, DiscoveryBasis, EnumerateError, FileUnit, ProviderAdapter,
+    ArtifactDiagnostic, ArtifactEnumeration, CandidateSource, CoverageLevel, DiscoveryBasis,
+    EnumerateError, FileUnit, ProviderAdapter,
 };
-use tessera_lib::domain::scan::ScanError;
+use tessera_lib::domain::scan::{build_record_id, ScanError};
 use tessera_lib::domain::source::{Source, SourceLifecycle};
 use tessera_lib::index::migrations;
 use tessera_lib::index::scan_store::ScanStore;
@@ -39,7 +40,7 @@ use tessera_lib::index::SourceRegistry;
 
 /// Open a fresh in-memory DB and apply all migrations (v0_meta +
 /// v1_source_registry + v2_scan_generations). Returns a connection at
-/// schema_version 3 with foreign-key enforcement ON (matching boot — the v2
+/// schema_version 4 with foreign-key enforcement ON (matching boot — the v3
 /// `memory_records.source_id` reference must actually be policed).
 fn fresh_db() -> Connection {
     let mut conn = Connection::open_in_memory().expect("open in-memory db");
@@ -195,10 +196,9 @@ struct MtimeBumpAdapter {
     calls: AtomicUsize,
 }
 
-/// An adapter that enumerates a legitimate in-root file, then retargets that
-/// visible filename to an outside symlink before the pipeline can read it.
-/// The pipeline must bind the enumerated canonical target, not merely the
-/// relative name that still appears in the final directory listing.
+/// An adapter that retargets an in-root file immediately after final
+/// enumeration. The digest validation must reject it before reading outside
+/// the confirmed root.
 #[cfg(unix)]
 #[derive(Debug)]
 struct RetargetAfterEnumerationAdapter {
@@ -233,13 +233,112 @@ impl ProviderAdapter for RetargetAfterEnumerationAdapter {
     fn enumerate_file_units(&self, root: &Path) -> Result<Vec<FileUnit>, EnumerateError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         let units = CodexAdapter.enumerate_file_units(root)?;
-        if call == 0 {
-            fs::write(&self.outside, "outside\n").expect("write outside");
+        if call == 1 {
+            fs::create_dir(&self.outside).expect("create outside directory");
             fs::remove_file(root.join("MEMORY.md")).expect("remove in-root file");
             std::os::unix::fs::symlink(&self.outside, root.join("MEMORY.md"))
                 .expect("retarget source file");
         }
         Ok(units)
+    }
+}
+
+/// An adapter that changes a source file after final enumeration while
+/// preserving its size and restored mtime. Only the final byte-digest check
+/// can detect this drift.
+#[derive(Debug)]
+struct SameMetadataMutationAdapter {
+    calls: AtomicUsize,
+    replacement: Vec<u8>,
+}
+
+impl SameMetadataMutationAdapter {
+    fn new(replacement: &[u8]) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            replacement: replacement.to_vec(),
+        }
+    }
+}
+
+impl ProviderAdapter for SameMetadataMutationAdapter {
+    fn provider_id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn coverage_level(&self) -> CoverageLevel {
+        CoverageLevel::Full
+    }
+
+    fn discover(&self) -> Vec<CandidateSource> {
+        Vec::new()
+    }
+
+    fn enumerate_file_units(&self, root: &Path) -> Result<Vec<FileUnit>, EnumerateError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let units = CodexAdapter.enumerate_file_units(root)?;
+        if call == 1 {
+            let target = units
+                .iter()
+                .find(|unit| unit.relative_path == "MEMORY.md")
+                .expect("memory unit");
+            let modified = fs::metadata(&target.absolute_path)
+                .expect("metadata")
+                .modified()
+                .expect("modified time");
+            fs::write(&target.absolute_path, &self.replacement).expect("same-size rewrite");
+            fs::File::open(&target.absolute_path)
+                .expect("open rewritten source")
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .expect("restore mtime");
+        }
+        Ok(units)
+    }
+}
+
+/// An adapter whose final artifact observation adds a safe diagnostic. Final
+/// enumeration equality must reject the run rather than activating stale
+/// diagnostics.
+#[derive(Debug)]
+struct DiagnosticDriftAdapter {
+    calls: AtomicUsize,
+}
+
+impl DiagnosticDriftAdapter {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ProviderAdapter for DiagnosticDriftAdapter {
+    fn provider_id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn coverage_level(&self) -> CoverageLevel {
+        CoverageLevel::Full
+    }
+
+    fn discover(&self) -> Vec<CandidateSource> {
+        Vec::new()
+    }
+
+    fn enumerate_file_units(&self, root: &Path) -> Result<Vec<FileUnit>, EnumerateError> {
+        CodexAdapter.enumerate_file_units(root)
+    }
+
+    fn enumerate_artifacts(&self, root: &Path) -> Result<ArtifactEnumeration, EnumerateError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut observation = CodexAdapter.enumerate_artifacts(root)?;
+        if call == 1 {
+            observation.diagnostics.push(ArtifactDiagnostic {
+                kind: "unsupported_artifact",
+                observed_path: "late-note.txt".to_string(),
+            });
+        }
+        Ok(observation)
     }
 }
 
@@ -304,11 +403,10 @@ impl ProviderAdapter for FailingEnumAdapter {
 // Migration
 // ---------------------------------------------------------------------------
 
-/// Migration id 3 (`v2_scan_generations`) applies on a fresh DB and
-/// `schema_version` advances to 3; both tables and both indexes exist; the v2
-/// audit row is recorded.
+/// Migration id 4 (`v3_canonical_memory_records`) applies on a fresh DB and
+/// creates the canonical provenance and diagnostic projection tables.
 #[test]
-fn migration_v2_scan_generations_applies_and_sets_schema_version_3() {
+fn migration_v3_canonical_memory_records_applies_and_sets_schema_version_4() {
     let conn = fresh_db();
     let v: String = conn
         .query_row(
@@ -317,9 +415,9 @@ fn migration_v2_scan_generations_applies_and_sets_schema_version_3() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(v, "3");
+    assert_eq!(v, "4");
 
-    for table in ["scan_runs", "memory_records"] {
+    for table in ["scan_runs", "memory_records", "scan_diagnostics"] {
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -329,7 +427,11 @@ fn migration_v2_scan_generations_applies_and_sets_schema_version_3() {
             .expect("check table");
         assert_eq!(n, 1, "table {table} exists");
     }
-    for index in ["scan_runs_source_fencing", "memory_records_source_generation"] {
+    for index in [
+        "scan_runs_source_fencing",
+        "memory_records_source_generation",
+        "scan_diagnostics_source_generation",
+    ] {
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
@@ -342,13 +444,70 @@ fn migration_v2_scan_generations_applies_and_sets_schema_version_3() {
 
     let (id, name): (i64, String) = conn
         .query_row(
-            "SELECT id, name FROM tessera_migrations_applied WHERE id = 3",
+            "SELECT id, name FROM tessera_migrations_applied WHERE id = 4",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .expect("v2 audit row");
-    assert_eq!(id, 3);
-    assert_eq!(name, "v2_scan_generations");
+        .expect("v3 audit row");
+    assert_eq!(id, 4);
+    assert_eq!(name, "v3_canonical_memory_records");
+}
+
+#[test]
+fn v3_upgrade_keeps_source_registry_and_invalidates_old_derived_state() {
+    let mut conn = Connection::open_in_memory().expect("open legacy database");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE tessera_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+        CREATE TABLE tessera_migrations_applied (
+            id INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
+        ) STRICT;
+        INSERT INTO tessera_meta(key, value) VALUES ('schema_version', '3');
+        INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1');
+        CREATE TABLE source_registry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL, source_kind TEXT NOT NULL, lifecycle_state TEXT NOT NULL,
+            health_state TEXT NOT NULL, coverage_level TEXT NOT NULL,
+            normalized_root_path TEXT NOT NULL, fingerprint TEXT NOT NULL, native_project TEXT
+        ) STRICT;
+        INSERT INTO source_registry VALUES
+            (1, 'codex', 'agent_memory', 'confirmed', 'unknown', 'full', '/tmp/root', 'fp', NULL);
+        CREATE TABLE scan_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL,
+            generation TEXT NOT NULL, state TEXT NOT NULL, fencing_token INTEGER NOT NULL,
+            intent TEXT NOT NULL, manifest_revision TEXT NOT NULL, error_code TEXT, finished_at INTEGER
+        ) STRICT;
+        INSERT INTO scan_runs VALUES (1, 1, 'gen_1', 'succeeded', 1, 'gen_1', 'old', NULL, NULL);
+        CREATE TABLE memory_records (
+            record_id TEXT NOT NULL, source_id INTEGER NOT NULL, generation TEXT NOT NULL,
+            provider TEXT NOT NULL, unit_kind TEXT NOT NULL, native_unit_id TEXT NOT NULL,
+            native_locator TEXT NOT NULL, content_hash TEXT NOT NULL, parser_version TEXT NOT NULL,
+            PRIMARY KEY (record_id, generation)
+        ) STRICT;
+        INSERT INTO memory_records VALUES
+            ('rec_old', 1, 'gen_1', 'codex', 'file', 'MEMORY.md', 'file:///tmp/root/MEMORY.md', 'h', 'file-level/v1');
+        "#,
+    )
+    .expect("build v3 fixture");
+
+    migrations::apply(&mut conn).expect("upgrade v3 to v4");
+    let sources: i64 = conn
+        .query_row("SELECT COUNT(*) FROM source_registry", [], |row| row.get(0))
+        .expect("sources remain");
+    let records: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_records", [], |row| row.get(0))
+        .expect("old projection cleared");
+    let runs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM scan_runs", [], |row| row.get(0))
+        .expect("old runs cleared");
+    let active_markers: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tessera_meta WHERE key LIKE 'active_generation:%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("active markers cleared");
+    assert_eq!((sources, records, runs, active_markers), (1, 0, 0, 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -396,10 +555,11 @@ fn first_scan_success_commits_active_generation() {
         .expect("count records");
     assert_eq!(n, 2);
 
-    // Every record is file-level with the 1.4 parser version and a rec_ id.
+    // Records are canonical units with a stable semantic locator and an
+    // independent line display locator.
     let mut stmt = conn
         .prepare(
-            "SELECT record_id, unit_kind, parser_version, native_unit_id, native_locator
+            "SELECT record_id, unit_kind, parser_version, native_unit_id, native_locator, display_locator
              FROM memory_records WHERE source_id=?1",
         )
         .expect("prepare");
@@ -411,21 +571,29 @@ fn first_scan_success_commits_active_generation() {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })
         .expect("query");
     let mut seen = Vec::new();
     for r in rows {
-        let (record_id, unit_kind, parser_version, native_unit_id, native_locator) =
+        let (record_id, unit_kind, parser_version, native_unit_id, native_locator, display_locator) =
             r.expect("row");
         assert!(record_id.starts_with("rec_"), "rec_ id");
-        assert_eq!(unit_kind, "file");
-        assert_eq!(parser_version, "file-level/v1");
+        assert!(matches!(unit_kind.as_str(), "section" | "file"));
+        assert_eq!(parser_version, "codex-markdown/v1");
         assert!(native_locator.starts_with("file://"), "file URI locator");
-        seen.push(native_unit_id);
+        assert!(display_locator.contains("#L"), "display line locator");
+        seen.push((native_unit_id, unit_kind));
     }
     seen.sort();
-    assert_eq!(seen, vec!["MEMORY.md", "raw_memories.md"]);
+    assert_eq!(
+        seen,
+        vec![
+            ("file".to_string(), "file".to_string()),
+            ("section/h1:3:mem:1".to_string(), "section".to_string())
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -454,20 +622,15 @@ fn dirty_after_validation_never_activates_and_preserves_previous() {
     let source_rowid = source.source_id.to_rowid().expect("rowid");
 
     // First scan succeeds and activates gen for the single file.
-    let first =
-        application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
     assert_eq!(first.records_indexed, 1);
     let first_gen = first.generation.0.clone();
 
     // Re-scan through a scripted adapter: the commit-time re-enumeration sees
     // an empty source (manifest drift) → DirtyAfterValidation.
-    let err = application::scan_source_with(
-        &DriftAdapter::new(),
-        &registry,
-        &conn,
-        &source.source_id,
-    )
-    .expect_err("drift at commit-time revalidation");
+    let err =
+        application::scan_source_with(&DriftAdapter::new(), &registry, &conn, &source.source_id)
+            .expect_err("drift at commit-time revalidation");
     assert!(
         matches!(err, ScanError::DirtyAfterValidation),
         "expected DirtyAfterValidation, got {err:?}"
@@ -518,8 +681,7 @@ fn commit_cas_contention_rolls_back_and_leaves_active_unchanged() {
     let source_rowid = source.source_id.to_rowid().expect("rowid");
 
     // Establish an active generation via a real scan.
-    let first =
-        application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
     let first_gen = first.generation.0.clone();
 
     let store = ScanStore::new(&conn);
@@ -537,7 +699,10 @@ fn commit_cas_contention_rolls_back_and_leaves_active_unchanged() {
     let committed = store
         .commit_cas(run1_id, tok1, &gen1, source_rowid)
         .expect("commit_cas returns Ok");
-    assert!(!committed, "stale owner loses the CAS against the newer token");
+    assert!(
+        !committed,
+        "stale owner loses the CAS against the newer token"
+    );
 
     // Active generation unchanged.
     let active = active_generation_str(&conn, source_rowid);
@@ -546,9 +711,11 @@ fn commit_cas_contention_rolls_back_and_leaves_active_unchanged() {
     // run1 is still `committing` (not re-marked by the loser) — boot recovery
     // will flip it to failed. Query run1 BY ID: the latest run is run2.
     let state: String = conn
-        .query_row("SELECT state FROM scan_runs WHERE id = ?1", [run1_id], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT state FROM scan_runs WHERE id = ?1",
+            [run1_id],
+            |row| row.get(0),
+        )
         .expect("run1 state");
     assert_eq!(state, "committing");
 }
@@ -573,8 +740,7 @@ fn boot_recovery_recovers_stale_runs_and_preserves_active() {
     let source_rowid = source.source_id.to_rowid().expect("rowid");
 
     // Establish an active generation.
-    let first =
-        application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
     let first_gen = first.generation.0.clone();
 
     let store = ScanStore::new(&conn);
@@ -596,13 +762,32 @@ fn boot_recovery_recovers_stale_runs_and_preserves_active() {
                 native_locator: "file:///x/MEMORY.md".to_string(),
                 content_hash: "h".to_string(),
                 parser_version: "file-level/v1".to_string(),
+                title: "stale".to_string(),
+                body: "".to_string(),
+                native_project: None,
+                provider_memory_type: "memory".to_string(),
+                coverage_level: "full".to_string(),
+                observed_at: 0,
+                source_revision: "r".to_string(),
+                display_locator: "file:///x/MEMORY.md#L1-L1".to_string(),
             }],
         )
         .expect("stage stale");
+    store
+        .stage_diagnostics(
+            &crash_gen,
+            &[tessera_lib::index::scan_store::StagedDiagnostic {
+                source_rowid,
+                kind: "unsupported_artifact".to_string(),
+                observed_path: "stale-rule.md".to_string(),
+            }],
+        )
+        .expect("stage stale diagnostic");
 
     // Sanity: before recovery, the stale record row exists (2 total: active +
     // stale).
     assert_eq!(count_rows(&conn, "memory_records"), 2);
+    assert_eq!(count_rows(&conn, "scan_diagnostics"), 1);
 
     // Boot recovery.
     application::recover_scans(&conn).expect("recover");
@@ -622,6 +807,7 @@ fn boot_recovery_recovers_stale_runs_and_preserves_active() {
     // The stale (non-active) generation record is GC'd; only the active
     // generation's record remains.
     assert_eq!(count_rows(&conn, "memory_records"), 1);
+    assert_eq!(count_rows(&conn, "scan_diagnostics"), 0);
 
     // The active generation is unchanged and still reports 1 record.
     let active = active_generation_str(&conn, source_rowid);
@@ -659,11 +845,11 @@ fn rescan_unchanged_source_is_idempotent_with_stable_record_ids() {
         let rows = stmt
             .query_map(rusqlite::params![source_rowid, gen], |row| row.get(0))
             .expect("query");
-        rows.collect::<rusqlite::Result<Vec<String>>>().expect("collect")
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+            .expect("collect")
     };
 
-    let first =
-        application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
     let first_ids = active_record_ids(&conn, &first.generation.0);
 
     let second =
@@ -711,8 +897,7 @@ fn empty_directory_scan_succeeds_with_zero_records() {
     assert_eq!(active.as_deref(), Some(outcome.generation.0.as_str()));
 
     // Status reports succeeded with 0 active records.
-    let status =
-        application::get_scan_status(&registry, &conn, &source.source_id).expect("status");
+    let status = application::get_scan_status(&registry, &conn, &source.source_id).expect("status");
     assert_eq!(status.active_records, 0);
     assert_eq!(
         status.active_generation.as_ref().map(|g| g.0.as_str()),
@@ -767,8 +952,8 @@ fn scan_disabled_source_returns_not_confirmed_no_row() {
     let registry = SourceRegistry::new(&conn);
     application::disable_source(&registry, &source.source_id).expect("disable");
 
-    let err = application::scan_source(&registry, &conn, &source.source_id)
-        .expect_err("disabled source");
+    let err =
+        application::scan_source(&registry, &conn, &source.source_id).expect_err("disabled source");
     assert!(matches!(err, ScanError::NotConfirmed));
     assert_eq!(count_rows(&conn, "scan_runs"), 0, "no scan row written");
 }
@@ -792,14 +977,13 @@ fn scan_with_deleted_root_returns_root_invalid_preserves_active() {
     let source_rowid = source.source_id.to_rowid().expect("rowid");
 
     // Establish an active generation first.
-    let first =
-        application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
 
     // Delete the root.
     fs::remove_dir_all(&memories).expect("remove root");
 
-    let err = application::scan_source(&registry, &conn, &source.source_id)
-        .expect_err("deleted root");
+    let err =
+        application::scan_source(&registry, &conn, &source.source_id).expect_err("deleted root");
     assert!(matches!(err, ScanError::RootInvalid));
 
     // No NEW scan row was written for the failed attempt (root validation
@@ -831,7 +1015,11 @@ fn successful_scan_does_not_mutate_source_files_sm2() {
     fs::write(memories.join("MEMORY.md"), "# mem\nbody\n").expect("w");
     fs::write(memories.join("memory_summary.md"), "summary\n").expect("w");
     fs::create_dir_all(memories.join("rollout_summaries")).expect("mkdir");
-    fs::write(memories.join("rollout_summaries").join("2026-07-01.md"), "r\n").expect("w");
+    fs::write(
+        memories.join("rollout_summaries").join("2026-07-01.md"),
+        "r\n",
+    )
+    .expect("w");
 
     let conn = fresh_db();
     let source = confirm(&conn, &memories);
@@ -887,7 +1075,11 @@ fn scan_indexes_only_supported_artifact_matrix() {
     fs::create_dir_all(memories.join("sessions")).expect("mkdir sessions");
     fs::write(memories.join("sessions").join("foo.jsonl"), "{}\n").expect("w");
     fs::create_dir_all(memories.join("rollout_summaries")).expect("mkdir rollout");
-    fs::write(memories.join("rollout_summaries").join("2026-07-01.md"), "r\n").expect("w");
+    fs::write(
+        memories.join("rollout_summaries").join("2026-07-01.md"),
+        "r\n",
+    )
+    .expect("w");
 
     let conn = fresh_db();
     let source = confirm(&conn, &memories);
@@ -900,14 +1092,20 @@ fn scan_indexes_only_supported_artifact_matrix() {
     assert_eq!(outcome.records_indexed, 2);
 
     let mut stmt = conn
-        .prepare("SELECT native_unit_id FROM memory_records WHERE source_id=?1 ORDER BY native_unit_id")
+        .prepare(
+            "SELECT native_locator FROM memory_records WHERE source_id=?1 ORDER BY native_locator",
+        )
         .expect("prepare");
     let ids: Vec<String> = stmt
         .query_map([source_rowid], |row| row.get(0))
         .expect("query")
         .collect::<rusqlite::Result<Vec<String>>>()
         .expect("collect");
-    assert_eq!(ids, vec!["MEMORY.md", "rollout_summaries/2026-07-01.md"]);
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().any(|id| id.contains("MEMORY.md")));
+    assert!(ids
+        .iter()
+        .any(|id| id.contains("rollout_summaries/2026-07-01.md")));
 }
 
 // ---------------------------------------------------------------------------
@@ -927,17 +1125,14 @@ fn get_scan_status_reports_state_generation_and_count() {
     let registry = SourceRegistry::new(&conn);
 
     // Never scanned: null state + null generation + 0 records.
-    let status =
-        application::get_scan_status(&registry, &conn, &source.source_id).expect("status");
+    let status = application::get_scan_status(&registry, &conn, &source.source_id).expect("status");
     assert_eq!(status.state, None);
     assert_eq!(status.active_generation, None);
     assert_eq!(status.active_records, 0);
 
     // After a scan: succeeded + active generation + count.
-    let outcome =
-        application::scan_source(&registry, &conn, &source.source_id).expect("scan");
-    let status =
-        application::get_scan_status(&registry, &conn, &source.source_id).expect("status");
+    let outcome = application::scan_source(&registry, &conn, &source.source_id).expect("scan");
+    let status = application::get_scan_status(&registry, &conn, &source.source_id).expect("status");
     assert_eq!(
         status.state,
         Some(tessera_lib::domain::scan::ScanRunState::Succeeded)
@@ -988,7 +1183,10 @@ fn fencing_tokens_are_monotonic_per_source() {
          VALUES (?1, 'g', 'queued', ?2, 'g', 'r')",
         rusqlite::params![source_rowid, tok_a],
     );
-    assert!(dup.is_err(), "duplicate fencing token rejected by unique index");
+    assert!(
+        dup.is_err(),
+        "duplicate fencing token rejected by unique index"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,7 +1262,9 @@ fn mid_scan_file_read_failure_preserves_previous_generation() {
 
     // Previous records fully visible: count still equals the prior count.
     let store = ScanStore::new(&conn);
-    let count_after = store.count_active_records(source_rowid).expect("count after");
+    let count_after = store
+        .count_active_records(source_rowid)
+        .expect("count after");
     assert_eq!(
         count_after, prior_active_count,
         "previous generation records remain fully visible"
@@ -1094,13 +1294,9 @@ fn first_enumeration_failure_marks_run_failed_with_enumeration_code() {
     let registry = SourceRegistry::new(&conn);
     let source_rowid = source.source_id.to_rowid().expect("rowid");
 
-    let err = application::scan_source_with(
-        &FailingEnumAdapter,
-        &registry,
-        &conn,
-        &source.source_id,
-    )
-    .expect_err("first enumeration fails");
+    let err =
+        application::scan_source_with(&FailingEnumAdapter, &registry, &conn, &source.source_id)
+            .expect_err("first enumeration fails");
     assert!(
         matches!(err, ScanError::EnumerationFailed),
         "expected EnumerationFailed, got {err:?}"
@@ -1141,8 +1337,7 @@ fn staging_then_drift_failure_preserves_previous_rows_identically() {
     let source_rowid = source.source_id.to_rowid().expect("rowid");
 
     // First scan: gen1 active with 2 records.
-    let first =
-        application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
     assert_eq!(first.records_indexed, 2);
     let gen1 = first.generation.0.clone();
 
@@ -1198,7 +1393,11 @@ fn staging_then_drift_failure_preserves_previous_rows_identically() {
         )
         .expect("gen2");
     assert_ne!(scan2_gen, gen1);
-    assert_eq!(gen_rows(&conn, &scan2_gen).len(), 2, "staged gen2 rows exist");
+    assert_eq!(
+        gen_rows(&conn, &scan2_gen).len(),
+        2,
+        "staged gen2 rows exist"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,16 +1433,18 @@ fn symlink_alias_is_deduped_and_count_stays_honest() {
         "persisted row count equals the announced count"
     );
 
-    // The indexed native_unit_ids are exactly the two real files.
+    // The two persisted records retain the two real source-file locators.
     let mut stmt = conn
-        .prepare("SELECT native_unit_id FROM memory_records ORDER BY native_unit_id")
+        .prepare("SELECT native_locator FROM memory_records ORDER BY native_locator")
         .expect("prepare");
     let ids: Vec<String> = stmt
         .query_map([], |row| row.get(0))
         .expect("query")
         .collect::<rusqlite::Result<Vec<String>>>()
         .expect("collect");
-    assert_eq!(ids, vec!["MEMORY.md", "rollout_summaries/a.md"]);
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().any(|id| id.contains("MEMORY.md")));
+    assert!(ids.iter().any(|id| id.contains("rollout_summaries/a.md")));
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +1470,432 @@ fn memory_records_rejects_orphan_source_reference() {
         orphan.is_err(),
         "orphan memory_records row must be rejected by the FK"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Story 1.5 canonical provenance and safe failure regressions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn canonical_records_persist_title_body_and_all_provider_memory_types() {
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    fs::write(memories.join("MEMORY.md"), "# Memory\nbody\n").expect("memory");
+    fs::write(memories.join("memory_summary.md"), "# Summary\nbody\n").expect("summary");
+    fs::write(memories.join("raw_memories.md"), "# Raw\nbody\n").expect("raw");
+    fs::create_dir(memories.join("rollout_summaries")).expect("rollout dir");
+    fs::write(
+        memories.join("rollout_summaries").join("run.md"),
+        "# Rollout\nbody\n",
+    )
+    .expect("rollout");
+
+    let conn = fresh_db();
+    let source = confirm(&conn, &memories);
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+    let registry = SourceRegistry::new(&conn);
+    application::scan_source(&registry, &conn, &source.source_id).expect("scan");
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT title, body, provider_memory_type, coverage_level, native_project,
+                    source_revision, native_locator, display_locator, parser_version
+             FROM memory_records WHERE source_id=?1 ORDER BY provider_memory_type",
+        )
+        .expect("prepare canonical projection");
+    type CanonicalRow = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+    );
+    let rows: Vec<CanonicalRow> = stmt
+        .query_map([source_rowid], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        })
+        .expect("query")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows.iter().map(|row| row.2.as_str()).collect::<Vec<_>>(),
+        vec![
+            "memory",
+            "memory_summary",
+            "raw_memories",
+            "rollout_summary"
+        ]
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.0.as_str(), row.2.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Memory", "memory"),
+            ("Summary", "memory_summary"),
+            ("Raw", "raw_memories"),
+            ("Rollout", "rollout_summary"),
+        ]
+    );
+    for row in rows {
+        assert!(matches!(
+            row.0.as_str(),
+            "Memory" | "Summary" | "Raw" | "Rollout"
+        ));
+        assert_eq!(row.1, "body\n");
+        assert_eq!(row.3, "full");
+        assert_eq!(row.4, None, "unmapped native project stays None");
+        assert!(!row.5.is_empty(), "whole-file source revision");
+        assert!(row.6.contains("#section%2F"), "semantic locator");
+        assert!(row.7.contains("#L1-L2"), "display locator");
+        assert_eq!(row.8, "codex-markdown/v1");
+    }
+}
+
+#[test]
+fn persisted_canonical_identity_and_display_ranges_are_exact() {
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    let file = memories.join("MEMORY.md");
+    fs::write(&file, "lead\n# Alpha\nfirst\n# Alpha\nlast\n").expect("source");
+
+    let conn = fresh_db();
+    let source = confirm(&conn, &memories);
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+    let registry = SourceRegistry::new(&conn);
+    application::scan_source(&registry, &conn, &source.source_id).expect("scan");
+
+    let canonical_file = fs::canonicalize(&file).expect("canonical file");
+    let file_locator = file_uri(&canonical_file).expect("file URI");
+    let mut expected_rows = [
+        ("preamble", "preamble", "L1-L1"),
+        ("section", "section/h1:5:Alpha:1", "L2-L3"),
+        ("section", "section/h1:5:Alpha:2", "L4-L5"),
+    ]
+    .into_iter()
+    .map(|(unit_kind, native_unit_id, range)| {
+        let native_locator = format!(
+            "{}#{}",
+            file_locator,
+            percent_encode_fragment(native_unit_id)
+        );
+        (
+            build_record_id(&source.source_id, "codex", &native_locator, unit_kind),
+            unit_kind.to_string(),
+            native_unit_id.to_string(),
+            native_locator,
+            format!("{}#{}", file_locator, range),
+        )
+    })
+    .collect::<Vec<_>>();
+    expected_rows.sort_by(|left, right| left.2.cmp(&right.2));
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT record_id, unit_kind, native_unit_id, native_locator, display_locator
+             FROM memory_records WHERE source_id=?1 ORDER BY native_unit_id",
+        )
+        .expect("prepare canonical rows");
+    let actual_rows = stmt
+        .query_map([source_rowid], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .expect("query canonical rows")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect canonical rows");
+    assert_eq!(actual_rows, expected_rows);
+}
+
+#[test]
+fn mapped_native_project_and_observed_at_persist_with_canonical_records() {
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    fs::write(memories.join("MEMORY.md"), "# Memory\nbody\n").expect("memory");
+    let conn = fresh_db();
+    let mut candidate = candidate_for(&memories);
+    candidate.native_project = Some("project-alpha".to_string());
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_source(&registry, &candidate).expect("confirm mapped source");
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+
+    application::scan_source(&registry, &conn, &source.source_id).expect("scan");
+    let (native_project, observed_at): (Option<String>, i64) = conn
+        .query_row(
+            "SELECT native_project, observed_at FROM memory_records WHERE source_id=?1",
+            [source_rowid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("canonical provenance");
+    assert_eq!(native_project.as_deref(), Some("project-alpha"));
+    assert!(observed_at > 0, "observed timestamp is persisted");
+}
+
+#[test]
+fn edited_section_changes_its_hash_while_unchanged_sibling_keeps_hash() {
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    let file = memories.join("MEMORY.md");
+    fs::write(&file, "# Changed\nalpha\n# Stable\nfixed\n").expect("initial source");
+
+    let conn = fresh_db();
+    let source = confirm(&conn, &memories);
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+    let registry = SourceRegistry::new(&conn);
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+    let first_changed: (String, String, String, String) = conn
+        .query_row(
+            "SELECT record_id, content_hash, source_revision, display_locator FROM memory_records
+             WHERE source_id=?1 AND generation=?2 AND title='Changed'",
+            rusqlite::params![source_rowid, first.generation.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("changed row before edit");
+    let first_stable: (String, String, String, String) = conn
+        .query_row(
+            "SELECT record_id, content_hash, source_revision, display_locator FROM memory_records
+             WHERE source_id=?1 AND generation=?2 AND title='Stable'",
+            rusqlite::params![source_rowid, first.generation.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("stable row before edit");
+
+    fs::write(&file, "# Changed\nbravo\nextra\n# Stable\nfixed\n").expect("edited source");
+    let second =
+        application::scan_source(&registry, &conn, &source.source_id).expect("second scan");
+    let second_changed: (String, String, String, String) = conn
+        .query_row(
+            "SELECT record_id, content_hash, source_revision, display_locator FROM memory_records
+             WHERE source_id=?1 AND generation=?2 AND title='Changed'",
+            rusqlite::params![source_rowid, second.generation.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("changed row after edit");
+    let second_stable: (String, String, String, String) = conn
+        .query_row(
+            "SELECT record_id, content_hash, source_revision, display_locator FROM memory_records
+             WHERE source_id=?1 AND generation=?2 AND title='Stable'",
+            rusqlite::params![source_rowid, second.generation.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("stable row after edit");
+
+    assert_eq!(
+        first_changed.0, second_changed.0,
+        "semantic identity stays stable"
+    );
+    assert_ne!(
+        first_changed.1, second_changed.1,
+        "edited body changes hash"
+    );
+    assert_ne!(first_changed.2, second_changed.2, "source revision changes");
+    assert_ne!(
+        first_changed.3, second_changed.3,
+        "edited range changes display locator"
+    );
+    assert_eq!(
+        first_stable.0, second_stable.0,
+        "sibling identity stays stable"
+    );
+    assert_eq!(
+        first_stable.1, second_stable.1,
+        "unchanged sibling hash stays stable"
+    );
+    assert_ne!(
+        first_stable.2, second_stable.2,
+        "whole-file revision changes"
+    );
+    assert_ne!(
+        first_stable.3, second_stable.3,
+        "shifted sibling display range changes"
+    );
+}
+
+#[test]
+fn same_size_restored_mtime_byte_change_fails_final_digest_validation() {
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    fs::write(memories.join("MEMORY.md"), "# Item\nalpha\n").expect("initial source");
+
+    let conn = fresh_db();
+    let source = confirm(&conn, &memories);
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+    let registry = SourceRegistry::new(&conn);
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+
+    let error = application::scan_source_with(
+        &SameMetadataMutationAdapter::new(b"# Item\nbravo\n"),
+        &registry,
+        &conn,
+        &source.source_id,
+    )
+    .expect_err("digest drift must fail");
+    assert!(matches!(error, ScanError::DirtyAfterValidation));
+    assert_eq!(
+        active_generation_str(&conn, source_rowid).as_deref(),
+        Some(first.generation.0.as_str())
+    );
+}
+
+#[test]
+fn malformed_allowlisted_source_fails_safely_without_replacing_active_generation() {
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    let file = memories.join("MEMORY.md");
+    fs::write(&file, "# Good\nbody\n").expect("good source");
+
+    let conn = fresh_db();
+    let source = confirm(&conn, &memories);
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+    let registry = SourceRegistry::new(&conn);
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+
+    fs::write(&file, [0xff, 0xfe, b'\n']).expect("malformed source");
+    let error =
+        application::scan_source(&registry, &conn, &source.source_id).expect_err("parse fails");
+    assert!(matches!(error, ScanError::ParseFailed));
+    assert_eq!(
+        active_generation_str(&conn, source_rowid),
+        Some(first.generation.0)
+    );
+    let (state, error_code) = latest_run_state(&conn, source_rowid);
+    assert_eq!(state, "failed");
+    assert_eq!(error_code.as_deref(), Some("parse_failed"));
+}
+
+#[test]
+fn diagnostic_only_rescan_preserves_active_records_and_projects_safe_diagnostic() {
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    let file = memories.join("MEMORY.md");
+    fs::write(&file, "# Good\nbody\n").expect("good source");
+
+    let conn = fresh_db();
+    let source = confirm(&conn, &memories);
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+    let registry = SourceRegistry::new(&conn);
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+
+    fs::remove_file(file).expect("remove supported source");
+    fs::write(memories.join("AGENTS.md"), "not indexed\n").expect("unknown");
+    let outcome =
+        application::scan_source(&registry, &conn, &source.source_id).expect("diagnostic scan");
+    assert_eq!(outcome.generation, first.generation);
+    assert_eq!(outcome.records_indexed, 1);
+    assert_eq!(
+        active_generation_str(&conn, source_rowid),
+        Some(first.generation.0)
+    );
+    let diagnostic: (String, String, String) = conn
+        .query_row(
+            "SELECT generation, kind, observed_path FROM scan_diagnostics WHERE source_id=?1",
+            [source_rowid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("diagnostic persists");
+    assert_eq!(diagnostic.1, "unsupported_artifact");
+    assert_eq!(diagnostic.2, "AGENTS.md");
+    let diagnostic_generation: String = conn
+        .query_row(
+            "SELECT generation FROM scan_runs WHERE id=?1",
+            [outcome.scan_id],
+            |row| row.get(0),
+        )
+        .expect("diagnostic run generation");
+    assert_eq!(diagnostic.0, diagnostic_generation);
+    assert_eq!(
+        conn.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM memory_records WHERE source_id=?1 AND generation=?2",
+            rusqlite::params![source_rowid, diagnostic_generation],
+            |row| row.get(0),
+        )
+        .expect("no record in diagnostic-only generation"),
+        0
+    );
+
+    fs::remove_file(memories.join("AGENTS.md")).expect("remove diagnostic source");
+    fs::write(memories.join("MEMORY.md"), "# Rebuilt\nbody\n").expect("restore source");
+    application::scan_source(&registry, &conn, &source.source_id).expect("successful cleanup");
+    assert_eq!(count_rows(&conn, "scan_diagnostics"), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_byte_unknown_entry_persists_safe_diagnostic_when_supported() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    fs::write(memories.join("MEMORY.md"), "# Good\nbody\n").expect("memory");
+    let unknown = memories.join(OsString::from_vec(b"bad\xff-entry".to_vec()));
+    if fs::write(&unknown, "unknown\n").is_err() {
+        return;
+    }
+
+    let conn = fresh_db();
+    let source = confirm(&conn, &memories);
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+    let registry = SourceRegistry::new(&conn);
+    let outcome = application::scan_source(&registry, &conn, &source.source_id).expect("scan");
+    assert_eq!(outcome.records_indexed, 1);
+    let observed_path: String = conn
+        .query_row(
+            "SELECT observed_path FROM scan_diagnostics WHERE source_id=?1",
+            [source_rowid],
+            |row| row.get(0),
+        )
+        .expect("native-byte diagnostic");
+    assert_eq!(observed_path, "bad%FF-entry");
+}
+
+#[test]
+fn diagnostic_drift_between_initial_and_final_enumeration_preserves_active_generation() {
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    fs::write(memories.join("MEMORY.md"), "# Good\nbody\n").expect("source");
+
+    let conn = fresh_db();
+    let source = confirm(&conn, &memories);
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+    let registry = SourceRegistry::new(&conn);
+    let first = application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+
+    fs::write(memories.join("AGENTS.md"), "staged diagnostic\n").expect("unknown source");
+
+    let error = application::scan_source_with(
+        &DiagnosticDriftAdapter::new(),
+        &registry,
+        &conn,
+        &source.source_id,
+    )
+    .expect_err("diagnostic drift must fail");
+    assert!(matches!(error, ScanError::DirtyAfterValidation));
+    assert_eq!(
+        active_generation_str(&conn, source_rowid).as_deref(),
+        Some(first.generation.0.as_str())
+    );
+    assert_eq!(count_rows(&conn, "scan_diagnostics"), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,7 +2023,7 @@ fn retargeted_file_after_enumeration_fails_before_reading_outside_target() {
     let tmp = tempdir().expect("tempdir");
     let memories = make_memories(tmp.path());
     fs::write(memories.join("MEMORY.md"), "inside\n").expect("w inside");
-    let outside = tmp.path().join("outside.md");
+    let outside = tmp.path().join("outside-dir");
 
     let conn = fresh_db();
     let source = confirm(&conn, &memories);
@@ -1418,6 +2045,9 @@ fn retargeted_file_after_enumeration_fails_before_reading_outside_target() {
     );
     assert_eq!(
         latest_run_state(&conn, source_rowid),
-        ("failed".to_string(), Some("dirty_after_validation".to_string()))
+        (
+            "failed".to_string(),
+            Some("dirty_after_validation".to_string())
+        )
     );
 }

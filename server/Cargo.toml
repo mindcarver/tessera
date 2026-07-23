@@ -54,6 +54,11 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 # though the first watcher lands in Story 1.4 — the spec pins notify here.
 notify = "8.2"
 
+# Cross-platform file-handle identity check for the scan read boundary. It is
+# already transitive through `notify`; declaring it directly keeps the
+# descriptor-to-path comparison explicit and portable.
+same-file = "1"
+
 [dev-dependencies]
 tempfile = "3"
 

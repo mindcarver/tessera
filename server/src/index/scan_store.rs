@@ -53,7 +53,7 @@ const ACTIVE_GENERATION_KEY_PREFIX: &str = "active_generation:";
 /// written only here.
 const ERROR_CODE_STALE_RECOVERED: &str = "stale_recovered";
 
-/// A staged file-level record to insert into a staging generation. Carries
+/// A staged canonical record to insert into a staging generation. Carries
 /// everything `memory_records` persists except the generation (supplied by
 /// the caller) — the application layer builds these from enumerated file
 /// units + content hashes.
@@ -67,6 +67,23 @@ pub struct StagedRecord {
     pub native_locator: String,
     pub content_hash: String,
     pub parser_version: String,
+    pub title: String,
+    pub body: String,
+    pub native_project: Option<String>,
+    pub provider_memory_type: String,
+    pub coverage_level: String,
+    pub observed_at: i64,
+    pub source_revision: String,
+    pub display_locator: String,
+}
+
+/// A persisted source-scoped diagnostic for an unsupported lexical artifact.
+/// It is intentionally detached from canonical content records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedDiagnostic {
+    pub source_rowid: i64,
+    pub kind: String,
+    pub observed_path: String,
 }
 
 /// A single row read back from `scan_runs` for status reporting.
@@ -126,7 +143,12 @@ impl<'a> ScanStore<'a> {
             "INSERT INTO scan_runs
                 (source_id, generation, state, fencing_token, intent, manifest_revision)
              VALUES (?1, '', ?2, ?3, '', ?4)",
-            params![source_rowid, ScanRunState::Queued.as_str(), next_token, manifest_revision],
+            params![
+                source_rowid,
+                ScanRunState::Queued.as_str(),
+                next_token,
+                manifest_revision
+            ],
         )?;
         let scan_id = tx.last_insert_rowid();
         let generation = Generation::from_rowid(scan_id);
@@ -186,8 +208,10 @@ impl<'a> ScanStore<'a> {
             let mut stmt = tx.prepare(
                 "INSERT INTO memory_records
                     (record_id, source_id, generation, provider, unit_kind,
-                     native_unit_id, native_locator, content_hash, parser_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     native_unit_id, native_locator, content_hash, parser_version,
+                     title, body, native_project, provider_memory_type,
+                     coverage_level, observed_at, source_revision, display_locator)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             )?;
             for r in records {
                 stmt.execute(params![
@@ -200,11 +224,45 @@ impl<'a> ScanStore<'a> {
                     r.native_locator,
                     r.content_hash,
                     r.parser_version,
+                    r.title,
+                    r.body,
+                    r.native_project,
+                    r.provider_memory_type,
+                    r.coverage_level,
+                    r.observed_at,
+                    r.source_revision,
+                    r.display_locator,
                 ])?;
             }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Persist diagnostics alongside a staging generation. There is no body
+    /// column here, so unknown artifacts can be explained without indexing or
+    /// copying their source content.
+    pub fn stage_diagnostics(
+        &self,
+        generation: &Generation,
+        diagnostics: &[StagedDiagnostic],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO scan_diagnostics (source_id, generation, kind, observed_path)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for diagnostic in diagnostics {
+                stmt.execute(params![
+                    diagnostic.source_rowid,
+                    generation.0,
+                    diagnostic.kind,
+                    diagnostic.observed_path,
+                ])?;
+            }
+        }
+        tx.commit()
     }
 
     /// Commit a staging generation as the new active generation, atomically
@@ -282,6 +340,48 @@ impl<'a> ScanStore<'a> {
             "DELETE FROM memory_records WHERE source_id = ?1 AND generation != ?2",
             params![source_rowid, generation.0],
         )?;
+        tx.execute(
+            "DELETE FROM scan_diagnostics WHERE source_id = ?1 AND generation != ?2",
+            params![source_rowid, generation.0],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Finish a diagnostic-only observation without replacing an existing
+    /// active generation. The diagnostics are still committed as a durable,
+    /// source-scoped projection for this completed run.
+    pub fn complete_without_activation(
+        &self,
+        scan_id: i64,
+        fencing_token: i64,
+        generation: &Generation,
+        source_rowid: i64,
+    ) -> rusqlite::Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE scan_runs SET state = ?1, finished_at = ?2
+             WHERE id = ?3 AND state = ?4
+               AND fencing_token = (
+                   SELECT MAX(fencing_token) FROM scan_runs WHERE source_id = ?5
+               )",
+            params![
+                ScanRunState::Succeeded.as_str(),
+                unix_seconds_now_i64(),
+                scan_id,
+                ScanRunState::Committing.as_str(),
+                source_rowid,
+            ],
+        )?;
+        if changed == 0 {
+            drop(tx);
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM scan_diagnostics WHERE source_id = ?1 AND generation != ?2",
+            params![source_rowid, generation.0],
+        )?;
+        debug_assert!(fencing_token > 0);
         tx.commit()?;
         Ok(true)
     }
@@ -293,7 +393,8 @@ impl<'a> ScanStore<'a> {
     /// orchestrator on every failure path EXCEPT a lost commit CAS (which is
     /// not re-marked — the run is left for boot recovery).
     pub fn fail_run(&self, scan_id: i64, error_code: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE scan_runs SET state = ?1, error_code = ?2, finished_at = ?3
              WHERE id = ?4 AND state IN (?5, ?6, ?7, ?8)",
             params![
@@ -307,6 +408,13 @@ impl<'a> ScanStore<'a> {
                 ScanRunState::Committing.as_str(),
             ],
         )?;
+        tx.execute(
+            "DELETE FROM scan_diagnostics
+             WHERE source_id = (SELECT source_id FROM scan_runs WHERE id = ?1)
+               AND generation = (SELECT generation FROM scan_runs WHERE id = ?1)",
+            params![scan_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -342,6 +450,16 @@ impl<'a> ScanStore<'a> {
                  ''
              )",
             params![ACTIVE_GENERATION_KEY_PREFIX],
+        )?;
+        tx.execute(
+            "DELETE FROM scan_diagnostics
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM scan_runs
+                 WHERE scan_runs.source_id = scan_diagnostics.source_id
+                   AND scan_runs.generation = scan_diagnostics.generation
+                   AND scan_runs.state = ?1
+             )",
+            params![ScanRunState::Succeeded.as_str()],
         )?;
         tx.commit()?;
         Ok(())

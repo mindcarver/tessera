@@ -158,7 +158,8 @@ pub fn disable_source(
 pub fn list_sources(state: &IndexState) -> Result<Envelope<Vec<Source>>, ErrorEnvelope> {
     let conn = lock_conn(state)?;
     let registry = SourceRegistry::new(&conn);
-    let sources = application::list_sources(&registry).map_err(|err| map_source_error(err, None))?;
+    let sources =
+        application::list_sources(&registry).map_err(|err| map_source_error(err, None))?;
     Ok(Envelope {
         api_version: API_VERSION,
         payload: sources,
@@ -167,9 +168,7 @@ pub fn list_sources(state: &IndexState) -> Result<Envelope<Vec<Source>>, ErrorEn
 
 /// Acquire the IndexState mutex and return a guarded connection reference.
 /// Maps poisoning / lock failure to the generic `internal` error envelope.
-fn lock_conn(
-    state: &IndexState,
-) -> Result<MutexGuard<'_, rusqlite::Connection>, ErrorEnvelope> {
+fn lock_conn(state: &IndexState) -> Result<MutexGuard<'_, rusqlite::Connection>, ErrorEnvelope> {
     state.conn.lock().map_err(|_| ErrorEnvelope::internal())
 }
 
@@ -264,6 +263,7 @@ fn map_scan_error(err: ScanError, source_id: &SourceId) -> ErrorEnvelope {
         ScanError::NotConfirmed => ErrorEnvelope::scan_failed_not_confirmed(source_id),
         ScanError::EnumerationFailed
         | ScanError::ReadFailed
+        | ScanError::ParseFailed
         | ScanError::EmptyScanWithActiveGeneration
         | ScanError::CommitCasFailed => ErrorEnvelope::scan_failed(source_id),
         ScanError::DirtyAfterValidation => ErrorEnvelope::scan_failed_source_changed(source_id),
@@ -312,8 +312,14 @@ mod tests {
         assert_eq!(env.api_version, API_VERSION);
         assert_eq!(env.payload.len(), 1, "injected payload carried through");
         assert_eq!(env.payload[0].provider, "codex");
-        assert_eq!(env.payload[0].basis, crate::domain::DiscoveryBasis::CodexHomeEnv);
-        assert_eq!(env.payload[0].coverage_level, crate::domain::CoverageLevel::Full);
+        assert_eq!(
+            env.payload[0].basis,
+            crate::domain::DiscoveryBasis::CodexHomeEnv
+        );
+        assert_eq!(
+            env.payload[0].coverage_level,
+            crate::domain::CoverageLevel::Full
+        );
     }
 
     /// The handler itself is wired and infallible: it always returns a Vec
@@ -444,10 +450,7 @@ mod tests {
         assert_eq!(back.source_kind, SourceKind::AgentMemory);
         assert_eq!(back.lifecycle_state, SourceLifecycle::Disabled);
         assert_eq!(back.health_state, HealthState::Unknown);
-        assert_eq!(
-            back.coverage_level,
-            crate::domain::CoverageLevel::Full
-        );
+        assert_eq!(back.coverage_level, crate::domain::CoverageLevel::Full);
         assert_eq!(back.normalized_root_path, "/y/memories");
         assert!(back.native_project.is_none());
         // Fingerprint was skipped on the wire → default-constructed on
@@ -505,7 +508,14 @@ mod tests {
             map_scan_error(ScanError::EnumerationFailed, &source_id).code,
             "scan_failed"
         );
-        assert_eq!(map_scan_error(ScanError::ReadFailed, &source_id).code, "scan_failed");
+        assert_eq!(
+            map_scan_error(ScanError::ReadFailed, &source_id).code,
+            "scan_failed"
+        );
+        assert_eq!(
+            map_scan_error(ScanError::ParseFailed, &source_id).code,
+            "scan_failed"
+        );
         assert_eq!(
             map_scan_error(ScanError::DirtyAfterValidation, &source_id).code,
             "scan_failed"
@@ -514,7 +524,10 @@ mod tests {
             map_scan_error(ScanError::CommitCasFailed, &source_id).code,
             "scan_failed"
         );
-        assert_eq!(map_scan_error(ScanError::Internal, &source_id).code, "internal");
+        assert_eq!(
+            map_scan_error(ScanError::Internal, &source_id).code,
+            "internal"
+        );
         // AD-13: safe messages are non-empty and never carry body/query/creds.
         for env in [
             map_scan_error(ScanError::ReadFailed, &source_id),
