@@ -4,6 +4,7 @@ type: 'feature'
 created: '2026-07-23'
 status: 'done'
 baseline_revision: '19b63da'
+final_revision: '6b0ed3c69af8c858cc3ac7f46478fb79e6f8d7d7'
 review_loop_iteration: 5
 followup_review_recommended: false
 context:
@@ -214,6 +215,8 @@ Residual artifacts: all implementation, test, fixture, generated Epic-context, a
 ### 2026-07-23 — Resumed completion
 
 Status: done
+
+Implementation revision: `6b0ed3c69af8c858cc3ac7f46478fb79e6f8d7d7`
 
 Implemented canonical, allowlisted Codex Markdown records with versioned provenance, safe unsupported-artifact diagnostics, v4 derived-index reset, byte-digest reconciliation, and safe parse-error HTTP mapping. The final review repairs also close the descriptor/path race before body reads, reject uninspectable allowlist directories, and complete the persisted-boundary regression coverage.
 
