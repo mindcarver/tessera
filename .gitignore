@@ -21,3 +21,9 @@ server/target/
 .vscode/
 .idea/
 *.log
+# Local automation and agent runtime state
+.bmad-loop/
+.codex/
+_bmad/config.yaml
+_bmad/config.user.yaml
+_bmad/module-help.csv
