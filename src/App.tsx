@@ -20,6 +20,7 @@
 import { useEffect, useState, type ReactElement } from "react";
 import { ping, type Pong } from "./api/ping";
 import { Sources } from "./features/sources/Sources";
+import { Search } from "./features/search/Search";
 import { readTesseraErrorMessage } from "./api/errors";
 
 type PingState =
@@ -60,6 +61,7 @@ export function App(): ReactElement {
     <main aria-busy={state.kind === "loading"} aria-live="polite">
       <h1>Tessera</h1>
       <Sources />
+      <Search />
       <section aria-label="API ping status">{renderPingState(state)}</section>
     </main>
   );

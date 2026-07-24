@@ -37,6 +37,8 @@ use std::sync::MutexGuard;
 
 use crate::application;
 use crate::application::SourceError;
+use crate::application::query::QueryError;
+use crate::domain::query::{SearchPage, SearchRequest};
 use crate::domain::scan::{ScanError, ScanOutcome, ScanStatus};
 use crate::domain::source::{Source, SourceId};
 use crate::domain::CandidateSource;
@@ -164,6 +166,19 @@ pub fn list_sources(state: &IndexState) -> Result<Envelope<Vec<Source>>, ErrorEn
         api_version: API_VERSION,
         payload: sources,
     })
+}
+
+/// Search only confirmed Sources' active canonical generations. The HTTP
+/// layer receives a validated DTO; it never sees source text or SQLite.
+pub fn search(request: SearchRequest, state: &IndexState) -> Result<Envelope<SearchPage>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let page = application::search(&registry, &conn, request).map_err(|error| match error {
+        QueryError::BadRequest => ErrorEnvelope::bad_request("search"),
+        QueryError::CursorStale => ErrorEnvelope::cursor_stale(),
+        QueryError::Internal => ErrorEnvelope::internal_for(None, "search"),
+    })?;
+    Ok(Envelope { api_version: API_VERSION, payload: page })
 }
 
 /// Acquire the IndexState mutex and return a guarded connection reference.

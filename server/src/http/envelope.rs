@@ -79,6 +79,14 @@ impl ErrorEnvelope {
         )
     }
 
+    pub fn bad_request(phase: &str) -> Self {
+        Self::new("bad_request", "The request did not match Tessera's search contract.", None, phase)
+    }
+
+    pub fn cursor_stale() -> Self {
+        Self::new("cursor_stale", "The index changed. Run the search again.", None, "search")
+    }
+
     /// Construct a `confirm_failed` error envelope (Story 1.3). Stable code
     /// per AD-13; the safe message never includes body / query text /
     /// credentials. Emitted when confirm/reject cannot canonicalize the root

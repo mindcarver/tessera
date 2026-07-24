@@ -30,6 +30,7 @@ export const TESSERA_STABLE_ERROR_CODES: ReadonlySet<string> = new Set([
   // scan, commit CAS loss, non-confirmed source). The previous index is
   // unchanged (NFR-9).
   "scan_failed",
+  "cursor_stale",
 ]);
 
 /**

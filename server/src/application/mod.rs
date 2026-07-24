@@ -17,6 +17,7 @@
 //! reject / disable / list orchestrators.
 
 pub mod scan;
+pub mod query;
 pub mod source;
 
 // Re-export so IPC and lib.rs can name `application::discover_sources` etc.
@@ -28,3 +29,4 @@ pub use source::{
 // Story 1.4 scan orchestration (AD-1). Re-exported so IPC and the boot path
 // can name them without a long path.
 pub use scan::{get_scan_status, recover_scans, scan_source, scan_source_with};
+pub use query::search;

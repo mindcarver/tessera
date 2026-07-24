@@ -5,5 +5,5 @@
 //! dependency inversion, ARCHITECTURE-SPINE "Design Paradigm").
 
 pub mod provider_adapter;
-pub mod index_store;
 pub mod query_store;
+pub mod index_store;

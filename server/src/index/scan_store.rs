@@ -28,9 +28,8 @@
 //!   let staging overwrite ACTIVE generation rows.
 //! - **Boot recovery (AD-16):** [`ScanStore::recover_stale_runs`] flips stale
 //!   in-flight runs to `failed` with `error_code='stale_recovered'` and
-//!   deletes ALL non-active-generation `memory_records` rows (in-flight
-//!   staging + historical failed staging), preserving only the active
-//!   generation's records.
+//!   deletes all non-active generation records. A search continuation is
+//!   rejected as stale after the active index changes.
 //! - **Corruption is loud:** [`ScanStore::latest_run`] returns an error on an
 //!   unparseable persisted state string — it does NOT silently map an unknown
 //!   state to `failed` (spec: unknown state = data corruption, surfaced as
@@ -39,7 +38,9 @@
 use rusqlite::{params, Connection};
 
 use crate::domain::scan::{Generation, ScanRunState};
-use crate::domain::source::SourceId;
+use crate::domain::ports::query_store::QueryStore;
+use crate::domain::query::{SearchRequest, SearchResult};
+use crate::domain::source::{HealthState, SourceId};
 
 /// The `tessera_meta` key prefix for the active-generation marker. The full
 /// key is `active_generation:<source_rowid>` (Design Notes — active
@@ -335,7 +336,9 @@ impl<'a> ScanStore<'a> {
             "INSERT OR REPLACE INTO tessera_meta(key, value) VALUES (?1, ?2)",
             params![key, generation.0],
         )?;
-        // Remove every other generation's records for this source (AD-2).
+        // A local search cursor never pins historical generations. Once the
+        // marker moves, the old derived records are rebuildable and must be
+        // removed in this same activation transaction.
         tx.execute(
             "DELETE FROM memory_records WHERE source_id = ?1 AND generation != ?2",
             params![source_rowid, generation.0],
@@ -420,10 +423,8 @@ impl<'a> ScanStore<'a> {
 
     /// Boot recovery (AD-16). Flip every stale in-flight run
     /// (`queued/running/staging/committing`) to `failed` with
-    /// `error_code='stale_recovered'`, then delete ALL `memory_records` rows
-    /// whose generation is not the active one for their source (in-flight
-    /// staging + historical failed staging). The active generation and its
-    /// records are preserved.
+    /// `error_code='stale_recovered'`, then delete every non-active record.
+    /// Search cursors are revision-bound and never retain historical data.
     pub fn recover_stale_runs(&self) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -439,9 +440,8 @@ impl<'a> ScanStore<'a> {
                 ScanRunState::Committing.as_str(),
             ],
         )?;
-        // Delete every non-active-generation record. A record's generation is
-        // active iff it equals the value stored at
-        // `tessera_meta.active_generation:<source_rowid>` for its source.
+        // Reclaim every non-active derived generation, including legacy
+        // successful generations from before local-cursor simplification.
         tx.execute(
             "DELETE FROM memory_records
              WHERE generation != COALESCE(
@@ -553,6 +553,79 @@ impl<'a> ScanStore<'a> {
     pub fn source_rowid(source_id: &SourceId) -> Option<i64> {
         source_id.to_rowid()
     }
+}
+
+impl QueryStore for ScanStore<'_> {
+    /// Search the current confirmed/active scope on every page. `instr`
+    /// deliberately performs literal substring matching: no FTS grammar is
+    /// parsed and two-character CJK terms remain searchable.
+    fn search_records(
+        &self,
+        request: &SearchRequest,
+        after_record_id: Option<&str>,
+    ) -> rusqlite::Result<Vec<SearchResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.record_id, m.title, m.body, m.provider, m.source_id,
+                    m.native_project, m.native_locator, m.display_locator,
+                    m.observed_at, m.coverage_level, s.health_state
+             FROM memory_records m
+             JOIN source_registry s ON s.id = m.source_id
+             JOIN tessera_meta active ON active.key = ('active_generation:' || m.source_id)
+                                       AND active.value = m.generation
+             WHERE s.lifecycle_state = 'confirmed'
+               AND instr(m.title || char(10) || m.body, ?1) > 0
+               AND (?2 IS NULL OR m.record_id > ?2)
+             ORDER BY m.record_id ASC
+             LIMIT ?3",
+        )?;
+        let page_size = i64::try_from(request.limit() + 1).expect("search limit is bounded");
+        let rows = stmt.query_map(params![request.query(), after_record_id, page_size], |row| {
+            let health: String = row.get(10)?;
+            let health_state = HealthState::parse_str(&health).ok_or(rusqlite::Error::InvalidQuery)?;
+            Ok(SearchResult::new(
+                row.get(0)?,
+                excerpt(&row.get::<_, String>(1)?, &row.get::<_, String>(2)?),
+                row.get(3)?,
+                SourceId::from_rowid(row.get(4)?),
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                health_state,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    fn current_index_revision(&self) -> rusqlite::Result<String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, active.value
+             FROM source_registry s
+             JOIN tessera_meta active ON active.key = ('active_generation:' || s.id)
+             WHERE s.lifecycle_state = 'confirmed'
+             ORDER BY s.id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        let mut hash = 0xcbf29ce484222325u64;
+        let mut any = false;
+        for row in rows {
+            let (id, generation) = row?;
+            any = true;
+            for byte in format!("{id}:{generation};").bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        Ok(if any { format!("{hash:016x}") } else { String::new() })
+    }
+}
+
+/// A plain-text stored-content excerpt. It never interprets Markdown/HTML;
+/// React receives this as text and therefore cannot execute source content.
+fn excerpt(title: &str, body: &str) -> String {
+    let combined = if body.is_empty() { title.to_string() } else { format!("{title}\n{body}") };
+    combined.chars().take(320).collect()
 }
 
 /// Unix epoch seconds as an `i64`, or `0` if the system clock is before the

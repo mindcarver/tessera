@@ -12,6 +12,7 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rusqlite::params;
 use tessera_lib::http::server::{bind, serve_with};
 
 /// Boot a real server on an ephemeral loopback port with a scratch app-data
@@ -31,6 +32,33 @@ fn boot_test_server() -> u16 {
     // any remaining race.
     std::thread::sleep(std::time::Duration::from_millis(50));
     port
+}
+
+/// A live loopback server with a populated active generation. This keeps the
+/// wire contract test at the HTTP boundary rather than relying on a mocked
+/// application response.
+fn boot_populated_search_server() -> (u16, Arc<tessera_lib::IndexState>) {
+    let dir = tempfile::tempdir().expect("scratch app-data dir");
+    let state = tessera_lib::boot(dir.path()).expect("boot must succeed on scratch dir");
+    {
+        let conn = state.conn.lock().expect("connection lock");
+        conn.execute("INSERT INTO source_registry (provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project) VALUES ('codex', 'agent_memory', 'confirmed', 'unknown', 'full', '/fixture', 'fixture', NULL)", []).expect("source");
+        conn.execute("INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision) VALUES (1, 'gen_1', 'succeeded', 1, 'gen_1', 'fixture')", []).expect("scan run");
+        conn.execute("INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')", []).expect("active generation");
+        for (id, title, body) in [("rec_a", "keyword first", "body one"), ("rec_b", "keyword second", "body two")] {
+            conn.execute("INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator) VALUES (?1, 1, 'gen_1', 'codex', 'section', ?1, 'file:///fixture#semantic', 'hash', 'v1', ?2, ?3, NULL, 'memory', 'full', 1, 'revision', 'file:///fixture#L1-L2')", params![id, title, body]).expect("record");
+        }
+    }
+    let server = bind("127.0.0.1:0");
+    let port = server.server_addr().to_ip().expect("bound addr").port();
+    let state = Arc::new(state);
+    let server_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let _dir = dir;
+        serve_with(server, server_state, PathBuf::from("dist"), Some(port));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    (port, state)
 }
 
 /// Send one raw HTTP/1.1 request and read the full response text. A read
@@ -157,6 +185,53 @@ fn malformed_scan_body_is_bad_request() {
     );
     assert!(response.starts_with("HTTP/1.1 400"), "got:\n{response}");
     assert!(response.contains("bad_request"), "got:\n{response}");
+}
+
+#[test]
+fn search_wire_contract_serializes_provenance_and_rejects_invalid_input_safely() {
+    let (port, state) = boot_populated_search_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=keyword&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("search body");
+    let page: serde_json::Value = serde_json::from_str(body).expect("versioned search JSON");
+    assert_eq!(page["api_version"], "1");
+    let result = &page["payload"]["results"][0];
+    for field in ["record_id", "excerpt", "provider", "source_id", "native_locator", "display_locator", "observed_at", "coverage_level", "health_state"] {
+        assert!(!result[field].is_null(), "missing {field}: {result}");
+    }
+    assert!(result.get("native_project").is_some(), "missing native_project: {result}");
+    let cursor = page["payload"]["next_cursor"].as_str().expect("continuation cursor");
+    let continuation = raw_http(
+        port,
+        &format!("GET /api/search?q=keyword&cursor={cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(continuation.starts_with("HTTP/1.1 200"), "got:\n{continuation}");
+    assert!(continuation.contains("rec_b"), "got:\n{continuation}");
+
+    {
+        let conn = state.conn.lock().expect("connection lock");
+        conn.execute("INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision) VALUES (1, 'gen_2', 'succeeded', 2, 'gen_2', 'fixture')", []).expect("new scan run");
+        conn.execute("UPDATE tessera_meta SET value = 'gen_2' WHERE key = 'active_generation:1'", []).expect("activate new generation");
+    }
+    let stale = raw_http(
+        port,
+        &format!("GET /api/search?q=keyword&cursor={cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(stale.starts_with("HTTP/1.1 409"), "got:\n{stale}");
+    assert!(stale.contains("\"code\":\"cursor_stale\""), "got:\n{stale}");
+    assert!(!stale.contains("keyword"), "safe error must not reflect the query: {stale}");
+    assert!(!continuation.contains("rec_a\""), "continuation duplicated first result: {continuation}");
+
+    let invalid = raw_http(
+        port,
+        &format!("GET /api/search?q=%20%20%20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(invalid.starts_with("HTTP/1.1 400"), "got:\n{invalid}");
+    assert!(invalid.contains("\"code\":\"bad_request\""), "got:\n{invalid}");
+    assert!(!invalid.contains("%20%20%20"), "query must not cross the wire: {invalid}");
 }
 
 #[test]

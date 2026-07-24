@@ -14,6 +14,7 @@
 
 pub mod ports;
 pub mod scan;
+pub mod query;
 pub mod source;
 
 // Re-export the most-used port types so application / adapter / IPC code can

@@ -30,7 +30,7 @@ pub mod state;
 pub use http::envelope::{Envelope, ErrorEnvelope, Pong, API_VERSION};
 pub use http::{
     confirm_source, disable_source, discover_sources, get_scan_status, list_sources, ping,
-    reject_source, scan_source,
+    reject_source, scan_source, search,
 };
 
 use std::path::{Path, PathBuf};
@@ -96,9 +96,10 @@ pub fn boot(data_dir: &Path) -> std::io::Result<IndexState> {
     index::migrations::apply(&mut conn)
         .map_err(std::io::Error::other)?;
 
-    // Boot scan recovery (AD-16): flip stale in-flight runs to failed
-    // and GC non-active-generation records, preserving the last active
-    // generation. Runs after migrations so the v2 tables exist.
+    // Boot scan recovery (AD-16): flip stale in-flight runs to failed and
+    // reclaim non-active derived records. Search cursors bind the current
+    // index revision, so they never retain historical snapshots. Runs after migrations
+    // so the v2 tables exist.
     // Log-and-continue: a recovery failure must not wedge the app; the
     // next boot retries (stale rows are still stale then).
     if let Err(e) = application::recover_scans(&conn) {

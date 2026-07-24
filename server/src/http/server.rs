@@ -37,8 +37,9 @@ use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
     confirm_source, disable_source, discover_sources, get_scan_status, list_sources, ping,
-    reject_source, scan_source,
+    reject_source, scan_source, search,
 };
+use crate::domain::query::{SearchRequest, MAX_CURSOR_BYTES, MAX_QUERY_BYTES};
 use crate::IndexState;
 
 /// The only interface the server is allowed to bind (AD-9/AD-12).
@@ -158,6 +159,13 @@ fn route(
             respond_result(request, disable_source(&source_id, state))
         }
         (Method::Get, "/api/sources") => respond_result(request, list_sources(state)),
+        (Method::Get, "/api/search") => {
+            let request_dto = match parse_search_query(query) {
+                Ok(request_dto) => request_dto,
+                Err(()) => return request.respond(json_error(StatusCode(400), "bad_request", "The request did not match Tessera's search contract.")),
+            };
+            respond_result(request, search(request_dto, state))
+        }
         (Method::Post, "/api/scan") => {
             let source_id = match read_source_id_body(&mut request) {
                 Ok(id) => id,
@@ -248,6 +256,55 @@ fn parse_source_id_query(query: &str) -> Option<SourceId> {
     None
 }
 
+/// Parse exactly q/cursor/limit. Values are percent-decoded before the
+/// request domain validates byte length and range; unknown/duplicate keys are
+/// rejected so API behavior stays bounded and unambiguous.
+fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
+    let mut q = None;
+    let mut cursor = None;
+    let mut limit = None;
+    if query.is_empty() { return Err(()); }
+    for pair in query.split('&') {
+        let (key, raw_value) = pair.split_once('=').ok_or(())?;
+        match key {
+            "q" if q.is_none() => {
+                q = Some(percent_decode_bounded(raw_value, MAX_QUERY_BYTES).ok_or(())?);
+            }
+            "cursor" if cursor.is_none() => {
+                cursor = Some(percent_decode_bounded(raw_value, MAX_CURSOR_BYTES).ok_or(())?);
+            }
+            "limit" if limit.is_none() => {
+                if raw_value.len() > 16 { return Err(()); }
+                limit = Some(percent_decode_bounded(raw_value, 16).ok_or(())?.parse::<usize>().map_err(|_| ())?);
+            }
+            _ => return Err(()),
+        }
+    }
+    SearchRequest::new(q.ok_or(())?, cursor, limit).map_err(|_| ())
+}
+
+/// Reject oversized encoded values before allocating their decoded buffer.
+/// Percent encoding can expand one decoded byte to three raw bytes.
+fn percent_decode_bounded(value: &str, max_decoded_bytes: usize) -> Option<String> {
+    if value.len() > max_decoded_bytes.checked_mul(3)? { return None; }
+    let mut bytes = Vec::with_capacity(value.len());
+    let raw = value.as_bytes();
+    let mut index = 0;
+    while index < raw.len() {
+        match raw[index] {
+            b'+' => { bytes.push(b' '); index += 1; }
+            b'%' if index + 2 < raw.len() => {
+                let hi = (raw[index + 1] as char).to_digit(16)?;
+                let lo = (raw[index + 2] as char).to_digit(16)?;
+                bytes.push(((hi << 4) | lo) as u8);
+                index += 3;
+            }
+            byte => { bytes.push(byte); index += 1; }
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn split_path_query(url: &str) -> (&str, &str) {
     match url.split_once('?') {
         Some((path, query)) => (path, query),
@@ -326,8 +383,9 @@ fn respond_result<T: serde::Serialize>(
         Ok(envelope) => request.respond(json_response(StatusCode(200), &envelope)),
         Err(error) => {
             let status = match error.code.as_str() {
+                "bad_request" => StatusCode(400),
                 "source_not_found" => StatusCode(404),
-                "confirm_failed" | "scan_failed" => StatusCode(409),
+                "confirm_failed" | "scan_failed" | "cursor_stale" => StatusCode(409),
                 _ => StatusCode(500),
             };
             request.respond(json_response(status, &error))
@@ -488,6 +546,13 @@ mod tests {
         assert_eq!(parse_source_id_query("source_id=/etc/passwd"), None);
         assert_eq!(parse_source_id_query("path=src_7"), None);
         assert_eq!(parse_source_id_query(""), None);
+    }
+
+    #[test]
+    fn parse_search_query_rejects_oversized_encoded_values_before_decoding() {
+        assert!(parse_search_query(&format!("q={}", "%41".repeat(MAX_QUERY_BYTES + 1))).is_err());
+        assert!(parse_search_query(&format!("q=ok&cursor={}", "%41".repeat(MAX_CURSOR_BYTES + 1))).is_err());
+        assert!(parse_search_query("q=%E4%B8%AD%E6%96%87&limit=2").is_ok());
     }
 
     #[test]

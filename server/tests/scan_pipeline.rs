@@ -821,8 +821,8 @@ fn boot_recovery_recovers_stale_runs_and_preserves_active() {
 // ---------------------------------------------------------------------------
 
 /// Re-scanning an unchanged source produces a NEW monotonically-increasing
-/// generation that becomes active; the old generation's records are cleaned
-/// up, and the `record_id` set is stable (locator-based identity — AD-15).
+/// generation that becomes active while the superseded derived generation is
+/// removed; the `record_id` set remains stable (locator-based identity — AD-15).
 #[test]
 fn rescan_unchanged_source_is_idempotent_with_stable_record_ids() {
     let tmp = tempdir().expect("tempdir");
@@ -863,8 +863,8 @@ fn rescan_unchanged_source_is_idempotent_with_stable_record_ids() {
     let active = active_generation_str(&conn, source_rowid);
     assert_eq!(active.as_deref(), Some(second.generation.0.as_str()));
 
-    // Old generation's records were cleaned up (AD-2 rebuildable); only the
-    // new active generation's records remain.
+    // Local cursor simplification: a new activation deletes all superseded
+    // derived records; continuations detect the changed index revision.
     assert_eq!(count_rows(&conn, "memory_records"), 2);
 
     // record_id set is stable across the unchanged re-scan (locator-based).
