@@ -85,6 +85,68 @@ fn read_identity(_canonical: &Path) -> Option<FilesystemIdentity> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocatorError {
+    Invalid,
+}
+
+pub fn path_from_file_uri(locator: &str) -> Result<PathBuf, LocatorError> {
+    let raw = locator
+        .strip_prefix("file://")
+        .ok_or(LocatorError::Invalid)?;
+    let path_part = raw.split_once('#').map(|(path, _)| path).unwrap_or(raw);
+    if path_part.is_empty() {
+        return Err(LocatorError::Invalid);
+    }
+    let decoded = percent_decode_uri_path(path_part)?;
+    if decoded.contains('\0') {
+        return Err(LocatorError::Invalid);
+    }
+    let path = PathBuf::from(decoded);
+    if !path.is_absolute() {
+        return Err(LocatorError::Invalid);
+    }
+    Ok(path)
+}
+
+pub fn canonical_target_within_root(root: &Path, target: &Path) -> io::Result<PathBuf> {
+    let root = canonicalize_root(root)?;
+    let target = std::fs::canonicalize(target)?;
+    if !target.starts_with(&root.normalized_path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "target is outside source root",
+        ));
+    }
+    Ok(target)
+}
+
+fn percent_decode_uri_path(value: &str) -> Result<String, LocatorError> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let raw = value.as_bytes();
+    let mut index = 0;
+    while index < raw.len() {
+        match raw[index] {
+            b'%' if index + 2 < raw.len() => {
+                let hi = (raw[index + 1] as char)
+                    .to_digit(16)
+                    .ok_or(LocatorError::Invalid)?;
+                let lo = (raw[index + 2] as char)
+                    .to_digit(16)
+                    .ok_or(LocatorError::Invalid)?;
+                bytes.push(((hi << 4) | lo) as u8);
+                index += 3;
+            }
+            b'%' => return Err(LocatorError::Invalid),
+            byte => {
+                bytes.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| LocatorError::Invalid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +188,9 @@ mod tests {
 
         let via_link = canonicalize_root(&link).expect("canonicalize symlink");
         // Canonicalize resolves the symlink: normalized_path equals real, not link.
-        assert_eq!(via_link.normalized_path, std::fs::canonicalize(&real).unwrap());
+        assert_eq!(
+            via_link.normalized_path,
+            std::fs::canonicalize(&real).unwrap()
+        );
     }
 }

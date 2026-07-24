@@ -31,6 +31,8 @@ export const TESSERA_STABLE_ERROR_CODES: ReadonlySet<string> = new Set([
   // unchanged (NFR-9).
   "scan_failed",
   "cursor_stale",
+  "record_not_found",
+  "open_failed",
 ]);
 
 /**

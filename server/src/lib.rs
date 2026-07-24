@@ -29,8 +29,8 @@ pub mod state;
 
 pub use http::envelope::{Envelope, ErrorEnvelope, Pong, API_VERSION};
 pub use http::{
-    confirm_source, disable_source, discover_sources, get_scan_status, list_sources, ping,
-    reject_source, scan_source, search,
+    confirm_source, disable_source, discover_sources, get_scan_status, list_sources,
+    open_original_location, ping, reject_source, scan_source, search,
 };
 
 use std::path::{Path, PathBuf};
@@ -81,8 +81,7 @@ pub fn boot(data_dir: &Path) -> std::io::Result<IndexState> {
     std::fs::create_dir_all(data_dir)?;
     let db_path = data_dir.join("tessera-index.db");
 
-    let mut conn = Connection::open(&db_path)
-        .map_err(std::io::Error::other)?;
+    let mut conn = Connection::open(&db_path).map_err(std::io::Error::other)?;
 
     // Enforce foreign keys on every connection (SQLite default is OFF;
     // the pragma is per-connection, not persisted). Required so the v2
@@ -93,8 +92,7 @@ pub fn boot(data_dir: &Path) -> std::io::Result<IndexState> {
 
     // Apply migrations atomically; on failure the previous usable index
     // remains (AD-29). v0 only seeds meta.
-    index::migrations::apply(&mut conn)
-        .map_err(std::io::Error::other)?;
+    index::migrations::apply(&mut conn).map_err(std::io::Error::other)?;
 
     // Boot scan recovery (AD-16): flip stale in-flight runs to failed and
     // reclaim non-active derived records. Search cursors bind the current

@@ -37,9 +37,10 @@
 
 use rusqlite::{params, Connection};
 
-use crate::domain::scan::{Generation, ScanRunState};
+use crate::domain::open::OpenTarget;
 use crate::domain::ports::query_store::QueryStore;
 use crate::domain::query::{SearchRequest, SearchResult};
+use crate::domain::scan::{Generation, ScanRunState};
 use crate::domain::source::{HealthState, SourceId};
 
 /// The `tessera_meta` key prefix for the active-generation marker. The full
@@ -553,6 +554,28 @@ impl<'a> ScanStore<'a> {
     pub fn source_rowid(source_id: &SourceId) -> Option<i64> {
         source_id.to_rowid()
     }
+    pub fn open_target_for_record(&self, record_id: &str) -> rusqlite::Result<Option<OpenTarget>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.record_id, m.source_id, m.native_locator, s.normalized_root_path
+             FROM memory_records m
+             JOIN source_registry s ON s.id = m.source_id
+             JOIN tessera_meta active ON active.key = ('active_generation:' || m.source_id)
+                                       AND active.value = m.generation
+             WHERE m.record_id = ?1
+               AND s.lifecycle_state = 'confirmed'
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![record_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(OpenTarget {
+                record_id: row.get(0)?,
+                source_id: SourceId::from_rowid(row.get(1)?),
+                native_locator: row.get(2)?,
+                normalized_root_path: row.get(3)?,
+            })),
+            None => Ok(None),
+        }
+    }
 }
 
 impl QueryStore for ScanStore<'_> {
@@ -579,22 +602,26 @@ impl QueryStore for ScanStore<'_> {
              LIMIT ?3",
         )?;
         let page_size = i64::try_from(request.limit() + 1).expect("search limit is bounded");
-        let rows = stmt.query_map(params![request.query(), after_record_id, page_size], |row| {
-            let health: String = row.get(10)?;
-            let health_state = HealthState::parse_str(&health).ok_or(rusqlite::Error::InvalidQuery)?;
-            Ok(SearchResult::new(
-                row.get(0)?,
-                excerpt(&row.get::<_, String>(1)?, &row.get::<_, String>(2)?),
-                row.get(3)?,
-                SourceId::from_rowid(row.get(4)?),
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-                health_state,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![request.query(), after_record_id, page_size],
+            |row| {
+                let health: String = row.get(10)?;
+                let health_state =
+                    HealthState::parse_str(&health).ok_or(rusqlite::Error::InvalidQuery)?;
+                Ok(SearchResult::new(
+                    row.get(0)?,
+                    excerpt(&row.get::<_, String>(1)?, &row.get::<_, String>(2)?),
+                    row.get(3)?,
+                    SourceId::from_rowid(row.get(4)?),
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    health_state,
+                ))
+            },
+        )?;
         rows.collect()
     }
 
@@ -606,7 +633,9 @@ impl QueryStore for ScanStore<'_> {
              WHERE s.lifecycle_state = 'confirmed'
              ORDER BY s.id ASC",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
         let mut hash = 0xcbf29ce484222325u64;
         let mut any = false;
         for row in rows {
@@ -617,14 +646,22 @@ impl QueryStore for ScanStore<'_> {
                 hash = hash.wrapping_mul(0x100000001b3);
             }
         }
-        Ok(if any { format!("{hash:016x}") } else { String::new() })
+        Ok(if any {
+            format!("{hash:016x}")
+        } else {
+            String::new()
+        })
     }
 }
 
 /// A plain-text stored-content excerpt. It never interprets Markdown/HTML;
 /// React receives this as text and therefore cannot execute source content.
 fn excerpt(title: &str, body: &str) -> String {
-    let combined = if body.is_empty() { title.to_string() } else { format!("{title}\n{body}") };
+    let combined = if body.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}\n{body}")
+    };
     combined.chars().take(320).collect()
 }
 

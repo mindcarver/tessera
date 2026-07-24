@@ -33,13 +33,14 @@ use std::sync::Arc;
 
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use crate::domain::open::OpenRequest;
+use crate::domain::query::{SearchRequest, MAX_CURSOR_BYTES, MAX_QUERY_BYTES};
 use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
-    confirm_source, disable_source, discover_sources, get_scan_status, list_sources, ping,
-    reject_source, scan_source, search,
+    confirm_source, disable_source, discover_sources, get_scan_status, list_sources,
+    open_original_location, ping, reject_source, scan_source, search,
 };
-use crate::domain::query::{SearchRequest, MAX_CURSOR_BYTES, MAX_QUERY_BYTES};
 use crate::IndexState;
 
 /// The only interface the server is allowed to bind (AD-9/AD-12).
@@ -159,10 +160,23 @@ fn route(
             respond_result(request, disable_source(&source_id, state))
         }
         (Method::Get, "/api/sources") => respond_result(request, list_sources(state)),
+        (Method::Post, "/api/open") => {
+            let open_request = match read_open_request_body(&mut request) {
+                Ok(body) => body,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, open_original_location(open_request, state))
+        }
         (Method::Get, "/api/search") => {
             let request_dto = match parse_search_query(query) {
                 Ok(request_dto) => request_dto,
-                Err(()) => return request.respond(json_error(StatusCode(400), "bad_request", "The request did not match Tessera's search contract.")),
+                Err(()) => {
+                    return request.respond(json_error(
+                        StatusCode(400),
+                        "bad_request",
+                        "The request did not match Tessera's search contract.",
+                    ))
+                }
             };
             respond_result(request, search(request_dto, state))
         }
@@ -212,6 +226,11 @@ struct SourceIdRequest {
     source_id: SourceId,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct OpenRequestBody {
+    record_id: String,
+}
+
 /// Read and deserialize a JSON request body. Enforces a 1 MiB bound (AD-17:
 /// bounded contracts) and a `bad_request` stable code on any shape drift —
 /// a malformed body is a client contract violation, never an internal error.
@@ -243,6 +262,18 @@ fn read_source_id_body(
     read_json_body::<SourceIdRequest>(request).map(|body| body.source_id)
 }
 
+fn read_open_request_body(
+    request: &mut Request,
+) -> Result<OpenRequest, Response<std::io::Cursor<Vec<u8>>>> {
+    let body = read_json_body::<OpenRequestBody>(request)?;
+    OpenRequest::new(body.record_id).map_err(|_| {
+        json_response(
+            StatusCode(400),
+            &crate::http::ErrorEnvelope::bad_request("open"),
+        )
+    })
+}
+
 /// Parse `source_id=src_<n>` from a query string. Rejects anything that does
 /// not carry exactly the expected parameter shape (AD-4: only `source_id`,
 /// never an arbitrary path).
@@ -263,7 +294,9 @@ fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
     let mut q = None;
     let mut cursor = None;
     let mut limit = None;
-    if query.is_empty() { return Err(()); }
+    if query.is_empty() {
+        return Err(());
+    }
     for pair in query.split('&') {
         let (key, raw_value) = pair.split_once('=').ok_or(())?;
         match key {
@@ -274,8 +307,15 @@ fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
                 cursor = Some(percent_decode_bounded(raw_value, MAX_CURSOR_BYTES).ok_or(())?);
             }
             "limit" if limit.is_none() => {
-                if raw_value.len() > 16 { return Err(()); }
-                limit = Some(percent_decode_bounded(raw_value, 16).ok_or(())?.parse::<usize>().map_err(|_| ())?);
+                if raw_value.len() > 16 {
+                    return Err(());
+                }
+                limit = Some(
+                    percent_decode_bounded(raw_value, 16)
+                        .ok_or(())?
+                        .parse::<usize>()
+                        .map_err(|_| ())?,
+                );
             }
             _ => return Err(()),
         }
@@ -286,20 +326,28 @@ fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
 /// Reject oversized encoded values before allocating their decoded buffer.
 /// Percent encoding can expand one decoded byte to three raw bytes.
 fn percent_decode_bounded(value: &str, max_decoded_bytes: usize) -> Option<String> {
-    if value.len() > max_decoded_bytes.checked_mul(3)? { return None; }
+    if value.len() > max_decoded_bytes.checked_mul(3)? {
+        return None;
+    }
     let mut bytes = Vec::with_capacity(value.len());
     let raw = value.as_bytes();
     let mut index = 0;
     while index < raw.len() {
         match raw[index] {
-            b'+' => { bytes.push(b' '); index += 1; }
+            b'+' => {
+                bytes.push(b' ');
+                index += 1;
+            }
             b'%' if index + 2 < raw.len() => {
                 let hi = (raw[index + 1] as char).to_digit(16)?;
                 let lo = (raw[index + 2] as char).to_digit(16)?;
                 bytes.push(((hi << 4) | lo) as u8);
                 index += 3;
             }
-            byte => { bytes.push(byte); index += 1; }
+            byte => {
+                bytes.push(byte);
+                index += 1;
+            }
         }
     }
     String::from_utf8(bytes).ok()
@@ -384,8 +432,10 @@ fn respond_result<T: serde::Serialize>(
         Err(error) => {
             let status = match error.code.as_str() {
                 "bad_request" => StatusCode(400),
-                "source_not_found" => StatusCode(404),
-                "confirm_failed" | "scan_failed" | "cursor_stale" => StatusCode(409),
+                "source_not_found" | "record_not_found" => StatusCode(404),
+                "confirm_failed" | "scan_failed" | "cursor_stale" | "open_failed" => {
+                    StatusCode(409)
+                }
                 _ => StatusCode(500),
             };
             request.respond(json_response(status, &error))
@@ -421,12 +471,16 @@ fn json_error(status: StatusCode, code: &str, message: &str) -> Response<std::io
 /// so derived-index data is never cached by the browser or any intermediary.
 fn with_security_headers<R: std::io::Read>(response: Response<R>, is_api: bool) -> Response<R> {
     let response = response
-        .with_header(Header::from_bytes("Content-Security-Policy", CONTENT_SECURITY_POLICY).unwrap())
+        .with_header(
+            Header::from_bytes("Content-Security-Policy", CONTENT_SECURITY_POLICY).unwrap(),
+        )
         .with_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap())
         .with_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
     if is_api {
         response
-            .with_header(Header::from_bytes("Content-Type", "application/json; charset=utf-8").unwrap())
+            .with_header(
+                Header::from_bytes("Content-Type", "application/json; charset=utf-8").unwrap(),
+            )
             .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap())
     } else {
         response
@@ -445,11 +499,7 @@ fn serve_static(request: Request, static_root: &Path, path: &str) -> std::io::Re
     let relative = match sanitize_static_path(path) {
         Some(relative) => relative,
         None => {
-            return request.respond(json_error(
-                StatusCode(400),
-                "bad_request",
-                "invalid path.",
-            ))
+            return request.respond(json_error(StatusCode(400), "bad_request", "invalid path."))
         }
     };
     let full_path = static_root.join(&relative);
@@ -527,8 +577,14 @@ mod tests {
     fn origin_value_accepts_only_loopback_origins() {
         assert!(origin_value_allowed("http://127.0.0.1:1420", Some(1420)));
         assert!(origin_value_allowed("http://localhost:1420", Some(1420)));
-        assert!(!origin_value_allowed("https://evil.example.com", Some(1420)));
-        assert!(!origin_value_allowed("http://evil.example.com:1420", Some(1420)));
+        assert!(!origin_value_allowed(
+            "https://evil.example.com",
+            Some(1420)
+        ));
+        assert!(!origin_value_allowed(
+            "http://evil.example.com:1420",
+            Some(1420)
+        ));
         assert!(!origin_value_allowed("", Some(1420)));
         // A loopback origin for a *different* port is a different origin.
         assert!(!origin_value_allowed("http://127.0.0.1:3000", Some(1420)));
@@ -551,7 +607,11 @@ mod tests {
     #[test]
     fn parse_search_query_rejects_oversized_encoded_values_before_decoding() {
         assert!(parse_search_query(&format!("q={}", "%41".repeat(MAX_QUERY_BYTES + 1))).is_err());
-        assert!(parse_search_query(&format!("q=ok&cursor={}", "%41".repeat(MAX_CURSOR_BYTES + 1))).is_err());
+        assert!(parse_search_query(&format!(
+            "q=ok&cursor={}",
+            "%41".repeat(MAX_CURSOR_BYTES + 1)
+        ))
+        .is_err());
         assert!(parse_search_query("q=%E4%B8%AD%E6%96%87&limit=2").is_ok());
     }
 
@@ -590,8 +650,14 @@ mod tests {
         assert!(joined.contains("connect-src 'self'"), "got:\n{joined}");
         assert!(joined.contains("object-src 'none'"), "got:\n{joined}");
         assert!(joined.contains("frame-src 'none'"), "got:\n{joined}");
-        assert!(joined.contains("X-Content-Type-Options: nosniff"), "got:\n{joined}");
-        assert!(joined.contains("Referrer-Policy: no-referrer"), "got:\n{joined}");
+        assert!(
+            joined.contains("X-Content-Type-Options: nosniff"),
+            "got:\n{joined}"
+        );
+        assert!(
+            joined.contains("Referrer-Policy: no-referrer"),
+            "got:\n{joined}"
+        );
         assert!(joined.contains("Cache-Control: no-store"), "got:\n{joined}");
         assert!(joined.contains("application/json"), "got:\n{joined}");
     }

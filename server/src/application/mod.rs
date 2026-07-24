@@ -16,8 +16,9 @@
 //! 兑现) and moves `discover_sources` into it, then adds the confirm /
 //! reject / disable / list orchestrators.
 
-pub mod scan;
+pub mod open;
 pub mod query;
+pub mod scan;
 pub mod source;
 
 // Re-export so IPC and lib.rs can name `application::discover_sources` etc.
@@ -28,5 +29,8 @@ pub use source::{
 
 // Story 1.4 scan orchestration (AD-1). Re-exported so IPC and the boot path
 // can name them without a long path.
-pub use scan::{get_scan_status, recover_scans, scan_source, scan_source_with};
+pub use open::{
+    open_original_location, reset_open_path_for_tests, set_open_path_for_tests, OpenError,
+};
 pub use query::search;
+pub use scan::{get_scan_status, recover_scans, scan_source, scan_source_with};

@@ -9,11 +9,20 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use rusqlite::params;
+use tessera_lib::adapters::codex::file_uri;
 use tessera_lib::http::server::{bind, serve_with};
+
+static HTTP_OPEN_TEST_LOCK: Mutex<()> = Mutex::new(());
+static HTTP_OPENED_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn capture_http_open(path: &Path) -> std::io::Result<()> {
+    *HTTP_OPENED_PATH.lock().expect("opened path lock") = Some(path.to_path_buf());
+    Ok(())
+}
 
 /// Boot a real server on an ephemeral loopback port with a scratch app-data
 /// dir, and return its bound port. The server thread lives for the rest of
@@ -44,8 +53,15 @@ fn boot_populated_search_server() -> (u16, Arc<tessera_lib::IndexState>) {
         let conn = state.conn.lock().expect("connection lock");
         conn.execute("INSERT INTO source_registry (provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project) VALUES ('codex', 'agent_memory', 'confirmed', 'unknown', 'full', '/fixture', 'fixture', NULL)", []).expect("source");
         conn.execute("INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision) VALUES (1, 'gen_1', 'succeeded', 1, 'gen_1', 'fixture')", []).expect("scan run");
-        conn.execute("INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')", []).expect("active generation");
-        for (id, title, body) in [("rec_a", "keyword first", "body one"), ("rec_b", "keyword second", "body two")] {
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')",
+            [],
+        )
+        .expect("active generation");
+        for (id, title, body) in [
+            ("rec_a", "keyword first", "body one"),
+            ("rec_b", "keyword second", "body two"),
+        ] {
             conn.execute("INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator) VALUES (?1, 1, 'gen_1', 'codex', 'section', ?1, 'file:///fixture#semantic', 'hash', 'v1', ?2, ?3, NULL, 'memory', 'full', 1, 'revision', 'file:///fixture#L1-L2')", params![id, title, body]).expect("record");
         }
     }
@@ -59,6 +75,39 @@ fn boot_populated_search_server() -> (u16, Arc<tessera_lib::IndexState>) {
     });
     std::thread::sleep(std::time::Duration::from_millis(50));
     (port, state)
+}
+
+fn boot_populated_open_server() -> (u16, PathBuf) {
+    let dir = tempfile::tempdir().expect("scratch app-data dir");
+    let source_root = tempfile::tempdir().expect("source root");
+    let memory = source_root.path().join("MEMORY.md");
+    std::fs::write(&memory, "keyword original").expect("source memory");
+    let expected = std::fs::canonicalize(&memory).expect("canonical memory");
+    let locator = file_uri(&memory).expect("file uri");
+    let state = tessera_lib::boot(dir.path()).expect("boot must succeed on scratch dir");
+    {
+        let conn = state.conn.lock().expect("connection lock");
+        let root = std::fs::canonicalize(source_root.path()).expect("canonical source root");
+        let root = root.to_string_lossy().into_owned();
+        conn.execute("INSERT INTO source_registry (provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project) VALUES ('codex', 'agent_memory', 'confirmed', 'unknown', 'full', ?1, 'fixture', NULL)", params![root]).expect("source");
+        conn.execute("INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision) VALUES (1, 'gen_1', 'succeeded', 1, 'gen_1', 'fixture')", []).expect("scan run");
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')",
+            [],
+        )
+        .expect("active generation");
+        conn.execute("INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator) VALUES ('rec_a', 1, 'gen_1', 'codex', 'section', 'rec_a', ?1, 'hash', 'v1', 'keyword', 'body', NULL, 'memory', 'full', 1, 'revision', ?2)", params![locator, format!("{locator}#L1-L2")]).expect("record");
+    }
+    let server = bind("127.0.0.1:0");
+    let port = server.server_addr().to_ip().expect("bound addr").port();
+    let state = Arc::new(state);
+    std::thread::spawn(move || {
+        let _dir = dir;
+        let _source_root = source_root;
+        serve_with(server, state, PathBuf::from("dist"), Some(port));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    (port, expected)
 }
 
 /// Send one raw HTTP/1.1 request and read the full response text. A read
@@ -199,22 +248,44 @@ fn search_wire_contract_serializes_provenance_and_rejects_invalid_input_safely()
     let page: serde_json::Value = serde_json::from_str(body).expect("versioned search JSON");
     assert_eq!(page["api_version"], "1");
     let result = &page["payload"]["results"][0];
-    for field in ["record_id", "excerpt", "provider", "source_id", "native_locator", "display_locator", "observed_at", "coverage_level", "health_state"] {
+    for field in [
+        "record_id",
+        "excerpt",
+        "provider",
+        "source_id",
+        "native_locator",
+        "display_locator",
+        "observed_at",
+        "coverage_level",
+        "health_state",
+    ] {
         assert!(!result[field].is_null(), "missing {field}: {result}");
     }
-    assert!(result.get("native_project").is_some(), "missing native_project: {result}");
-    let cursor = page["payload"]["next_cursor"].as_str().expect("continuation cursor");
+    assert!(
+        result.get("native_project").is_some(),
+        "missing native_project: {result}"
+    );
+    let cursor = page["payload"]["next_cursor"]
+        .as_str()
+        .expect("continuation cursor");
     let continuation = raw_http(
         port,
         &format!("GET /api/search?q=keyword&cursor={cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
     );
-    assert!(continuation.starts_with("HTTP/1.1 200"), "got:\n{continuation}");
+    assert!(
+        continuation.starts_with("HTTP/1.1 200"),
+        "got:\n{continuation}"
+    );
     assert!(continuation.contains("rec_b"), "got:\n{continuation}");
 
     {
         let conn = state.conn.lock().expect("connection lock");
         conn.execute("INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision) VALUES (1, 'gen_2', 'succeeded', 2, 'gen_2', 'fixture')", []).expect("new scan run");
-        conn.execute("UPDATE tessera_meta SET value = 'gen_2' WHERE key = 'active_generation:1'", []).expect("activate new generation");
+        conn.execute(
+            "UPDATE tessera_meta SET value = 'gen_2' WHERE key = 'active_generation:1'",
+            [],
+        )
+        .expect("activate new generation");
     }
     let stale = raw_http(
         port,
@@ -222,16 +293,87 @@ fn search_wire_contract_serializes_provenance_and_rejects_invalid_input_safely()
     );
     assert!(stale.starts_with("HTTP/1.1 409"), "got:\n{stale}");
     assert!(stale.contains("\"code\":\"cursor_stale\""), "got:\n{stale}");
-    assert!(!stale.contains("keyword"), "safe error must not reflect the query: {stale}");
-    assert!(!continuation.contains("rec_a\""), "continuation duplicated first result: {continuation}");
+    assert!(
+        !stale.contains("keyword"),
+        "safe error must not reflect the query: {stale}"
+    );
+    assert!(
+        !continuation.contains("rec_a\""),
+        "continuation duplicated first result: {continuation}"
+    );
 
     let invalid = raw_http(
         port,
         &format!("GET /api/search?q=%20%20%20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
     );
     assert!(invalid.starts_with("HTTP/1.1 400"), "got:\n{invalid}");
-    assert!(invalid.contains("\"code\":\"bad_request\""), "got:\n{invalid}");
-    assert!(!invalid.contains("%20%20%20"), "query must not cross the wire: {invalid}");
+    assert!(
+        invalid.contains("\"code\":\"bad_request\""),
+        "got:\n{invalid}"
+    );
+    assert!(
+        !invalid.contains("%20%20%20"),
+        "query must not cross the wire: {invalid}"
+    );
+}
+
+#[test]
+fn open_wire_contract_invokes_server_opener_and_rejects_missing_record_safely() {
+    let _guard = HTTP_OPEN_TEST_LOCK.lock().expect("test lock");
+    *HTTP_OPENED_PATH.lock().expect("opened path lock") = None;
+    tessera_lib::application::set_open_path_for_tests(capture_http_open);
+    let (port, expected) = boot_populated_open_server();
+    let body = r#"{"record_id":"rec_a"}"#;
+    let response = raw_http(
+        port,
+        &format!(
+            "POST /api/open HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    assert!(
+        response.contains("\"api_version\":\"1\""),
+        "got:\n{response}"
+    );
+    assert!(
+        response.contains("\"record_id\":\"rec_a\""),
+        "got:\n{response}"
+    );
+    assert_eq!(HTTP_OPENED_PATH.lock().unwrap().as_ref(), Some(&expected));
+
+    let missing_body = r#"{"record_id":"rec_missing"}"#;
+    let missing = raw_http(
+        port,
+        &format!(
+            "POST /api/open HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            missing_body.len(),
+            missing_body
+        ),
+    );
+    assert!(missing.starts_with("HTTP/1.1 404"), "got:\n{missing}");
+    assert!(
+        missing.contains("\"code\":\"record_not_found\""),
+        "got:\n{missing}"
+    );
+    assert!(
+        !missing.contains(expected.to_string_lossy().as_ref()),
+        "open error must not leak paths: {missing}"
+    );
+
+    let invalid_body = r#"{"record_id":"not-a-record"}"#;
+    let invalid = raw_http(
+        port,
+        &format!(
+            "POST /api/open HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            invalid_body.len(),
+            invalid_body
+        ),
+    );
+    assert!(invalid.starts_with("HTTP/1.1 400"), "got:\n{invalid}");
+    assert!(invalid.contains("open contract"), "got:\n{invalid}");
+    tessera_lib::application::reset_open_path_for_tests();
 }
 
 #[test]

@@ -39,6 +39,16 @@ test("keyboard scan posts successfully and announces completion", async ({ page 
 test("keyboard search renders provenance, empty states, pagination, and safe API errors", async ({ page }) => {
   await page.goto("/");
   let stalePage = 0;
+  let openCalls = 0;
+  const openBodies: string[] = [];
+  await page.route("**/api/open", async (route) => {
+    openCalls += 1;
+    openBodies.push(route.request().postData() ?? "");
+    if (openCalls === 1) {
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: { record_id: "mock-record", source_id: "src_1" } }) });
+    }
+    return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ code: "open_failed", message: "Tessera could not open the original location.", source_id: "src_1", phase: "open" }) });
+  });
   await page.route("**/api/search?*", async (route) => {
     const q = new URL(route.request().url()).searchParams.get("q");
     const payload = (empty_state: string | null, results: unknown[] = [], next_cursor: string | null = null) => ({ api_version: "1", payload: { results, next_cursor, empty_state } });
@@ -62,6 +72,18 @@ test("keyboard search renders provenance, empty states, pagination, and safe API
   await expect(page.getByText("Provider").first()).toBeVisible();
   await expect(page.getByText("Semantic location").first()).toBeVisible();
   await expect(page.getByText("Last observed (scan)").first()).toBeVisible();
+  const openOriginal = page.getByRole("button", { name: "Open original location" }).first();
+  await expect(openOriginal).toBeVisible();
+  await openOriginal.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("Opened original location.")).toBeVisible();
+  const openRequest = JSON.parse(openBodies[0]) as Record<string, unknown>;
+  expect(Object.keys(openRequest)).toEqual(["record_id"]);
+  expect(typeof openRequest.record_id).toBe("string");
+  await openOriginal.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("alert")).toHaveText("Tessera could not open the original location.");
+  await expect(page.getByText("Source health").first()).toBeVisible();
 
   const loadMore = page.getByRole("button", { name: "Load more" });
   await expect(loadMore).toBeVisible();

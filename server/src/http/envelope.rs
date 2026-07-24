@@ -66,7 +66,12 @@ impl ErrorEnvelope {
     /// Construct a generic internal error envelope. Phase 0 has no real
     /// failure path; this helper exists so later Stories use the same shape.
     pub fn internal() -> Self {
-        Self::new("internal", "Tessera hit an internal error.", None, "internal")
+        Self::new(
+            "internal",
+            "Tessera hit an internal error.",
+            None,
+            "internal",
+        )
     }
 
     /// Construct an internal error tied to a safe Source handle and phase.
@@ -80,11 +85,39 @@ impl ErrorEnvelope {
     }
 
     pub fn bad_request(phase: &str) -> Self {
-        Self::new("bad_request", "The request did not match Tessera's search contract.", None, phase)
+        let message = match phase {
+            "search" => "The request did not match Tessera's search contract.",
+            "open" => "The request did not match Tessera's open contract.",
+            _ => "The request did not match Tessera's API contract.",
+        };
+        Self::new("bad_request", message, None, phase)
     }
 
     pub fn cursor_stale() -> Self {
-        Self::new("cursor_stale", "The index changed. Run the search again.", None, "search")
+        Self::new(
+            "cursor_stale",
+            "The index changed. Run the search again.",
+            None,
+            "search",
+        )
+    }
+
+    pub fn record_not_found() -> Self {
+        Self::new(
+            "record_not_found",
+            "Tessera could not find that memory record.",
+            None,
+            "open",
+        )
+    }
+
+    pub fn open_failed(source_id: Option<&str>) -> Self {
+        Self::new(
+            "open_failed",
+            "Tessera could not open the original location.",
+            source_id,
+            "open",
+        )
     }
 
     /// Construct a `confirm_failed` error envelope (Story 1.3). Stable code

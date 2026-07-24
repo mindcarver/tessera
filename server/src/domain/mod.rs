@@ -12,9 +12,10 @@
 //!   `source_id + provider + native locator + unit kind`; content hash detects
 //!   change but is not identity (AD-15/AD-30).
 
+pub mod open;
 pub mod ports;
-pub mod scan;
 pub mod query;
+pub mod scan;
 pub mod source;
 
 // Re-export the most-used port types so application / adapter / IPC code can
@@ -31,6 +32,8 @@ pub use ports::provider_adapter::{
 // Story 1.3 adds the persistent Source identity + lifecycle + fingerprint
 // domain model (AD-33/AD-35). Re-exported so application / index / ipc can
 // name them without a long path.
+pub use open::{OpenRequest, OpenRequestError, OpenResult};
+
 pub use source::{
     build_fingerprint, FilesystemIdentity, HealthState, Source, SourceFingerprint, SourceId,
     SourceKind, SourceLifecycle, ROOT_KIND_DIR,

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactElement, type RefObject } from "react";
 import { readTesseraErrorMessage } from "../../api/errors";
+import { openOriginalLocation } from "../../api/open";
 import { searchMemories, type SearchEmptyState, type SearchResult } from "../../api/search";
 
 const SEARCH_PAGE_SIZE = 2;
@@ -12,10 +13,18 @@ type State =
   | { kind: "stale"; results: SearchResult[]; cursor: string | null; message: string }
   | { kind: "ready"; results: SearchResult[]; cursor: string | null; empty: SearchEmptyState | null };
 
+type OpenState =
+  | { kind: "idle" }
+  | { kind: "opening"; recordId: string }
+  | { kind: "opened"; message: string }
+  | { kind: "error"; message: string };
+
 export function Search(): ReactElement {
   const [query, setQuery] = useState("");
   const [state, setState] = useState<State>({ kind: "idle" });
+  const [openState, setOpenState] = useState<OpenState>({ kind: "idle" });
   const request = useRef(0);
+  const openRequest = useRef(0);
   const pendingResultFocus = useRef<number | null>(null);
   const resultList = useRef<HTMLOListElement>(null);
   const alert = useRef<HTMLParagraphElement>(null);
@@ -32,6 +41,8 @@ export function Search(): ReactElement {
   const submit = useCallback((event: FormEvent) => {
     event.preventDefault();
     const id = ++request.current;
+    ++openRequest.current;
+    setOpenState({ kind: "idle" });
     setState({ kind: "loading" });
     searchMemories(query, undefined, SEARCH_PAGE_SIZE).then((page) => {
       if (id !== request.current) return;
@@ -58,34 +69,59 @@ export function Search(): ReactElement {
       }
     });
   }, [query, state]);
+  const openRecord = useCallback((recordId: string) => {
+    const id = ++openRequest.current;
+    setOpenState({ kind: "opening", recordId });
+    openOriginalLocation(recordId).then(() => {
+      if (id !== openRequest.current) return;
+      setOpenState({ kind: "opened", message: "Opened original location." });
+    }).catch((error: unknown) => {
+      if (id !== openRequest.current) return;
+      setOpenState({ kind: "error", message: readTesseraErrorMessage(error) });
+    });
+  }, []);
   return <section aria-label="Memory search" role="region">
     <h2>Search memories</h2>
     <form onSubmit={submit}>
       <label htmlFor="memory-search">Keyword</label>
-      <input id="memory-search" value={query} onChange={(event) => { ++request.current; setQuery(event.target.value); setState({ kind: "idle" }); }} />
+      <input id="memory-search" value={query} onChange={(event) => { ++request.current; ++openRequest.current; setQuery(event.target.value); setState({ kind: "idle" }); setOpenState({ kind: "idle" }); }} />
       <button type="submit">Search</button>
     </form>
-    <div aria-live="polite">{renderState(state, loadMore, resultList, alert)}</div>
+    <div aria-live="polite">{renderOpenState(openState)}{renderState(state, loadMore, openRecord, openState, resultList, alert)}</div>
   </section>;
 }
 
 function renderState(
   state: State,
   loadMore: () => void,
+  openRecord: (recordId: string) => void,
+  openState: OpenState,
   resultList: RefObject<HTMLOListElement | null>,
   alert: RefObject<HTMLParagraphElement | null>,
 ): ReactElement | null {
+  const openingId = openingRecordId(openState);
   if (state.kind === "idle") return null;
   if (state.kind === "loading") return <p>Searching indexed memories…</p>;
-  if (state.kind === "loading_more") return <>{renderResults(state.results, state.cursor, loadMore, resultList, true)}<p>Loading more results…</p></>;
-  if (state.kind === "error") return <>{state.results ? renderResults(state.results, null, loadMore, resultList) : null}<p ref={alert} tabIndex={-1} role="alert">{state.message}</p></>;
-  if (state.kind === "stale") return <><p ref={alert} tabIndex={-1} role="alert">{state.message}</p>{renderResults(state.results, null, loadMore, resultList)}</>;
+  if (state.kind === "loading_more") return <>{renderResults(state.results, state.cursor, loadMore, openRecord, openingId, resultList, true)}<p>Loading more results…</p></>;
+  if (state.kind === "error") return <>{state.results ? renderResults(state.results, null, loadMore, openRecord, openingId, resultList) : null}<p ref={alert} tabIndex={-1} role="alert">{state.message}</p></>;
+  if (state.kind === "stale") return <><p ref={alert} tabIndex={-1} role="alert">{state.message}</p>{renderResults(state.results, null, loadMore, openRecord, openingId, resultList)}</>;
   if (state.empty) return <p>{emptyCopy(state.empty)}</p>;
-  return renderResults(state.results, state.cursor, loadMore, resultList);
+  return renderResults(state.results, state.cursor, loadMore, openRecord, openingId, resultList);
 }
 
-function renderResults(results: SearchResult[], cursor: string | null, loadMore: () => void, resultList: RefObject<HTMLOListElement | null>, loadingMore = false): ReactElement {
-  return <><p>{results.length} result{results.length === 1 ? "" : "s"}.</p><ol ref={resultList}>{results.map((result) => <li key={result.record_id} tabIndex={0}><p>{result.excerpt}</p><dl><dt>Provider</dt><dd>{result.provider}</dd><dt>Source</dt><dd>{result.source_id}</dd><dt>Native project</dt><dd>{result.native_project ?? "Unmapped"}</dd><dt>Semantic location</dt><dd>{result.native_locator}</dd><dt>Display location</dt><dd>{result.display_locator}</dd><dt>Last observed (scan)</dt><dd>{result.observed_at}</dd><dt>Coverage</dt><dd>{result.coverage_level}</dd><dt>Source health</dt><dd>{result.health_state}</dd></dl></li>)}</ol>{cursor ? <button type="button" onClick={loadMore} disabled={loadingMore}>Load more</button> : null}</>;
+function renderResults(results: SearchResult[], cursor: string | null, loadMore: () => void, openRecord: (recordId: string) => void, openingRecordId: string | null, resultList: RefObject<HTMLOListElement | null>, loadingMore = false): ReactElement {
+  return <><p>{results.length} result{results.length === 1 ? "" : "s"}.</p><ol ref={resultList}>{results.map((result) => <li key={result.record_id} tabIndex={0}><p>{result.excerpt}</p><dl><dt>Provider</dt><dd>{result.provider}</dd><dt>Source</dt><dd>{result.source_id}</dd><dt>Native project</dt><dd>{result.native_project ?? "Unmapped"}</dd><dt>Semantic location</dt><dd>{result.native_locator}</dd><dt>Display location</dt><dd>{result.display_locator}</dd><dt>Last observed (scan)</dt><dd>{result.observed_at}</dd><dt>Coverage</dt><dd>{result.coverage_level}</dd><dt>Source health</dt><dd>{result.health_state}</dd></dl><button type="button" onClick={() => openRecord(result.record_id)} disabled={openingRecordId === result.record_id}>Open original location</button></li>)}</ol>{cursor ? <button type="button" onClick={loadMore} disabled={loadingMore}>Load more</button> : null}</>;
+}
+
+function renderOpenState(state: OpenState): ReactElement | null {
+  if (state.kind === "idle") return null;
+  if (state.kind === "opening") return <p>Opening original location…</p>;
+  if (state.kind === "opened") return <p>{state.message}</p>;
+  return <p role="alert">{state.message}</p>;
+}
+
+function openingRecordId(state: OpenState): string | null {
+  return state.kind === "opening" ? state.recordId : null;
 }
 
 function hasErrorCode(error: unknown, code: string): boolean {

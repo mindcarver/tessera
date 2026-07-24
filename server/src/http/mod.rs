@@ -36,8 +36,9 @@ pub use envelope::{Envelope, ErrorEnvelope, Pong, API_VERSION};
 use std::sync::MutexGuard;
 
 use crate::application;
-use crate::application::SourceError;
 use crate::application::query::QueryError;
+use crate::application::{OpenError, SourceError};
+use crate::domain::open::{OpenRequest, OpenResult};
 use crate::domain::query::{SearchPage, SearchRequest};
 use crate::domain::scan::{ScanError, ScanOutcome, ScanStatus};
 use crate::domain::source::{Source, SourceId};
@@ -170,7 +171,10 @@ pub fn list_sources(state: &IndexState) -> Result<Envelope<Vec<Source>>, ErrorEn
 
 /// Search only confirmed Sources' active canonical generations. The HTTP
 /// layer receives a validated DTO; it never sees source text or SQLite.
-pub fn search(request: SearchRequest, state: &IndexState) -> Result<Envelope<SearchPage>, ErrorEnvelope> {
+pub fn search(
+    request: SearchRequest,
+    state: &IndexState,
+) -> Result<Envelope<SearchPage>, ErrorEnvelope> {
     let conn = lock_conn(state)?;
     let registry = SourceRegistry::new(&conn);
     let page = application::search(&registry, &conn, request).map_err(|error| match error {
@@ -178,7 +182,22 @@ pub fn search(request: SearchRequest, state: &IndexState) -> Result<Envelope<Sea
         QueryError::CursorStale => ErrorEnvelope::cursor_stale(),
         QueryError::Internal => ErrorEnvelope::internal_for(None, "search"),
     })?;
-    Ok(Envelope { api_version: API_VERSION, payload: page })
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: page,
+    })
+}
+
+pub fn open_original_location(
+    request: OpenRequest,
+    state: &IndexState,
+) -> Result<Envelope<OpenResult>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let result = application::open_original_location(&conn, request).map_err(map_open_error)?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: result,
+    })
 }
 
 /// Acquire the IndexState mutex and return a guarded connection reference.
@@ -189,6 +208,17 @@ fn lock_conn(state: &IndexState) -> Result<MutexGuard<'_, rusqlite::Connection>,
 
 /// Map an application-layer [`SourceError`] onto the stable API error codes
 /// (AD-13). Keeps the application → http mapping in one place.
+fn map_open_error(err: OpenError) -> ErrorEnvelope {
+    match err {
+        OpenError::RecordNotFound => ErrorEnvelope::record_not_found(),
+        OpenError::OpenFailed { source_id } => {
+            let source_id = source_id.as_ref().map(|id| id.0.as_str());
+            ErrorEnvelope::open_failed(source_id)
+        }
+        OpenError::Internal => ErrorEnvelope::internal_for(None, "open"),
+    }
+}
+
 fn map_source_error(err: SourceError, source_id: Option<&str>) -> ErrorEnvelope {
     match err {
         SourceError::ConfirmFailed => ErrorEnvelope::confirm_failed(source_id, "source"),

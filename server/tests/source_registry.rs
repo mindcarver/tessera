@@ -361,8 +361,10 @@ fn same_path_different_inode_yields_different_source_no_merge() {
 
     let first = application::confirm_source(&registry, &candidate_for(&memories)).expect("first");
 
-    // Rebuild the directory: remove + recreate gives a new inode.
-    fs::remove_dir_all(&memories).expect("remove");
+    // Rebuild the directory while keeping the old inode allocated, so filesystems
+    // that aggressively reuse recently freed inodes cannot collapse the test.
+    let old_memories = tmp.path().join("memories-old");
+    fs::rename(&memories, &old_memories).expect("rename old memories aside");
     fs::create_dir_all(&memories).expect("recreate");
 
     let second = application::confirm_source(&registry, &candidate_for(&memories)).expect("second");
