@@ -1,6 +1,4 @@
 use std::fs;
-use std::time::Instant;
-
 use rusqlite::{params, Connection};
 use tempfile::tempdir;
 
@@ -113,7 +111,7 @@ fn cursor_is_bound_to_its_query_and_empty_states_remain_distinct() {
 }
 
 #[test]
-fn committed_local_codex_fixture_has_short_cjk_recall_without_printing_source_text() {
+fn generic_e2e_fixture_keeps_short_cjk_recall_without_a_performance_gate() {
     let tmp = tempdir().unwrap();
     let root = tmp.path().join("memories");
     fs::create_dir(&root).unwrap();
@@ -136,16 +134,7 @@ fn committed_local_codex_fixture_has_short_cjk_recall_without_printing_source_te
     application::scan_source(&registry, &conn, &source.source_id).unwrap();
 
     for query in ["中文", "检索样"] {
-        let started = Instant::now();
         let page = application::search(&registry, &conn, SearchRequest::new(query.into(), None, None).unwrap()).unwrap();
         assert!(!page.results().is_empty(), "short-CJK recall must be non-zero");
-        let latency_us = started.elapsed().as_micros();
-        assert!(latency_us > 0);
-        eprintln!("search_fixture_query_bytes={} latency_us={latency_us}", query.len());
     }
-
-    let benchmark: serde_json::Value = serde_json::from_str(include_str!("benchmarks/memory-index.json")).unwrap();
-    assert_eq!(benchmark["thresholds"]["recall"], serde_json::Value::Null);
-    assert_eq!(benchmark["thresholds"]["empty_result_rate"], serde_json::Value::Null);
-    assert_eq!(benchmark["thresholds"]["latency_us"], serde_json::Value::Null);
 }

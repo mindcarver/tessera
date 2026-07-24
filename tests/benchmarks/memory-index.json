@@ -1,42 +1,61 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "Tessera Phase 0 benchmark placeholder (AD-22 / A-16 / NFR-11). Path is fixed by the architecture spine: `tests/benchmarks/memory-index.json`. Per A-16, thresholds and baseline values MUST be left null until Phase 0 establishes the real baseline on Carver's desensitized Codex fixtures (Story 1.9). Filling these in with fabricated numbers before the baseline is measured is an explicit spec violation.",
-  "version": "0",
+  "$comment": "Tessera Phase 0 benchmark gate (AD-22 / A-16 / NFR-11). This root path is the single authority. Baselines are measured on the committed codex-anonymized-v1 fixture by server/tests/performance_baseline.rs. Each threshold is exactly 2 times its observed positive integer baseline in the metric unit.",
+  "version": "1",
   "fixture": {
-    "$comment": "Identifier for the desensitized fixture set used to establish the baseline. Filled in when Story 1.9 measures the baseline.",
-    "name": null,
-    "seed_path": null
+    "$comment": "Versioned repository-safe fixture used for every Phase 0 baseline and regression run.",
+    "name": "codex-anonymized-v1",
+    "seed_path": "tests/fixtures/benchmarks/codex-anonymized-v1",
+    "version": "1",
+    "identity_digest": "36a65ba8a551dbce35176ed357328b79b214b71e89d378f3d9c1908666635e65"
   },
   "metrics": {
     "cold_scan": {
       "$comment": "Wall time to scan a Confirmed Source from cold into a fresh Derived Index. Higher is worse.",
       "unit": "milliseconds",
-      "baseline": null,
-      "threshold": null
+      "collection": {
+        "trials": 5,
+        "statistic": "median",
+        "method": "production scan_source against a fresh temporary Derived Index per trial"
+      },
+      "baseline": 6,
+      "threshold": 12
     },
     "query": {
       "$comment": "P50 and P95 wall time for a keyword query against the active generation. Higher is worse.",
       "unit": "milliseconds",
-      "baseline_p50": null,
-      "baseline_p95": null,
-      "threshold_p50": null,
-      "threshold_p95": null
+      "collection": {
+        "trials_per_query": 25,
+        "statistic": "p50_p95",
+        "method": "production query path across every declared fixture query"
+      },
+      "baseline_p50": 1,
+      "baseline_p95": 1,
+      "threshold_p50": 2,
+      "threshold_p95": 2
     },
     "memory": {
       "$comment": "Tessera process RSS while the active generation is loaded. Higher is worse.",
       "unit": "bytes",
-      "baseline": null,
-      "threshold": null
+      "collection": {
+        "process": "dedicated_tessera_probe",
+        "method": "child test process scans and queries the active generation, then reads its own ps RSS in KiB multiplied by 1024"
+      },
+      "baseline": 5079040,
+      "threshold": 10158080
     },
     "index_size": {
-      "$comment": "On-disk size of the Tessera Derived Index SQLite file (including FTS5). Higher is worse.",
+      "$comment": "On-disk size of the main Tessera Derived Index SQLite file produced by the current production scan/query path. This is not a separate FTS5 index-size measurement. Higher is worse.",
       "unit": "bytes",
-      "baseline": null,
-      "threshold": null
+      "collection": {
+        "method": "metadata length of the main SQLite file after a successful production scan"
+      },
+      "baseline": 69632,
+      "threshold": 139264
     }
   },
   "gate": {
-    "$comment": "Quality-gate policy. Phase 0 leaves the gate OPEN (no thresholds) until the baseline is measured by Story 1.9. Once thresholds are set, a regression is any metric exceeding its threshold on the same fixture, and the change must report numbers and pass the gate before entering the default build (AD-22).",
-    "enforce": false
+    "$comment": "Quality-gate policy. A regression is any metric exceeding its threshold on the same fixture. The default Rust suite runs server/tests/performance_baseline.rs, which reports measured values without source text or query text.",
+    "enforce": true
   }
 }

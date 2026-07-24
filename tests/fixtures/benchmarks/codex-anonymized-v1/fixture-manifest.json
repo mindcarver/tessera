@@ -1,0 +1,19 @@
+{
+  "fixture_version": "1",
+  "sanitisation": [
+    "Replace local paths, user names, URLs, email addresses, UUIDs, hashes, credential-shaped values, and source-specific identifiers before writing fixture text.",
+    "Retain only generic product and engineering concepts needed by the declared query identifiers.",
+    "Reject residual paths, credentials, URLs, emails, UUIDs, and hash-like identifiers before benchmark use."
+  ],
+  "queries": [
+    "local_first",
+    "onboarding_template",
+    "discoverability_metadata"
+  ],
+  "content_digests": {
+    "memory_summary.md": "a27b716a4697cfaa330dc31e7d3649dbbc12b5d6ee861bdd81c03b60ec758424",
+    "rollout_summaries/architecture.md": "068702963f8d3a3920ba19eb1ed1533c29ed6802ce9e4bf07fff422649bf74f6",
+    "rollout_summaries/discoverability.md": "a1b410cb1bd45c4e7e04fa4a08bddc76e2a8089f7cc7189d2b2c84ba8bad9451",
+    "rollout_summaries/onboarding.md": "d660841685dd10a31783f090469ac29a9587298289a699855f76a5018439c852"
+  }
+}
