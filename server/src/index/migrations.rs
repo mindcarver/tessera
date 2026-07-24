@@ -59,6 +59,11 @@ pub static MIGRATIONS: &[Migration] = &[
         name: "v3_canonical_memory_records",
         apply: v3_canonical_memory_records,
     },
+    Migration {
+        id: 5,
+        name: "v4_rescan_cancellation",
+        apply: v4_rescan_cancellation,
+    },
 ];
 
 /// Ensure the meta tables exist on a fresh DB so [`apply`] can read
@@ -265,6 +270,15 @@ fn v3_canonical_memory_records(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// v4 (Story 1.8) makes manual cancellation durable. A cancellation changes
+/// the run out of its in-flight state, so the existing `commit_cas` predicate
+/// can never activate that generation after the cancellation wins the race.
+fn v4_rescan_cancellation(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE scan_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;",
+    )
+}
+
 /// Apply all pending migrations atomically (AD-29).
 ///
 /// Semantics:
@@ -371,10 +385,10 @@ mod tests {
         // `fresh_db` applies ALL migrations in MIGRATIONS. Phase 0 shipped only
         // v0_meta (id 1) so schema_version was 1; Story 1.3 appended
         // v1_source_registry (id 2) and Story 1.4 appended v2_scan_generations
-        // (id 3), and Story 1.5 appended v3_canonical_memory_records (id 4),
-        // so the post-apply schema_version is now 4.
+        // (id 3), Story 1.5 appended v3_canonical_memory_records (id 4), and
+        // Story 1.8 appended durable rescan cancellation (id 5).
         // The `0` value remains reserved as the pre-migration sentinel.
-        assert_eq!(v, "4");
+        assert_eq!(v, "5");
     }
 
     #[test]
@@ -406,8 +420,9 @@ mod tests {
             .expect("count");
         // Phase 0 shipped 1 migration (v0_meta); Story 1.3 appended
         // v1_source_registry and Story 1.4 appended v2_scan_generations, so the
-        // v3_canonical_memory_records makes the idempotent baseline four audit rows.
-        assert_eq!(count, 4, "exactly four audit rows after idempotent re-run");
+        // v3_canonical_memory_records and v4_rescan_cancellation make the
+        // idempotent baseline five audit rows.
+        assert_eq!(count, 5, "exactly five audit rows after idempotent re-run");
     }
 
     /// AD-29 / A-7: migration is atomic. If a later migration fails mid-batch,
@@ -418,15 +433,14 @@ mod tests {
     ///
     /// The current shipping migrations are v0_meta (id 1), v1_source_registry
     /// (id 2), v2_scan_generations (id 3), and v3_canonical_memory_records
-    /// (id 4). This test starts from a fully-migrated DB (schema_version = 4)
-    /// and simulates a failing migration id 5; the rollback must preserve
-    /// schema_version = 4 and record no audit row for id 5.
+    /// (id 4), and v4_rescan_cancellation (id 5). This test starts from a
+    /// fully-migrated DB and simulates a failing migration id 6.
     #[test]
     fn failed_migration_batch_rolls_back_atomically() {
         let mut conn = Connection::open_in_memory().expect("open db");
         apply(&mut conn).expect("all shipping migrations apply on first boot");
 
-        // After all shipping migrations: schema_version = 4, four audit rows.
+        // After all shipping migrations: schema_version = 5, five audit rows.
         let pre_version: String = conn
             .query_row(
                 "SELECT value FROM tessera_meta WHERE key = 'schema_version'",
@@ -434,7 +448,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema_version readable");
-        assert_eq!(pre_version, "4");
+        assert_eq!(pre_version, "5");
 
         // Simulate a failing follow-up migration. The failing migration
         // writes a sentinel table first, then errors; the atomic batch must
@@ -471,6 +485,11 @@ mod tests {
             },
             Migration {
                 id: 5,
+                name: "v4_rescan_cancellation",
+                apply: v4_rescan_cancellation,
+            },
+            Migration {
+                id: 6,
                 name: "partial_then_fail",
                 apply: partial_then_fail,
             },
@@ -527,7 +546,7 @@ mod tests {
             )
             .expect("schema_version still readable after rollback");
         assert_eq!(
-            post_version, "4",
+            post_version, "5",
             "schema_version must not advance on failure"
         );
 
@@ -539,7 +558,7 @@ mod tests {
             )
             .expect("count");
         assert_eq!(
-            audit_count, 4,
+            audit_count, 5,
             "no audit row recorded for the failed migration"
         );
 

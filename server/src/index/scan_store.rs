@@ -95,6 +95,7 @@ pub struct ScanRunRow {
     pub state: ScanRunState,
     pub generation: Generation,
     pub error_code: Option<String>,
+    pub finished_at: Option<i64>,
 }
 
 /// The Scan Store. Borrows the Derived Index connection for its lifetime; the
@@ -168,8 +169,9 @@ impl<'a> ScanStore<'a> {
     /// `fail_run` / `commit_cas`.
     pub fn set_state(&self, scan_id: i64, state: ScanRunState) -> rusqlite::Result<usize> {
         self.conn.execute(
-            "UPDATE scan_runs SET state = ?1 WHERE id = ?2",
-            params![state.as_str(), scan_id],
+            "UPDATE scan_runs SET state = ?1 WHERE id = ?2
+             AND state != ?3 AND cancel_requested = 0",
+            params![state.as_str(), scan_id, ScanRunState::Failed.as_str()],
         )
     }
 
@@ -422,6 +424,66 @@ impl<'a> ScanStore<'a> {
         Ok(())
     }
 
+    /// Atomically cancel the newest in-flight run for one Source. The state
+    /// transition is the cancellation fence: `commit_cas` only accepts
+    /// `committing`, so a cancelled owner cannot later activate its staging
+    /// generation. Returns false when no cancellable run exists (already
+    /// finished is not reported as cancelled).
+    pub fn cancel_latest_run(&self, source_rowid: i64) -> rusqlite::Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE scan_runs SET state = ?1, error_code = 'cancelled', cancel_requested = 1, finished_at = ?2
+             WHERE id = (
+                 SELECT id FROM scan_runs
+                 WHERE source_id = ?3 AND state IN (?4, ?5, ?6, ?7)
+                 ORDER BY id DESC LIMIT 1
+             )",
+            params![
+                ScanRunState::Failed.as_str(),
+                unix_seconds_now_i64(),
+                source_rowid,
+                ScanRunState::Queued.as_str(),
+                ScanRunState::Running.as_str(),
+                ScanRunState::Staging.as_str(),
+                ScanRunState::Committing.as_str(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// Cancel this exact reserved run. Job cancellation must never target a
+    /// later rescan for the same Source, even if a stale UI action arrives.
+    pub fn cancel_run(&self, scan_id: i64, source_rowid: i64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE scan_runs SET state = ?1, error_code = 'cancelled', cancel_requested = 1, finished_at = ?2
+             WHERE id = ?3 AND source_id = ?4
+               AND state IN (?5, ?6, ?7, ?8)",
+            params![
+                ScanRunState::Failed.as_str(),
+                unix_seconds_now_i64(),
+                scan_id,
+                source_rowid,
+                ScanRunState::Queued.as_str(),
+                ScanRunState::Running.as_str(),
+                ScanRunState::Staging.as_str(),
+                ScanRunState::Committing.as_str(),
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// True if cancellation (or another owner/state transition) has revoked
+    /// this run's right to proceed. It is intentionally checked at each
+    /// pipeline boundary and before activation.
+    pub fn is_cancelled(&self, scan_id: i64) -> rusqlite::Result<bool> {
+        self.conn.query_row(
+            "SELECT state = ?1 OR cancel_requested != 0 FROM scan_runs WHERE id = ?2",
+            params![ScanRunState::Failed.as_str(), scan_id],
+            |row| row.get(0),
+        )
+    }
+
     /// Boot recovery (AD-16). Flip every stale in-flight run
     /// (`queued/running/staging/committing`) to `failed` with
     /// `error_code='stale_recovered'`, then delete every non-active record.
@@ -490,7 +552,7 @@ impl<'a> ScanStore<'a> {
     /// coerced to `failed` (spec: no `unwrap_or(Failed)`).
     pub fn latest_run(&self, source_rowid: i64) -> rusqlite::Result<Option<ScanRunRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, state, generation, error_code FROM scan_runs
+            "SELECT id, state, generation, error_code, finished_at FROM scan_runs
              WHERE source_id = ?1 ORDER BY id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![source_rowid])?;
@@ -509,6 +571,7 @@ impl<'a> ScanStore<'a> {
                     state,
                     generation: Generation(generation_str),
                     error_code: row.get(3)?,
+                    finished_at: row.get(4)?,
                 }))
             }
             None => Ok(None),
@@ -546,6 +609,22 @@ impl<'a> ScanStore<'a> {
             |row| row.get(0),
         )?;
         Ok(count as u64)
+    }
+
+    /// Most recent successfully completed scan. It is intentionally separate
+    /// from `latest_run`: a failed/cancelled rescan must not erase this fact.
+    pub fn last_successful_finished_at(&self, source_rowid: i64) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT finished_at FROM scan_runs WHERE source_id = ?1 AND state = ?2
+             ORDER BY id DESC LIMIT 1",
+                params![source_rowid, ScanRunState::Succeeded.as_str()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
     }
 
     /// Resolve a `SourceId` handle to its registry rowid. Returns `None` for a

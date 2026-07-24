@@ -406,7 +406,7 @@ impl ProviderAdapter for FailingEnumAdapter {
 /// Migration id 4 (`v3_canonical_memory_records`) applies on a fresh DB and
 /// creates the canonical provenance and diagnostic projection tables.
 #[test]
-fn migration_v3_canonical_memory_records_applies_and_sets_schema_version_4() {
+fn migrations_apply_canonical_records_and_rescan_cancellation_schema() {
     let conn = fresh_db();
     let v: String = conn
         .query_row(
@@ -415,7 +415,7 @@ fn migration_v3_canonical_memory_records_applies_and_sets_schema_version_4() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(v, "4");
+    assert_eq!(v, "5");
 
     for table in ["scan_runs", "memory_records", "scan_diagnostics"] {
         let n: i64 = conn

@@ -30,9 +30,10 @@ pub mod state;
 pub use http::envelope::{Envelope, ErrorEnvelope, Pong, API_VERSION};
 pub use http::{
     confirm_source, disable_source, discover_sources, get_scan_status, list_sources,
-    open_original_location, ping, reject_source, scan_source, search,
+    open_original_location, ping, reject_source, scan_source, search, source_inventory,
 };
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -50,6 +51,31 @@ use rusqlite::Connection;
 #[derive(Debug)]
 pub struct IndexState {
     pub conn: Mutex<Connection>,
+    /// Jobs are ephemeral transport observations; the durable cancellation
+    /// fence remains in `scan_runs`.
+    pub rescan_jobs: Mutex<HashMap<String, RescanJob>>,
+    pub db_path: PathBuf,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RescanEvent {
+    pub api_version: &'static str,
+    pub job_id: String,
+    pub source_id: String,
+    pub sequence: u64,
+    pub state: String,
+    pub message: String,
+}
+
+/// Bounded, source-scoped transport observation for one reserved scan run.
+/// The persistent `scan_runs` row is the authority for fencing/cancellation;
+/// this only lets an SSE client observe that job.
+#[derive(Debug, Clone)]
+pub struct RescanJob {
+    pub scan_id: i64,
+    pub job_id: String,
+    pub events: Vec<RescanEvent>,
+    pub terminal: bool,
 }
 
 /// Resolve the OS-managed Tessera app-data directory (AD-20).
@@ -106,5 +132,7 @@ pub fn boot(data_dir: &Path) -> std::io::Result<IndexState> {
 
     Ok(IndexState {
         conn: Mutex::new(conn),
+        rescan_jobs: Mutex::new(HashMap::new()),
+        db_path,
     })
 }

@@ -216,3 +216,57 @@ export async function getScanStatus(sourceId: SourceId): Promise<Envelope<ScanSt
     "Tessera core get_scan_status response did not match the versioned envelope contract.",
   );
 }
+
+export type RescanState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export interface RescanProgress {
+  job_id: string;
+  source_id: SourceId;
+  sequence: number;
+  state: RescanState;
+  message: string;
+}
+
+function asRescanProgress(value: unknown): RescanProgress | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  if (!isString(v.job_id) || !isString(v.source_id) || !isNumber(v.sequence) || !isString(v.message) ||
+    !(v.state === "queued" || v.state === "running" || v.state === "succeeded" || v.state === "failed" || v.state === "cancelled")) return null;
+  return v as unknown as RescanProgress;
+}
+
+function readRescan(value: unknown): Envelope<RescanProgress> {
+  const envelope = value as Envelope<unknown> | null;
+  const progress = envelope ? asRescanProgress(envelope.payload) : null;
+  if (envelope && envelope.api_version === API_VERSION && progress) return { api_version: envelope.api_version, payload: progress };
+  return throwContractError("Tessera core rescan response did not match the versioned envelope contract.");
+}
+
+export async function startRescan(sourceId: SourceId): Promise<Envelope<RescanProgress>> {
+  return readRescan(await apiPost("/api/sources/rescan", { source_id: sourceId }));
+}
+
+export async function cancelRescan(sourceId: SourceId): Promise<Envelope<RescanProgress>> {
+  return readRescan(await apiPost("/api/sources/rescan/cancel", { source_id: sourceId }));
+}
+
+/** Read a finite SSE snapshot, rejecting malformed or out-of-order events. */
+export async function getRescanProgress(sourceId: SourceId, jobId: string, afterSequence = 0): Promise<RescanProgress[]> {
+  const response = await fetch(`/api/sources/rescan/events?source_id=${encodeURIComponent(sourceId)}&job_id=${encodeURIComponent(jobId)}&after=${afterSequence}`);
+  if (!response.ok) return throwContractError("Tessera core rescan event stream was unavailable.");
+  let previous = afterSequence;
+  const output: RescanProgress[] = [];
+  for (const block of (await response.text()).split("\n\n")) {
+    const data = block.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+    if (!data) continue;
+    let raw: unknown;
+    try { raw = JSON.parse(data); } catch { return throwContractError("Tessera core emitted an invalid rescan event."); }
+    const versioned = raw as Record<string, unknown> | null;
+    const progress = asRescanProgress(raw);
+    if (!versioned || versioned.api_version !== API_VERSION || !progress || progress.source_id !== sourceId || progress.job_id !== jobId || progress.sequence <= previous) {
+      return throwContractError("Tessera core emitted an out-of-order rescan event.");
+    }
+    previous = progress.sequence;
+    output.push(progress);
+  }
+  return output;
+}

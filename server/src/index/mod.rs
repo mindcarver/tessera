@@ -26,7 +26,7 @@ pub mod source_registry;
 /// (`v3_canonical_memory_records`), so the current schema version is `4`. The value
 /// `0` is reserved as the pre-migration sentinel on a fresh database and is
 /// never a valid `CURRENT_SCHEMA_VERSION`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// Re-export the registry so application / IPC code can name it without a long
 /// path.

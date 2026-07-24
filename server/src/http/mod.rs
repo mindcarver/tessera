@@ -43,8 +43,8 @@ use crate::domain::query::{SearchPage, SearchRequest};
 use crate::domain::scan::{ScanError, ScanOutcome, ScanStatus};
 use crate::domain::source::{Source, SourceId};
 use crate::domain::CandidateSource;
-use crate::index::SourceRegistry;
-use crate::IndexState;
+use crate::index::{scan_store::ScanStore, SourceRegistry};
+use crate::{IndexState, RescanEvent, RescanJob};
 
 /// `ping` — contract-sample endpoint (Phase 0).
 ///
@@ -200,6 +200,151 @@ pub fn open_original_location(
     })
 }
 
+/// Read all registered Sources as a server-derived Inventory. This is separate
+/// from the lifecycle list because it combines registry facts with scan/index
+/// state without asking the browser to infer health or counts.
+pub fn source_inventory(
+    state: &IndexState,
+) -> Result<Envelope<Vec<crate::domain::scan::SourceInventory>>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let inventory = application::list_inventory(&registry, &conn)
+        .map_err(|_| ErrorEnvelope::internal_for(None, "inventory"))?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: inventory,
+    })
+}
+
+/// Start one background rescan. The worker opens its own SQLite connection so
+/// an SSE observation request and cancel request never hold the main request
+/// connection mutex for the duration of filesystem scanning.
+pub fn start_rescan(
+    source_id: &SourceId,
+    state: &std::sync::Arc<IndexState>,
+) -> Result<Envelope<crate::RescanEvent>, ErrorEnvelope> {
+    let mut jobs = state.rescan_jobs.lock().map_err(|_| ErrorEnvelope::internal_for(Some(&source_id.0), "rescan"))?;
+    if let Some(existing) = jobs.get(&source_id.0) {
+        if !existing.terminal {
+            return Ok(Envelope { api_version: API_VERSION, payload: existing.events[0].clone() });
+        }
+    }
+    let (scan_id, fencing_token, generation) = {
+        let conn = lock_conn(state)?;
+        let registry = SourceRegistry::new(&conn);
+        let source = registry
+            .get(source_id)
+            .map_err(|_| ErrorEnvelope::internal_for(Some(&source_id.0), "rescan"))?;
+        match source {
+            None => {
+                return Err(ErrorEnvelope::source_not_found(
+                    Some(&source_id.0),
+                    "rescan",
+                ))
+            }
+            Some(source)
+                if source.lifecycle_state != crate::domain::source::SourceLifecycle::Confirmed =>
+            {
+                return Err(ErrorEnvelope::scan_failed_not_confirmed(&source_id.0))
+            }
+            Some(_) => {}
+        }
+        let rowid = ScanStore::source_rowid(source_id).ok_or_else(|| ErrorEnvelope::source_not_found(Some(&source_id.0), "rescan"))?;
+        ScanStore::new(&conn).begin_run(rowid, "pending").map_err(|_| ErrorEnvelope::internal_for(Some(&source_id.0), "rescan"))?
+    };
+    let job_id = format!("job_{scan_id}");
+    let queued = RescanEvent { api_version: API_VERSION, job_id: job_id.clone(), source_id: source_id.0.clone(), sequence: 1, state: "queued".to_string(), message: "Rescan queued.".to_string() };
+    jobs.insert(source_id.0.clone(), RescanJob { scan_id, job_id, events: vec![queued.clone()], terminal: false });
+    drop(jobs);
+    let worker_state = std::sync::Arc::clone(state);
+    let worker_source = source_id.clone();
+    std::thread::spawn(move || {
+        append_rescan_event(&worker_state, &worker_source, scan_id, "running", "Rescan running.");
+        let result = (|| -> Result<ScanOutcome, ScanError> {
+            let conn = rusqlite::Connection::open(&worker_state.db_path)
+                .map_err(|_| ScanError::Internal)?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")
+                .map_err(|_| ScanError::Internal)?;
+            let registry = SourceRegistry::new(&conn);
+            application::scan_reserved_source(&registry, &conn, &worker_source, scan_id, fencing_token, generation)
+        })();
+        match result {
+            Ok(_) => {
+                append_rescan_event(&worker_state, &worker_source, scan_id, "succeeded", "Rescan complete.");
+            }
+            Err(ScanError::Cancelled) => {
+                append_rescan_event(&worker_state, &worker_source, scan_id, "cancelled", "Rescan cancelled.");
+            }
+            Err(_) => {
+                append_rescan_event(&worker_state, &worker_source, scan_id, "failed", "Rescan failed. The previous index is unchanged.");
+            }
+        }
+    });
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: queued,
+    })
+}
+
+pub fn cancel_rescan_request(
+    source_id: &SourceId,
+    state: &IndexState,
+) -> Result<Envelope<crate::RescanEvent>, ErrorEnvelope> {
+    let mut jobs = state.rescan_jobs.lock().map_err(|_| ErrorEnvelope::internal_for(Some(&source_id.0), "rescan"))?;
+    let Some(job) = jobs.get(&source_id.0) else { return Err(ErrorEnvelope::bad_request("rescan")); };
+    if job.terminal { return Err(ErrorEnvelope::bad_request("rescan")); }
+    let scan_id = job.scan_id;
+    let conn = lock_conn(state)?;
+    let source_rowid = ScanStore::source_rowid(source_id).ok_or_else(|| ErrorEnvelope::source_not_found(Some(&source_id.0), "rescan"))?;
+    let cancelled = ScanStore::new(&conn).cancel_run(scan_id, source_rowid).map_err(|_| ErrorEnvelope::internal_for(Some(&source_id.0), "rescan"))?;
+    if !cancelled {
+        return Err(ErrorEnvelope::bad_request("rescan"));
+    }
+    drop(conn);
+    let event = append_rescan_event_locked(&mut jobs, source_id, scan_id, "cancelled", "Rescan cancelled.");
+    Ok(Envelope { api_version: API_VERSION, payload: event })
+}
+
+pub fn rescan_events(
+    source_id: &SourceId,
+    job_id: &str,
+    after: u64,
+    state: &IndexState,
+) -> Result<Vec<crate::RescanEvent>, ErrorEnvelope> {
+    let jobs = state
+        .rescan_jobs
+        .lock()
+        .map_err(|_| ErrorEnvelope::internal_for(Some(&source_id.0), "rescan"))?;
+    let Some(job) = jobs.get(&source_id.0) else { return Ok(Vec::new()); };
+    if job.job_id != job_id { return Err(ErrorEnvelope::bad_request("rescan")); }
+    Ok(job.events.iter().filter(|event| event.sequence > after).cloned().collect())
+}
+
+fn append_rescan_event(
+    state: &IndexState,
+    source_id: &SourceId,
+    scan_id: i64,
+    event_state: &str,
+    message: &str,
+) -> crate::RescanEvent {
+    let mut jobs = state.rescan_jobs.lock().expect("rescan job mutex must not be poisoned");
+    append_rescan_event_locked(&mut jobs, source_id, scan_id, event_state, message)
+}
+
+fn append_rescan_event_locked(
+    jobs: &mut std::collections::HashMap<String, RescanJob>, source_id: &SourceId, scan_id: i64,
+    event_state: &str, message: &str,
+) -> RescanEvent {
+    const MAX_EVENTS: usize = 32;
+    let Some(job) = jobs.get_mut(&source_id.0) else { return RescanEvent { api_version: API_VERSION, job_id: format!("job_{scan_id}"), source_id: source_id.0.clone(), sequence: 0, state: event_state.to_string(), message: message.to_string() }; };
+    if job.scan_id != scan_id || job.terminal { return job.events.last().cloned().expect("job has queued event"); }
+    let event = RescanEvent { api_version: API_VERSION, job_id: job.job_id.clone(), source_id: source_id.0.clone(), sequence: job.events.last().map_or(1, |last| last.sequence + 1), state: event_state.to_string(), message: message.to_string() };
+    job.events.push(event.clone());
+    if job.events.len() > MAX_EVENTS { job.events.remove(0); }
+    job.terminal = matches!(event_state, "succeeded" | "failed" | "cancelled");
+    event
+}
+
 /// Acquire the IndexState mutex and return a guarded connection reference.
 /// Maps poisoning / lock failure to the generic `internal` error envelope.
 fn lock_conn(state: &IndexState) -> Result<MutexGuard<'_, rusqlite::Connection>, ErrorEnvelope> {
@@ -310,7 +455,8 @@ fn map_scan_error(err: ScanError, source_id: &SourceId) -> ErrorEnvelope {
         | ScanError::ReadFailed
         | ScanError::ParseFailed
         | ScanError::EmptyScanWithActiveGeneration
-        | ScanError::CommitCasFailed => ErrorEnvelope::scan_failed(source_id),
+        | ScanError::CommitCasFailed
+        | ScanError::Cancelled => ErrorEnvelope::scan_failed(source_id),
         ScanError::DirtyAfterValidation => ErrorEnvelope::scan_failed_source_changed(source_id),
         ScanError::Internal => ErrorEnvelope::internal_for(Some(source_id), "scan"),
     }

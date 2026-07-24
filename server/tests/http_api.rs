@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::params;
 use tessera_lib::adapters::codex::file_uri;
+use tessera_lib::domain::{CandidateSource, CoverageLevel, DiscoveryBasis};
 use tessera_lib::http::server::{bind, serve_with};
+use tessera_lib::index::SourceRegistry;
 
 static HTTP_OPEN_TEST_LOCK: Mutex<()> = Mutex::new(());
 static HTTP_OPENED_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -108,6 +110,31 @@ fn boot_populated_open_server() -> (u16, PathBuf) {
     });
     std::thread::sleep(std::time::Duration::from_millis(50));
     (port, expected)
+}
+
+fn boot_rescan_server() -> u16 {
+    let dir = tempfile::tempdir().expect("scratch app-data dir");
+    let source_root = tempfile::tempdir().expect("source root");
+    std::fs::write(source_root.path().join("MEMORY.md"), "# rescan\nbody").expect("memory");
+    let state = tessera_lib::boot(dir.path()).expect("boot");
+    {
+        let conn = state.conn.lock().expect("connection");
+        let registry = SourceRegistry::new(&conn);
+        let source = tessera_lib::application::confirm_source(&registry, &CandidateSource {
+            provider: "codex".into(), root_path: source_root.path().to_string_lossy().into_owned(),
+            basis: DiscoveryBasis::CodexHomeEnv, coverage_level: CoverageLevel::Full, native_project: None,
+        }).expect("confirm");
+        tessera_lib::application::scan_source(&registry, &conn, &source.source_id).expect("initial scan");
+    }
+    let server = bind("127.0.0.1:0");
+    let port = server.server_addr().to_ip().expect("bound").port();
+    std::thread::spawn(move || {
+        let _dir = dir;
+        let _source_root = source_root;
+        serve_with(server, Arc::new(state), PathBuf::from("dist"), Some(port));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    port
 }
 
 /// Send one raw HTTP/1.1 request and read the full response text. A read
@@ -315,6 +342,56 @@ fn search_wire_contract_serializes_provenance_and_rejects_invalid_input_safely()
         !invalid.contains("%20%20%20"),
         "query must not cross the wire: {invalid}"
     );
+}
+
+#[test]
+fn inventory_and_rescan_routes_are_versioned_and_reject_unknown_sources() {
+    let (port, _state) = boot_populated_search_server();
+    let inventory = raw_http(
+        port,
+        &format!(
+            "GET /api/sources/inventory HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(inventory.starts_with("HTTP/1.1 200"), "got:\n{inventory}");
+    assert!(inventory.contains("\"api_version\":\"1\""), "got:\n{inventory}");
+    assert!(inventory.contains("\"complete_record_count\":2"), "got:\n{inventory}");
+    let body = "{\"source_id\":\"src_99\"}";
+    let rejected = raw_http(
+        port,
+        &format!(
+            "POST /api/sources/rescan HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        ),
+    );
+    assert!(rejected.starts_with("HTTP/1.1 404"), "got:\n{rejected}");
+    assert!(rejected.contains("source_not_found"), "got:\n{rejected}");
+    assert!(!rejected.contains("/fixture"), "got:\n{rejected}");
+}
+
+#[test]
+fn rescan_is_singleton_and_events_are_versioned_ordered_and_job_scoped() {
+    let port = boot_rescan_server();
+    let body = "{\"source_id\":\"src_1\"}";
+    let start = raw_http(port, &format!("POST /api/sources/rescan HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body));
+    assert!(start.starts_with("HTTP/1.1 200"), "got:\n{start}");
+    let payload: serde_json::Value = serde_json::from_str(start.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    let job_id = payload["payload"]["job_id"].as_str().expect("job id");
+    let duplicate = raw_http(port, &format!("POST /api/sources/rescan HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body));
+    let duplicate_json: serde_json::Value = serde_json::from_str(duplicate.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(duplicate_json["payload"]["job_id"], job_id, "duplicate must join the existing job");
+    let mut events = Vec::new();
+    for _ in 0..40 {
+        let response = raw_http(port, &format!("GET /api/sources/rescan/events?source_id=src_1&job_id={job_id}&after=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"));
+        assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+        events = response.split("\r\n\r\n").nth(1).expect("sse body").split("\n\n").filter_map(|block| block.lines().find_map(|line| line.strip_prefix("data: "))).map(|json| serde_json::from_str::<serde_json::Value>(json).expect("event json")).collect::<Vec<_>>();
+        if events.last().and_then(|event| event["state"].as_str()).is_some_and(|state| matches!(state, "succeeded" | "failed" | "cancelled")) { break; }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(events.len() >= 2, "queued plus terminal event");
+    for pair in events.windows(2) { assert_eq!(pair[1]["sequence"].as_u64(), pair[0]["sequence"].as_u64().map(|value| value + 1)); }
+    assert!(events.iter().all(|event| event["api_version"] == "1" && event["job_id"] == job_id));
+    assert_eq!(events.last().and_then(|event| event["state"].as_str()), Some("succeeded"));
 }
 
 #[test]

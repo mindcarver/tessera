@@ -62,7 +62,7 @@ export type SourceKind = "agent_memory";
  * Health state of a Source (AD-7). Story 1.3 always writes `unknown`; health
  * tracking is Story 1.8 / 4.x.
  */
-export type HealthState = "unknown";
+export type HealthState = "unknown" | "healthy" | "degraded" | "error";
 
 /**
  * A registered Source. Mirrors Rust `Source` DTO. The fingerprint field is
@@ -102,7 +102,7 @@ const VALID_LIFECYCLES: ReadonlySet<string> = new Set([
   "rejected",
 ]);
 const VALID_SOURCE_KINDS: ReadonlySet<string> = new Set(["agent_memory"]);
-const VALID_HEALTH_STATES: ReadonlySet<string> = new Set(["unknown"]);
+const VALID_HEALTH_STATES: ReadonlySet<string> = new Set(["unknown", "healthy", "degraded", "error"]);
 const VALID_COVERAGE_LEVELS: ReadonlySet<string> = new Set([
   "full",
   "search_only",
@@ -112,6 +112,10 @@ const VALID_COVERAGE_LEVELS: ReadonlySet<string> = new Set([
 
 function isString(v: unknown): v is string {
   return typeof v === "string";
+}
+
+function isNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
 }
 
 function isOptionalStringOrNull(v: unknown): boolean {
@@ -259,4 +263,40 @@ export async function listSources(): Promise<Envelope<Source[]>> {
   throwContractError(
     "Tessera core list_sources response did not match the versioned envelope contract.",
   );
+}
+
+/** Server-derived inventory facts. A null count is deliberately distinct from
+ * zero: only full coverage may claim a complete record count. */
+export interface SourceInventory {
+  source_id: SourceId;
+  provider: string;
+  lifecycle_state: SourceLifecycle;
+  root: string;
+  native_project: string | null;
+  coverage_level: CandidateSource["coverage_level"];
+  health_state: HealthState;
+  last_successful_scan: number | null;
+  complete_record_count: number | null;
+  latest_error: string | null;
+}
+
+function asInventory(value: unknown): SourceInventory | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  if (!isString(v.source_id) || !isString(v.provider) || !(typeof v.lifecycle_state === "string" && VALID_LIFECYCLES.has(v.lifecycle_state)) || !isString(v.root) ||
+    !isOptionalStringOrNull(v.native_project) ||
+    !(typeof v.coverage_level === "string" && VALID_COVERAGE_LEVELS.has(v.coverage_level)) ||
+    !(typeof v.health_state === "string" && VALID_HEALTH_STATES.has(v.health_state)) ||
+    !(v.last_successful_scan === null || isNumber(v.last_successful_scan)) ||
+    !(v.complete_record_count === null || isNumber(v.complete_record_count)) ||
+    !isOptionalStringOrNull(v.latest_error)) return null;
+  return v as unknown as SourceInventory;
+}
+
+export async function getSourceInventory(): Promise<Envelope<SourceInventory[]>> {
+  const envelope = (await apiGet("/api/sources/inventory")) as Envelope<SourceInventory[]> | null;
+  if (envelope && envelope.api_version === API_VERSION && Array.isArray(envelope.payload) && envelope.payload.every((item) => asInventory(item) !== null)) {
+    return { api_version: envelope.api_version, payload: envelope.payload.map((item) => asInventory(item) as SourceInventory) };
+  }
+  throwContractError("Tessera core Inventory response did not match the versioned envelope contract.");
 }

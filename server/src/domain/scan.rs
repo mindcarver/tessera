@@ -141,6 +141,23 @@ pub struct ScanStatus {
     pub active_records: u64,
 }
 
+/// A server-derived Source Inventory row. `complete_record_count` is absent
+/// unless the provider declares full coverage; a missing value is never a
+/// disguised zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceInventory {
+    pub source_id: SourceId,
+    pub provider: String,
+    pub lifecycle_state: crate::domain::source::SourceLifecycle,
+    pub root: String,
+    pub native_project: Option<String>,
+    pub coverage_level: String,
+    pub health_state: crate::domain::source::HealthState,
+    pub last_successful_scan: Option<i64>,
+    pub complete_record_count: Option<u64>,
+    pub latest_error: Option<String>,
+}
+
 /// Application-layer scan error. Each variant maps onto a stable IPC error
 /// code in the IPC layer (AD-13). No body / credential / path detail is
 /// carried — the safe message lives in the IPC envelope constructor.
@@ -182,6 +199,8 @@ pub enum ScanError {
     /// holder (recovered / superseded). Maps to `scan_failed`. The run is
     /// left in `committing` for the next boot to recover (spec Design Notes).
     CommitCasFailed,
+    /// A persisted cancel request changed this run out of its active state.
+    Cancelled,
     /// An unexpected internal error (SQLite failure). Maps to `internal`.
     Internal,
 }
@@ -222,6 +241,7 @@ impl ScanError {
             | ScanError::RootInvalid
             | ScanError::RootIdentityChanged
             | ScanError::CommitCasFailed
+            | ScanError::Cancelled
             | ScanError::Internal => "internal",
         }
     }

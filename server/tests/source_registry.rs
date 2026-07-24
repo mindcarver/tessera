@@ -105,7 +105,7 @@ fn walk(dir: &std::path::Path, out: &mut Vec<(PathBuf, SystemTime, u64, Vec<u8>)
 /// and 1.5 append migrations 3 and 4, so `schema_version` advances to 4; the
 /// v1 table and its unique index still exist and the v1 audit row is recorded.
 #[test]
-fn migration_v1_source_registry_applies_and_sets_schema_version_4() {
+fn migration_v1_source_registry_applies_and_sets_current_schema_version() {
     let conn = fresh_db();
     let v: String = conn
         .query_row(
@@ -114,7 +114,7 @@ fn migration_v1_source_registry_applies_and_sets_schema_version_4() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(v, "4", "schema_version must be 4 after Story 1.5 migration");
+    assert_eq!(v, "5", "schema_version must be 5 after Story 1.8 migration");
 
     // The table + unique index exist.
     let table: i64 = conn

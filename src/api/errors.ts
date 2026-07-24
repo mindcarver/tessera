@@ -33,6 +33,7 @@ export const TESSERA_STABLE_ERROR_CODES: ReadonlySet<string> = new Set([
   "cursor_stale",
   "record_not_found",
   "open_failed",
+  "rescan_not_running",
 ]);
 
 /**

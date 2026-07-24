@@ -38,8 +38,9 @@ use crate::domain::query::{SearchRequest, MAX_CURSOR_BYTES, MAX_QUERY_BYTES};
 use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
-    confirm_source, disable_source, discover_sources, get_scan_status, list_sources,
-    open_original_location, ping, reject_source, scan_source, search,
+    cancel_rescan_request, confirm_source, disable_source, discover_sources, get_scan_status,
+    list_sources, open_original_location, ping, reject_source, rescan_events, scan_source, search,
+    source_inventory, start_rescan,
 };
 use crate::IndexState;
 
@@ -160,6 +161,37 @@ fn route(
             respond_result(request, disable_source(&source_id, state))
         }
         (Method::Get, "/api/sources") => respond_result(request, list_sources(state)),
+        (Method::Get, "/api/sources/inventory") => respond_result(request, source_inventory(state)),
+        (Method::Post, "/api/sources/rescan") => {
+            let source_id = match read_source_id_body(&mut request) {
+                Ok(id) => id,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, start_rescan(&source_id, state))
+        }
+        (Method::Post, "/api/sources/rescan/cancel") => {
+            let source_id = match read_source_id_body(&mut request) {
+                Ok(id) => id,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, cancel_rescan_request(&source_id, state))
+        }
+        (Method::Get, "/api/sources/rescan/events") => {
+            let (source_id, job_id, after) = match parse_rescan_events_query(query) {
+                Some(value) => value,
+                None => {
+                    return request.respond(json_error(
+                        StatusCode(400),
+                        "bad_request",
+                        "missing or invalid source_id query parameter.",
+                    ))
+                }
+            };
+            match rescan_events(&source_id, &job_id, after, state) {
+                Ok(events) => request.respond(sse_response(&events)),
+                Err(error) => request.respond(json_response(StatusCode(500), &error)),
+            }
+        }
         (Method::Post, "/api/open") => {
             let open_request = match read_open_request_body(&mut request) {
                 Ok(body) => body,
@@ -285,6 +317,25 @@ fn parse_source_id_query(query: &str) -> Option<SourceId> {
         }
     }
     None
+}
+
+/// Events are scoped to the queued job and can be resumed from a strict
+/// sequence cursor. Unknown/duplicate fields are rejected rather than being
+/// silently interpreted as a different job.
+fn parse_rescan_events_query(query: &str) -> Option<(SourceId, String, u64)> {
+    let mut source_id = None;
+    let mut job_id = None;
+    let mut after = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        match key {
+            "source_id" if source_id.is_none() && value.starts_with("src_") && value.len() > 4 => source_id = Some(SourceId(value.to_string())),
+            "job_id" if job_id.is_none() && value.starts_with("job_") && value.len() > 4 => job_id = Some(value.to_string()),
+            "after" if after.is_none() && value.len() <= 20 => after = value.parse::<u64>().ok(),
+            _ => return None,
+        }
+    }
+    Some((source_id?, job_id?, after?))
 }
 
 /// Parse exactly q/cursor/limit. Values are percent-decoded before the
@@ -464,6 +515,32 @@ fn json_error(status: StatusCode, code: &str, message: &str) -> Response<std::io
             source_id: None,
             phase: "transport".to_string(),
         },
+    )
+}
+
+/// A finite SSE snapshot. Clients may reconnect while a job is running; each
+/// event carries its own version and strictly increasing sequence, so a client
+/// can reject malformed or replayed/out-of-order observations without gaining
+/// any scan authority.
+fn sse_response(events: &[crate::RescanEvent]) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut body = Vec::new();
+    for event in events {
+        body.extend_from_slice(b"event: progress\n");
+        body.extend_from_slice(b"data: ");
+        body.extend_from_slice(
+            serde_json::to_string(event)
+                .unwrap_or_else(|_| "{}".to_string())
+                .as_bytes(),
+        );
+        body.extend_from_slice(b"\n\n");
+    }
+    with_security_headers(
+        Response::from_data(body)
+            .with_status_code(StatusCode(200))
+            .with_header(
+                Header::from_bytes("Content-Type", "text/event-stream; charset=utf-8").unwrap(),
+            ),
+        false,
     )
 }
 

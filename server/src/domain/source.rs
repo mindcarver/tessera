@@ -131,12 +131,22 @@ impl SourceKind {
 pub enum HealthState {
     /// 1.3 sentinel — no health probe has run yet.
     Unknown,
+    /// The latest completed scan established that this Source is readable.
+    Healthy,
+    /// The Source remains registered but its location, permissions, or format
+    /// need attention. Existing active records remain available.
+    Degraded,
+    /// Tessera could not complete the latest scan for an internal scan reason.
+    Error,
 }
 
 impl HealthState {
     pub fn as_str(self) -> &'static str {
         match self {
             HealthState::Unknown => "unknown",
+            HealthState::Healthy => "healthy",
+            HealthState::Degraded => "degraded",
+            HealthState::Error => "error",
         }
     }
 
@@ -145,6 +155,9 @@ impl HealthState {
     pub fn parse_str(s: &str) -> Option<Self> {
         match s {
             "unknown" => Some(HealthState::Unknown),
+            "healthy" => Some(HealthState::Healthy),
+            "degraded" => Some(HealthState::Degraded),
+            "error" => Some(HealthState::Error),
             _ => None,
         }
     }
@@ -318,7 +331,10 @@ mod tests {
     #[test]
     fn build_fingerprint_is_deterministic() {
         let path = Path::new("/Users/c/.codex/memories");
-        let id = Some(FilesystemIdentity { device: 16777231, file_id: 9876543 });
+        let id = Some(FilesystemIdentity {
+            device: 16777231,
+            file_id: 9876543,
+        });
         let a = build_fingerprint("codex", ROOT_KIND_DIR, path, id);
         let b = build_fingerprint("codex", ROOT_KIND_DIR, path, id);
         assert_eq!(a, b);
@@ -334,7 +350,10 @@ mod tests {
         //   illustrative number was off by one; the real invariant is
         //   byte-length-prefixed segments).
         let path = Path::new("/Users/c/.codex/memories");
-        let id = Some(FilesystemIdentity { device: 16777231, file_id: 9876543 });
+        let id = Some(FilesystemIdentity {
+            device: 16777231,
+            file_id: 9876543,
+        });
         let fp = build_fingerprint("codex", ROOT_KIND_DIR, path, id).0;
         assert!(fp.starts_with("root-fingerprint/v1|"), "fp was: {fp}");
         assert!(fp.contains("|5:codex|"), "fp was: {fp}");
@@ -353,7 +372,10 @@ mod tests {
 
     #[test]
     fn build_fingerprint_differs_when_path_differs() {
-        let id = Some(FilesystemIdentity { device: 1, file_id: 2 });
+        let id = Some(FilesystemIdentity {
+            device: 1,
+            file_id: 2,
+        });
         let a = build_fingerprint("codex", ROOT_KIND_DIR, Path::new("/a/memories"), id);
         let b = build_fingerprint("codex", ROOT_KIND_DIR, Path::new("/b/memories"), id);
         assert_ne!(a, b, "different path → different fingerprint");
@@ -368,20 +390,29 @@ mod tests {
             "codex",
             ROOT_KIND_DIR,
             path,
-            Some(FilesystemIdentity { device: 1, file_id: 100 }),
+            Some(FilesystemIdentity {
+                device: 1,
+                file_id: 100,
+            }),
         );
         let b = build_fingerprint(
             "codex",
             ROOT_KIND_DIR,
             path,
-            Some(FilesystemIdentity { device: 1, file_id: 200 }),
+            Some(FilesystemIdentity {
+                device: 1,
+                file_id: 200,
+            }),
         );
         assert_ne!(a, b, "different inode → different fingerprint");
     }
 
     #[test]
     fn build_fingerprint_differs_when_provider_or_kind_differs() {
-        let id = Some(FilesystemIdentity { device: 1, file_id: 2 });
+        let id = Some(FilesystemIdentity {
+            device: 1,
+            file_id: 2,
+        });
         let path = Path::new("/x/memories");
         let a = build_fingerprint("codex", ROOT_KIND_DIR, path, id);
         let b = build_fingerprint("claude_code", ROOT_KIND_DIR, path, id);
@@ -394,18 +425,8 @@ mod tests {
     fn build_fingerprint_is_injection_safe_against_length_collisions() {
         // Two pairs that would collide under plain concatenation but not under
         // length-prefixed netstring encoding.
-        let a = build_fingerprint(
-            "ab",
-            ROOT_KIND_DIR,
-            Path::new("/c"),
-            None,
-        );
-        let b = build_fingerprint(
-            "a",
-            ROOT_KIND_DIR,
-            Path::new("b/c"),
-            None,
-        );
+        let a = build_fingerprint("ab", ROOT_KIND_DIR, Path::new("/c"), None);
+        let b = build_fingerprint("a", ROOT_KIND_DIR, Path::new("b/c"), None);
         assert_ne!(a, b, "netstring prefix must disambiguate");
     }
 
@@ -423,8 +444,14 @@ mod tests {
             fingerprint: SourceFingerprint("root-fingerprint/v1|secret".to_string()),
         };
         let json = serde_json::to_string(&src).expect("serialize");
-        assert!(!json.contains("fingerprint"), "wire shape hides fp; json: {json}");
-        assert!(!json.contains("secret"), "internal key not leaked; json: {json}");
+        assert!(
+            !json.contains("fingerprint"),
+            "wire shape hides fp; json: {json}"
+        );
+        assert!(
+            !json.contains("secret"),
+            "internal key not leaked; json: {json}"
+        );
         assert!(json.contains("\"source_id\":\"src_1\""));
         assert!(json.contains("\"lifecycle_state\":\"confirmed\""));
         assert!(json.contains("\"source_kind\":\"agent_memory\""));
@@ -435,14 +462,20 @@ mod tests {
     #[test]
     fn source_kind_round_trips() {
         assert_eq!(SourceKind::AgentMemory.as_str(), "agent_memory");
-        assert_eq!(SourceKind::parse_str("agent_memory"), Some(SourceKind::AgentMemory));
+        assert_eq!(
+            SourceKind::parse_str("agent_memory"),
+            Some(SourceKind::AgentMemory)
+        );
         assert_eq!(SourceKind::parse_str("nope"), None);
     }
 
     #[test]
     fn health_state_round_trips() {
         assert_eq!(HealthState::Unknown.as_str(), "unknown");
-        assert_eq!(HealthState::parse_str("unknown"), Some(HealthState::Unknown));
+        assert_eq!(
+            HealthState::parse_str("unknown"),
+            Some(HealthState::Unknown)
+        );
         assert_eq!(HealthState::parse_str("nope"), None);
     }
 }

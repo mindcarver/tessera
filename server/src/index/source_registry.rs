@@ -61,9 +61,9 @@ impl<'a> SourceRegistry<'a> {
         &self,
         fingerprint: &SourceFingerprint,
     ) -> rusqlite::Result<Option<Source>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {SELECT_COLS} FROM source_registry WHERE fingerprint = ?1"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SELECT_COLS} FROM source_registry WHERE fingerprint = ?1"
+        ))?;
         let mut rows = stmt.query(params![fingerprint.0])?;
         match rows.next()? {
             Some(row) => Ok(Some(row_to_source(row))),
@@ -80,10 +80,7 @@ impl<'a> SourceRegistry<'a> {
     /// `last_insert_rowid()` is the SQLite function that returns the
     /// AUTOINCREMENT id of the just-inserted row; rusqlite exposes it via
     /// [`Connection::last_insert_rowid`].
-    pub fn upsert_by_fingerprint(
-        &self,
-        fields: &SourceInsert<'_>,
-    ) -> rusqlite::Result<Source> {
+    pub fn upsert_by_fingerprint(&self, fields: &SourceInsert<'_>) -> rusqlite::Result<Source> {
         self.conn.execute(
             "INSERT INTO source_registry
                 (provider, source_kind, lifecycle_state, health_state, coverage_level,
@@ -128,6 +125,27 @@ impl<'a> SourceRegistry<'a> {
         self.get_by_rowid(rowid)
     }
 
+    /// Persist a scan-derived health fact without changing the Source's stable
+    /// identity or lifecycle. Unknown stored values are rejected by
+    /// `row_to_source`; this method never coerces corruption to `unknown`.
+    pub fn set_health(
+        &self,
+        source_id: &SourceId,
+        health: HealthState,
+    ) -> rusqlite::Result<Option<Source>> {
+        let Some(rowid) = source_id.to_rowid() else {
+            return Ok(None);
+        };
+        if self.conn.execute(
+            "UPDATE source_registry SET health_state = ?1 WHERE id = ?2",
+            params![health.as_str(), rowid],
+        )? == 0
+        {
+            return Ok(None);
+        }
+        self.get_by_rowid(rowid)
+    }
+
     /// Fetch a Source by its `source_id`. Returns `Ok(None)` when the id does
     /// not match any row (e.g. unknown id passed to `disable_source`).
     pub fn get(&self, source_id: &SourceId) -> rusqlite::Result<Option<Source>> {
@@ -140,9 +158,9 @@ impl<'a> SourceRegistry<'a> {
     /// List every Source row, ordered by id for stable UI ordering. Used by
     /// `list_sources`.
     pub fn list(&self) -> rusqlite::Result<Vec<Source>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {SELECT_COLS} FROM source_registry ORDER BY id ASC"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SELECT_COLS} FROM source_registry ORDER BY id ASC"
+        ))?;
         // `query_map` requires a `FnMut(&Row) -> Result<T>` closure; wrap the
         // infallible mapper so the signature matches.
         let rows = stmt.query_map([], |row| Ok(row_to_source(row)))?;
@@ -154,9 +172,9 @@ impl<'a> SourceRegistry<'a> {
     }
 
     fn get_by_rowid(&self, rowid: i64) -> rusqlite::Result<Option<Source>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("SELECT {SELECT_COLS} FROM source_registry WHERE id = ?1"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SELECT_COLS} FROM source_registry WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query(params![rowid])?;
         match rows.next()? {
             Some(row) => Ok(Some(row_to_source(row))),

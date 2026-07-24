@@ -38,8 +38,11 @@ use crate::adapters::codex::{
 };
 use crate::domain::scan::{
     build_record_id, fnv1a_hex, Generation, ScanError, ScanOutcome, ScanRunState, ScanStatus,
+    SourceInventory,
 };
-use crate::domain::source::{build_fingerprint, SourceId, SourceLifecycle, ROOT_KIND_DIR};
+use crate::domain::source::{
+    build_fingerprint, HealthState, SourceId, SourceLifecycle, ROOT_KIND_DIR,
+};
 use crate::domain::{CoverageLevel, ProviderAdapter, SupportedArtifact};
 use crate::index::scan_store::{ScanStore, StagedDiagnostic, StagedRecord};
 use crate::index::SourceRegistry;
@@ -69,6 +72,14 @@ pub fn scan_source(
     source_id: &SourceId,
 ) -> Result<ScanOutcome, ScanError> {
     scan_source_with(&CodexAdapter, registry, conn, source_id)
+}
+
+/// Execute a run reserved before the queued response reached the browser.
+pub fn scan_reserved_source(
+    registry: &SourceRegistry<'_>, conn: &Connection, source_id: &SourceId,
+    scan_id: i64, fencing_token: i64, generation: Generation,
+) -> Result<ScanOutcome, ScanError> {
+    scan_reserved_source_with(&CodexAdapter, registry, conn, source_id, scan_id, fencing_token, generation)
 }
 
 /// Scan a confirmed Source with an injected adapter (AD-1 orchestration).
@@ -104,8 +115,13 @@ pub fn scan_source_with<A: ProviderAdapter>(
     // Re-validate the root (AD-4/NFR-5/6). A deleted / non-dir root fails the
     // scan BEFORE begin_run (no run row — root validation precedes ownership);
     // any prior active generation is preserved.
-    let root = policy::canonicalize_root(Path::new(&source.normalized_root_path))
-        .map_err(|_| ScanError::RootInvalid)?;
+    let root = match policy::canonicalize_root(Path::new(&source.normalized_root_path)) {
+        Ok(root) => root,
+        Err(_) => {
+            let _ = registry.set_health(source_id, HealthState::Degraded);
+            return Err(ScanError::RootInvalid);
+        }
+    };
     let current_fingerprint = build_fingerprint(
         &source.provider,
         ROOT_KIND_DIR,
@@ -116,6 +132,7 @@ pub fn scan_source_with<A: ProviderAdapter>(
         // The source's path now resolves to a different filesystem object.
         // Require an explicit re-confirmation instead of silently scanning a
         // replacement directory under the old Source identity.
+        let _ = registry.set_health(source_id, HealthState::Degraded);
         return Err(ScanError::RootIdentityChanged);
     }
 
@@ -140,7 +157,12 @@ pub fn scan_source_with<A: ProviderAdapter>(
         &generation,
     );
     match outcome {
-        Ok(o) => Ok(o),
+        Ok(o) => {
+            // Activation already committed; a health-write failure must not
+            // falsely report that the previous generation remains active.
+            let _ = registry.set_health(source_id, HealthState::Healthy);
+            Ok(o)
+        }
         Err(e) => {
             // A lost CAS is NOT re-marked: the run is no longer owned by this
             // holder (left in `committing` for boot recovery). Every other
@@ -149,9 +171,49 @@ pub fn scan_source_with<A: ProviderAdapter>(
             if !matches!(e, ScanError::CommitCasFailed) {
                 let _ = scan_store.fail_run(scan_id, e.error_code());
             }
+            if !matches!(e, ScanError::Cancelled) {
+                let health = health_for_scan_error(&e);
+                let _ = registry.set_health(source_id, health);
+            }
             Err(e)
         }
     }
+}
+
+fn scan_reserved_source_with<A: ProviderAdapter>(
+    adapter: &A, registry: &SourceRegistry<'_>, conn: &Connection, source_id: &SourceId,
+    scan_id: i64, fencing_token: i64, generation: Generation,
+) -> Result<ScanOutcome, ScanError> {
+    let store = ScanStore::new(conn);
+    let source = registry.get(source_id).map_err(|_| ScanError::Internal)?;
+    let Some(source) = source else { return Err(ScanError::SourceNotFound); };
+    if source.lifecycle_state != SourceLifecycle::Confirmed { return Err(ScanError::NotConfirmed); }
+    let source_rowid = ScanStore::source_rowid(source_id).ok_or(ScanError::SourceNotFound)?;
+    ensure_not_cancelled(&store, scan_id)?;
+    let root = match policy::canonicalize_root(Path::new(&source.normalized_root_path)) {
+        Ok(root) => root,
+        Err(_) => return reserved_failure(registry, &store, source_id, scan_id, ScanError::RootInvalid, "root_invalid"),
+    };
+    if build_fingerprint(&source.provider, ROOT_KIND_DIR, &root.normalized_path, root.identity) != source.fingerprint {
+        return reserved_failure(registry, &store, source_id, scan_id, ScanError::RootIdentityChanged, "root_identity_changed");
+    }
+    match run_pipeline(adapter, &store, &root.normalized_path, &source, source_rowid, scan_id, fencing_token, &generation) {
+        Ok(outcome) => { let _ = registry.set_health(source_id, HealthState::Healthy); Ok(outcome) }
+        Err(error) => {
+            if !matches!(error, ScanError::CommitCasFailed) { let _ = store.fail_run(scan_id, error.error_code()); }
+            if !matches!(error, ScanError::Cancelled) { let _ = registry.set_health(source_id, health_for_scan_error(&error)); }
+            Err(error)
+        }
+    }
+}
+
+fn reserved_failure(
+    registry: &SourceRegistry<'_>, store: &ScanStore<'_>, source_id: &SourceId,
+    scan_id: i64, error: ScanError, error_code: &str,
+) -> Result<ScanOutcome, ScanError> {
+    let _ = store.fail_run(scan_id, error_code);
+    let _ = registry.set_health(source_id, HealthState::Degraded);
+    Err(error)
 }
 
 /// The staged body of the scan, split out so the caller can apply the
@@ -168,14 +230,14 @@ fn run_pipeline<A: ProviderAdapter>(
     generation: &Generation,
 ) -> Result<ScanOutcome, ScanError> {
     // running → staging.
-    scan_store
-        .set_state(scan_id, ScanRunState::Running)
-        .map_err(|_| ScanError::Internal)?;
+    advance(scan_store, scan_id, ScanRunState::Running)?;
+    ensure_not_cancelled(scan_store, scan_id)?;
 
     // --- First enumeration → start manifest → UPDATE real revision ----------
     let start_enumeration = adapter
         .enumerate_artifacts(canonical_root)
         .map_err(|_| ScanError::EnumerationFailed)?;
+    ensure_not_cancelled(scan_store, scan_id)?;
     let active_generation = scan_store
         .active_generation(source_rowid)
         .map_err(|_| ScanError::Internal)?;
@@ -195,9 +257,8 @@ fn run_pipeline<A: ProviderAdapter>(
     let manifest_revision = manifest_revision(&start_manifest);
     set_manifest_revision(scan_store, scan_id, &manifest_revision)?;
 
-    scan_store
-        .set_state(scan_id, ScanRunState::Staging)
-        .map_err(|_| ScanError::Internal)?;
+    advance(scan_store, scan_id, ScanRunState::Staging)?;
+    ensure_not_cancelled(scan_store, scan_id)?;
 
     // Per file: read bytes, hash, build a staged file-level record. The
     // enumerated canonical target and metadata are re-validated before and
@@ -207,6 +268,7 @@ fn run_pipeline<A: ProviderAdapter>(
     let mut source_digests = Vec::with_capacity(start_enumeration.supported.len());
     let observed_at = unix_seconds_now();
     for artifact in &start_enumeration.supported {
+        ensure_not_cancelled(scan_store, scan_id)?;
         let bytes = read_verified(canonical_root, artifact)?;
         let source_revision = fnv1a_hex(&bytes);
         source_digests.push((artifact.clone(), source_revision.clone()));
@@ -250,6 +312,7 @@ fn run_pipeline<A: ProviderAdapter>(
     scan_store
         .stage_records(generation, &staged)
         .map_err(|_| ScanError::Internal)?;
+    ensure_not_cancelled(scan_store, scan_id)?;
     let diagnostics: Vec<StagedDiagnostic> = start_enumeration
         .diagnostics
         .iter()
@@ -273,6 +336,7 @@ fn run_pipeline<A: ProviderAdapter>(
     let final_enumeration = adapter
         .enumerate_artifacts(canonical_root)
         .map_err(|_| ScanError::EnumerationFailed)?;
+    ensure_not_cancelled(scan_store, scan_id)?;
     let final_manifest = build_manifest(&final_enumeration.supported);
     if final_manifest != start_manifest || final_enumeration != start_enumeration {
         // Source changed during the scan: this generation is never activated.
@@ -290,9 +354,8 @@ fn run_pipeline<A: ProviderAdapter>(
     }
 
     // --- Commit under CAS (AD-32) ------------------------------------------
-    scan_store
-        .set_state(scan_id, ScanRunState::Committing)
-        .map_err(|_| ScanError::Internal)?;
+    advance(scan_store, scan_id, ScanRunState::Committing)?;
+    ensure_not_cancelled(scan_store, scan_id)?;
 
     // A diagnostic-only observation may explain excluded artifacts but must
     // never replace a usable supported generation. This is deliberately after
@@ -328,6 +391,40 @@ fn run_pipeline<A: ProviderAdapter>(
         generation: generation.clone(),
         records_indexed,
     })
+}
+
+fn ensure_not_cancelled(scan_store: &ScanStore<'_>, scan_id: i64) -> Result<(), ScanError> {
+    if scan_store
+        .is_cancelled(scan_id)
+        .map_err(|_| ScanError::Internal)?
+    {
+        return Err(ScanError::Cancelled);
+    }
+    Ok(())
+}
+
+fn advance(scan_store: &ScanStore<'_>, scan_id: i64, state: ScanRunState) -> Result<(), ScanError> {
+    if scan_store.set_state(scan_id, state).map_err(|_| ScanError::Internal)? == 0 {
+        return ensure_not_cancelled(scan_store, scan_id);
+    }
+    Ok(())
+}
+
+fn health_for_scan_error(error: &ScanError) -> HealthState {
+    match error {
+        ScanError::RootInvalid
+        | ScanError::RootIdentityChanged
+        | ScanError::ReadFailed
+        | ScanError::ParseFailed
+        | ScanError::EnumerationFailed
+        | ScanError::EmptyScanWithActiveGeneration => HealthState::Degraded,
+        ScanError::SourceNotFound | ScanError::NotConfirmed | ScanError::Cancelled => {
+            HealthState::Unknown
+        }
+        ScanError::DirtyAfterValidation | ScanError::CommitCasFailed | ScanError::Internal => {
+            HealthState::Error
+        }
+    }
 }
 
 fn read_verified(
@@ -445,6 +542,84 @@ pub fn get_scan_status(
         active_generation,
         active_records,
     })
+}
+
+/// Assemble server-owned inventory facts. This deliberately reads the last
+/// success, current active count, and latest failure independently so a failed
+/// rescan cannot erase a previously safe, searchable generation.
+pub fn list_inventory(
+    registry: &SourceRegistry<'_>,
+    conn: &Connection,
+) -> Result<Vec<SourceInventory>, ScanError> {
+    let store = ScanStore::new(conn);
+    registry
+        .list()
+        .map_err(|_| ScanError::Internal)?
+        .into_iter()
+        .map(|source| {
+            let source_rowid =
+                ScanStore::source_rowid(&source.source_id).ok_or(ScanError::Internal)?;
+            let latest = store
+                .latest_run(source_rowid)
+                .map_err(|_| ScanError::Internal)?;
+            let latest_error = latest.as_ref().and_then(|run| {
+                (run.state == ScanRunState::Failed)
+                    .then(|| safe_error_reason(run.error_code.as_deref()))
+            });
+            let complete_record_count = matches!(source.coverage_level, CoverageLevel::Full)
+                .then(|| store.count_active_records(source_rowid))
+                .transpose()
+                .map_err(|_| ScanError::Internal)?;
+            Ok(SourceInventory {
+                source_id: source.source_id,
+                provider: source.provider,
+                lifecycle_state: source.lifecycle_state,
+                root: source.normalized_root_path,
+                native_project: source.native_project,
+                coverage_level: coverage_level_string(source.coverage_level).to_string(),
+                health_state: source.health_state,
+                last_successful_scan: store
+                    .last_successful_finished_at(source_rowid)
+                    .map_err(|_| ScanError::Internal)?,
+                complete_record_count,
+                latest_error: latest_error.or_else(|| (source.health_state == HealthState::Degraded).then(|| "Tessera could not access this source.".to_string())),
+            })
+        })
+        .collect()
+}
+
+fn safe_error_reason(error_code: Option<&str>) -> String {
+    match error_code {
+        Some("cancelled") => "The last rescan was cancelled.".to_string(),
+        Some("read_failed") | Some("enumeration_failed") => {
+            "Tessera could not read this source.".to_string()
+        }
+        Some("parse_failed") => "Tessera could not read this source format.".to_string(),
+        Some("dirty_after_validation") => {
+            "The source changed while Tessera was scanning it.".to_string()
+        }
+        Some("stale_recovered") => "The previous rescan did not finish.".to_string(),
+        _ => "Tessera could not complete the last rescan.".to_string(),
+    }
+}
+
+/// Request cancellation for the newest running Source job. Returns false when
+/// no in-flight job exists; it never cancels a completed generation.
+pub fn cancel_rescan(
+    registry: &SourceRegistry<'_>,
+    conn: &Connection,
+    source_id: &SourceId,
+) -> Result<bool, ScanError> {
+    let source = registry.get(source_id).map_err(|_| ScanError::Internal)?;
+    let Some(source) = source else {
+        return Err(ScanError::SourceNotFound);
+    };
+    if source.lifecycle_state != SourceLifecycle::Confirmed {
+        return Err(ScanError::NotConfirmed);
+    }
+    ScanStore::new(conn)
+        .cancel_latest_run(ScanStore::source_rowid(source_id).ok_or(ScanError::SourceNotFound)?)
+        .map_err(|_| ScanError::Internal)
 }
 
 /// Boot-time scan recovery (AD-16). Flips stale in-flight runs to `failed`

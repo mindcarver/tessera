@@ -6,38 +6,55 @@
  *
  * Uses an isolated Codex memory fixture and the real loopback HTTP server.
  * The flow must stay keyboard reachable: confirm the discovered source,
- * trigger Scan with Enter, observe the successful POST response, then read
- * the polite status announcement and persisted scan state.
+ * trigger Rescan with Enter, observe the scoped job request, then read the
+ * polite progress announcement and rendered server-derived inventory.
  */
 
 import { expect, test } from "@playwright/test";
 
 test.describe.configure({ mode: "serial" });
 
-test("keyboard scan posts successfully and announces completion", async ({ page }) => {
+test("keyboard rescan posts successfully and announces ordered progress", async ({ page }) => {
+  let eventCalls = 0;
+  await page.route("**/api/sources/discover", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }));
+  await page.route("**/api/sources/inventory", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [{ source_id: "src_1", provider: "codex", lifecycle_state: "confirmed", root: "/fixture", native_project: null, coverage_level: "full", health_state: "healthy", last_successful_scan: 1, complete_record_count: 1, latest_error: null }] }) }));
+  await page.route("**/api/sources/rescan/events?*", async (route) => {
+    eventCalls += 1;
+    const data = eventCalls === 1
+      ? { api_version: "1", job_id: "job_1", source_id: "src_1", sequence: 2, state: "running", message: "Rescan running." }
+      : { api_version: "1", job_id: "job_1", source_id: "src_1", sequence: 3, state: "cancelled", message: "Rescan cancelled." };
+    await route.fulfill({ contentType: "text/event-stream", body: `event: progress\ndata: ${JSON.stringify(data)}\n\n` });
+  });
+  await page.route("**/api/sources/rescan/cancel", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: { api_version: "1", job_id: "job_1", source_id: "src_1", sequence: 3, state: "cancelled", message: "Rescan cancelled." } }) }));
+  await page.route("**/api/sources/rescan", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: { api_version: "1", job_id: "job_1", source_id: "src_1", sequence: 1, state: "queued", message: "Rescan queued." } }) }));
   await page.goto("/");
 
-  const confirm = page.getByRole("button", { name: "Confirm" });
-  await expect(confirm).toBeVisible();
-  await confirm.focus();
-  await page.keyboard.press("Enter");
-
-  const scan = page.getByRole("button", { name: "Scan", exact: true });
-  await expect(scan).toBeVisible();
-  const scanResponse = page.waitForResponse(
+  const rescan = page.getByRole("button", { name: "Rescan", exact: true });
+  await expect(rescan).toBeVisible();
+  const rescanResponse = page.waitForResponse(
     (response) =>
-      response.url().endsWith("/api/scan") && response.request().method() === "POST",
+      response.url().endsWith("/api/sources/rescan") && response.request().method() === "POST",
   );
-  await scan.focus();
+  await rescan.focus();
   await page.keyboard.press("Enter");
 
-  expect((await scanResponse).status()).toBe(200);
-  await expect(page.getByTestId("scan-announcement")).toContainText("Scan complete.");
-  await expect(page.getByText(/Scan succeeded — generation gen_\d+/)).toBeVisible();
+  expect((await rescanResponse).status()).toBe(200);
+  await expect(page.getByRole("button", { name: "Cancel rescan" })).toBeVisible();
+  await page.waitForTimeout(300);
+  expect(eventCalls).toBeGreaterThan(0);
+  const cancel = page.getByRole("button", { name: "Cancel rescan" });
+  await cancel.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("rescan-progress")).toContainText("Rescan cancelled.");
+  await expect(page.getByRole("region", { name: "Source inventory" }).getByText("Health", { exact: true })).toBeVisible();
 });
 
 test("keyboard search renders provenance, empty states, pagination, and safe API errors", async ({ page }) => {
   await page.goto("/");
+  const confirm = page.getByRole("button", { name: "Confirm" });
+  await expect(confirm).toBeVisible();
+  await confirm.press("Enter");
+  await expect(page.getByRole("button", { name: "Rescan", exact: true })).toBeVisible();
   let stalePage = 0;
   let openCalls = 0;
   const openBodies: string[] = [];
@@ -53,6 +70,7 @@ test("keyboard search renders provenance, empty states, pagination, and safe API
     const q = new URL(route.request().url()).searchParams.get("q");
     const payload = (empty_state: string | null, results: unknown[] = [], next_cursor: string | null = null) => ({ api_version: "1", payload: { results, next_cursor, empty_state } });
     const result = { record_id: "mock-record", excerpt: "mock excerpt", provider: "codex", source_id: "src_1", native_project: null, native_locator: "mock://semantic", display_locator: "mock://display", observed_at: 1, coverage_level: "full", health_state: "unknown" };
+    if (q?.trim() === "") return route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ code: "bad_request", message: "The request did not match Tessera's search contract.", source_id: null, phase: "search" }) });
     if (q === "stale-page") {
       stalePage += 1;
       if (stalePage === 1) return route.fulfill({ contentType: "application/json", body: JSON.stringify(payload(null, [result], "v1.cursor")) });
@@ -60,7 +78,8 @@ test("keyboard search renders provenance, empty states, pagination, and safe API
     }
     if (q === "not-indexed") return route.fulfill({ contentType: "application/json", body: JSON.stringify(payload("source_not_indexed")) });
     if (q === "unavailable") return route.fulfill({ contentType: "application/json", body: JSON.stringify(payload("source_unavailable")) });
-    return route.continue();
+    if (q === "does-not-match") return route.fulfill({ contentType: "application/json", body: JSON.stringify(payload("no_match")) });
+    return route.fulfill({ contentType: "application/json", body: JSON.stringify(payload(null, [result], "v1.cursor")) });
   });
   const input = page.getByLabel("Keyword");
   const response = page.waitForResponse(
@@ -89,7 +108,7 @@ test("keyboard search renders provenance, empty states, pagination, and safe API
   await expect(loadMore).toBeVisible();
   await loadMore.focus();
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("region", { name: "Memory search" }).getByRole("listitem")).toHaveCount(3);
+  await expect(page.getByRole("region", { name: "Memory search" }).getByRole("listitem")).toHaveCount(2);
 
   await input.fill("stale-page");
   await input.press("Enter");

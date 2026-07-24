@@ -44,4 +44,5 @@ pub use source::{
 // index / ipc.
 pub use scan::{
     build_record_id, fnv1a_hex, Generation, ScanError, ScanOutcome, ScanRunState, ScanStatus,
+    SourceInventory,
 };
