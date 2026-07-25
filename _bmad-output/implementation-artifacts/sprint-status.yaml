@@ -64,7 +64,7 @@ development_status:
   # === Epic 2: 跨 Agent 联邦（Claude Code + 跨 Provider 搜索与全景 Inventory） ===
   epic-2: in-progress
   2-1-claude-discover: done                 # Claude Code Candidate Source 发现与确认
-  2-2-claude-parse-index: backlog           # Claude Code 记忆解析、边界限定与只读索引
+  2-2-claude-parse-index: done              # Claude Code 记忆解析、边界限定与只读索引
   2-3-cross-agent-search: backlog           # 跨 Provider 关键词搜索与来源对比
   2-4-cross-provider-filters: backlog       # 跨 Provider 组合筛选与范围可见性
   2-5-multi-provider-inventory: backlog     # 多 Provider Source Inventory 全景与跨源健康

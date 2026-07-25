@@ -53,18 +53,23 @@ pub enum SourceError {
 /// route through the same confirm pipeline. Returns `None` for unknown
 /// providers so confirm fails with `ConfirmFailed` rather than crashing.
 ///
+/// This is the **single source of truth** for the provider→adapter registry.
+/// `application::scan::adapter_for_scan` delegates here so scan dispatch and
+/// confirm/dispatch can never drift (a provider added here is automatically
+/// scannable; a provider missing here is rejected by both paths identically).
+///
 /// The Design Notes prefer `Option<Box<dyn ProviderAdapter>>` (matches the
-/// architecture's "adapter registry" language); each call returns a freshly
+/// architecture's "adapter registry" language"); each call returns a freshly
 /// boxed unit struct, but the unit structs are zero-sized so the heap cost is
 /// negligible. The boxed trait object preserves the existing confirm/reject
 /// dispatch shape — only the registry width changes.
-fn adapter_for(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
+pub(crate) fn adapter_for(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
     match provider {
         // Reference Codex's canonical provider-id constant (single source of
         // truth) so a rename cannot desync the registry from the scan guard,
         // which uses the same constant. See `CodexAdapter::PROVIDER_ID`.
         CodexAdapter::PROVIDER_ID => Some(Box::new(CodexAdapter)),
-        "claude_code" => Some(Box::new(ClaudeCodeAdapter)),
+        ClaudeCodeAdapter::PROVIDER_ID => Some(Box::new(ClaudeCodeAdapter)),
         _ => None,
     }
 }

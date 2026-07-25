@@ -172,6 +172,13 @@ impl ProviderAdapter for DriftAdapter {
         CoverageLevel::Full
     }
 
+    // Story 2.2: scripted adapters spoof the codex provider id, so they
+    // declare codex's parser version too. The persisted tag is now read from
+    // the adapter (single source of truth) instead of a hard-coded constant.
+    fn parser_version(&self) -> &'static str {
+        "codex-markdown/v1"
+    }
+
     fn discover(&self) -> Vec<CandidateSource> {
         Vec::new()
     }
@@ -226,6 +233,13 @@ impl ProviderAdapter for RetargetAfterEnumerationAdapter {
         CoverageLevel::Full
     }
 
+    // Story 2.2: scripted adapters spoof the codex provider id, so they
+    // declare codex's parser version too. The persisted tag is now read from
+    // the adapter (single source of truth) instead of a hard-coded constant.
+    fn parser_version(&self) -> &'static str {
+        "codex-markdown/v1"
+    }
+
     fn discover(&self) -> Vec<CandidateSource> {
         Vec::new()
     }
@@ -268,6 +282,13 @@ impl ProviderAdapter for SameMetadataMutationAdapter {
 
     fn coverage_level(&self) -> CoverageLevel {
         CoverageLevel::Full
+    }
+
+    // Story 2.2: scripted adapters spoof the codex provider id, so they
+    // declare codex's parser version too. The persisted tag is now read from
+    // the adapter (single source of truth) instead of a hard-coded constant.
+    fn parser_version(&self) -> &'static str {
+        "codex-markdown/v1"
     }
 
     fn discover(&self) -> Vec<CandidateSource> {
@@ -321,6 +342,13 @@ impl ProviderAdapter for DiagnosticDriftAdapter {
         CoverageLevel::Full
     }
 
+    // Story 2.2: scripted adapters spoof the codex provider id, so they
+    // declare codex's parser version too. The persisted tag is now read from
+    // the adapter (single source of truth) instead of a hard-coded constant.
+    fn parser_version(&self) -> &'static str {
+        "codex-markdown/v1"
+    }
+
     fn discover(&self) -> Vec<CandidateSource> {
         Vec::new()
     }
@@ -359,6 +387,13 @@ impl ProviderAdapter for MtimeBumpAdapter {
         CoverageLevel::Full
     }
 
+    // Story 2.2: scripted adapters spoof the codex provider id, so they
+    // declare codex's parser version too. The persisted tag is now read from
+    // the adapter (single source of truth) instead of a hard-coded constant.
+    fn parser_version(&self) -> &'static str {
+        "codex-markdown/v1"
+    }
+
     fn discover(&self) -> Vec<CandidateSource> {
         Vec::new()
     }
@@ -388,6 +423,13 @@ impl ProviderAdapter for FailingEnumAdapter {
 
     fn coverage_level(&self) -> CoverageLevel {
         CoverageLevel::Full
+    }
+
+    // Story 2.2: scripted adapters spoof the codex provider id, so they
+    // declare codex's parser version too. The persisted tag is now read from
+    // the adapter (single source of truth) instead of a hard-coded constant.
+    fn parser_version(&self) -> &'static str {
+        "codex-markdown/v1"
     }
 
     fn discover(&self) -> Vec<CandidateSource> {
@@ -629,7 +671,7 @@ fn dirty_after_validation_never_activates_and_preserves_previous() {
     // Re-scan through a scripted adapter: the commit-time re-enumeration sees
     // an empty source (manifest drift) → DirtyAfterValidation.
     let err =
-        application::scan_source_with(&DriftAdapter::new(), &registry, &conn, &source.source_id)
+        application::scan_source_with(&DriftAdapter::new(), &registry, &conn, &source)
             .expect_err("drift at commit-time revalidation");
     assert!(
         matches!(err, ScanError::DirtyAfterValidation),
@@ -1295,7 +1337,7 @@ fn first_enumeration_failure_marks_run_failed_with_enumeration_code() {
     let source_rowid = source.source_id.to_rowid().expect("rowid");
 
     let err =
-        application::scan_source_with(&FailingEnumAdapter, &registry, &conn, &source.source_id)
+        application::scan_source_with(&FailingEnumAdapter, &registry, &conn, &source)
             .expect_err("first enumeration fails");
     assert!(
         matches!(err, ScanError::EnumerationFailed),
@@ -1365,7 +1407,7 @@ fn staging_then_drift_failure_preserves_previous_rows_identically() {
         &MtimeBumpAdapter::new(),
         &registry,
         &conn,
-        &source.source_id,
+        &source,
     )
     .expect_err("mtime drift at revalidation");
     assert!(matches!(err, ScanError::DirtyAfterValidation));
@@ -1747,7 +1789,7 @@ fn same_size_restored_mtime_byte_change_fails_final_digest_validation() {
         &SameMetadataMutationAdapter::new(b"# Item\nbravo\n"),
         &registry,
         &conn,
-        &source.source_id,
+        &source,
     )
     .expect_err("digest drift must fail");
     assert!(matches!(error, ScanError::DirtyAfterValidation));
@@ -1887,7 +1929,7 @@ fn diagnostic_drift_between_initial_and_final_enumeration_preserves_active_gener
         &DiagnosticDriftAdapter::new(),
         &registry,
         &conn,
-        &source.source_id,
+        &source,
     )
     .expect_err("diagnostic drift must fail");
     assert!(matches!(error, ScanError::DirtyAfterValidation));
@@ -2035,7 +2077,7 @@ fn retargeted_file_after_enumeration_fails_before_reading_outside_target() {
         &RetargetAfterEnumerationAdapter::new(outside),
         &registry,
         &conn,
-        &source.source_id,
+        &source,
     )
     .expect_err("retargeted file is rejected");
     assert!(matches!(err, ScanError::DirtyAfterValidation));

@@ -99,3 +99,9 @@ Tauri 移除、传输改为 loopback-only HTTP（tiny_http）后，上述条目�
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-1-claude-discover.md`
   summary: Sync `POST /api/scan` on a `claude_code` source leaves no persistent trace (no `scan_runs` row), so the inventory `latest_error` only reflects rescan failures, not sync-scan failures — an unobvious asymmetry.
   evidence: The sync guard fires before `begin_run` by design (spec scopes the inventory surface to "when a rescan is triggered"). The asymmetry is undocumented. Document it, or have the sync guard write a failed row if cross-entry-point consistency is later desired.
+
+## Deferred from: code review of spec-2-2-claude-parse-index (2026-07-25)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-2-claude-parse-index.md`
+  summary: The Phase 0 perf gate (`server/tests/performance_baseline.rs::phase_zero_baseline_gate_measures_and_enforces_the_approved_fixture`) uses tight, machine-calibrated thresholds (cold_scan ≤ 12ms on a 6ms baseline, etc.) that can false-fail under parallel `cargo test` load or on slower/dev machines — making the "no perf regression" claim clock-dependent.
+  evidence: Pre-existing test infra (Story 1.9), NOT introduced or modified by 2.2. On a reviewer machine it failed 3/3 in isolation (21–42ms vs 12ms); under parallel load it flakes. The clock-independent "no Codex behavioral regression" is already proven by `codex_canonicalization` (parser-output pin) and the cross-coexistence dispatch test. Harden by widening the threshold to absorb runner variance (e.g. 5–10× baseline), marking the gate advisory, pinning it to a reference CI runner with its own baseline, and/or adding a Codex record_id/body golden-master snapshot for clock-independent behavioral regression.

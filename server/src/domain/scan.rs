@@ -201,19 +201,6 @@ pub enum ScanError {
     CommitCasFailed,
     /// A persisted cancel request changed this run out of its active state.
     Cancelled,
-    /// The Source's provider is not scannable in this Story. Story 2.1 ships
-    /// Claude Code discovery + confirm but defers Claude parsing/indexing to
-    /// Story 2.2; the guard at the scan boundary returns this variant so the
-    /// Codex parser is never applied to Claude files. Maps to `scan_failed`
-    /// on the wire (HTTP layer) with a provider-aware message. The persisted
-    /// `error_code` is `provider_not_scannable` (its own dedicated vocabulary
-    /// value, not the `internal` catch-all) so the inventory `latest_error`,
-    /// the rescan SSE terminal event, and `scan_runs.error_code` all surface
-    /// a provider-aware, *expected* 2.1 outcome — never a misleading generic
-    /// `internal` failure. For the synchronous `/api/scan` envelope this is
-    /// true even when the guard fires before `begin_run` (no run row exists
-    /// to label): the envelope maps to the dedicated message directly.
-    ProviderNotScannable,
     /// An unexpected internal error (SQLite failure). Maps to `internal`.
     Internal,
 }
@@ -230,12 +217,6 @@ impl ScanError {
     /// - `read_failed` — a file read failed mid-scan.
     /// - `parse_failed` — an allowlisted source could not be canonicalized.
     /// - `enumeration_failed` — enumeration of file units failed.
-    /// - `provider_not_scannable` — the Source's provider is not parseable
-    ///   in this Story (e.g. Claude Code in 2.1, before 2.2 lands). A
-    ///   dedicated vocabulary value, not `internal`, so every surface
-    ///   (inventory `latest_error`, rescan SSE terminal event,
-    ///   `scan_runs.error_code`) reports the provider-aware, *expected*
-    ///   outcome instead of a generic failure.
     /// - `internal` — an unexpected internal (SQLite) error.
     ///
     /// `stale_recovered` is another vocabulary value but is written ONLY by
@@ -244,6 +225,12 @@ impl ScanError {
     /// [`ScanError::NotConfirmed`], [`ScanError::RootInvalid`]) or that must
     /// NOT re-mark the row ([`ScanError::CommitCasFailed`]) map to the
     /// internal catch-all; the orchestrator does not call `fail_run` for them.
+    ///
+    /// Story 2.2 removed the `provider_not_scannable` vocabulary value along
+    /// with the `ProviderNotScannable` variant: Claude Code is scannable now,
+    /// so the 2.1 placeholder surface is gone. A genuinely-unknown future
+    /// provider that cannot scan surfaces via `EnumerateError`/enumeration-
+    /// failed, not a pre-enumeration variant.
     pub fn error_code(&self) -> &'static str {
         match self {
             ScanError::DirtyAfterValidation => "dirty_after_validation",
@@ -252,7 +239,6 @@ impl ScanError {
             ScanError::EnumerationFailed | ScanError::EmptyScanWithActiveGeneration => {
                 "enumeration_failed"
             }
-            ScanError::ProviderNotScannable => "provider_not_scannable",
             // SourceNotFound / NotConfirmed / RootInvalid / CommitCasFailed
             // never write a row via fail_run (see fail-run policy in
             // application::scan). The internal catch-all keeps the mapping
@@ -486,7 +472,6 @@ mod tests {
             ScanError::ParseFailed,
             ScanError::DirtyAfterValidation,
             ScanError::CommitCasFailed,
-            ScanError::ProviderNotScannable,
             ScanError::Internal,
         ] {
             let _ = format!("{e:?}");
@@ -512,14 +497,9 @@ mod tests {
             ScanError::EmptyScanWithActiveGeneration.error_code(),
             "enumeration_failed"
         );
-        // Story 2.1: a non-scannable provider (Claude Code before 2.2) gets
-        // its own dedicated vocabulary value so every surface reports the
-        // provider-aware, *expected* 2.1 outcome — never a misleading
-        // generic `internal` failure.
-        assert_eq!(
-            ScanError::ProviderNotScannable.error_code(),
-            "provider_not_scannable"
-        );
+        // Story 2.2: the `provider_not_scannable` vocabulary value and the
+        // `ProviderNotScannable` variant are removed — Claude is scannable
+        // now, so the 2.1 placeholder surface is gone.
         assert_eq!(ScanError::Internal.error_code(), "internal");
         // Variants that never reach fail_run map to the internal catch-all so
         // the mapping stays total (they are not written to a run row).

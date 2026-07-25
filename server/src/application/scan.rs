@@ -32,10 +32,7 @@ use std::path::Path;
 use rusqlite::Connection;
 use same_file::Handle;
 
-use crate::adapters::codex::{
-    canonicalize_markdown, file_uri, percent_encode_fragment, CodexAdapter,
-    CODEX_MARKDOWN_PARSER_VERSION,
-};
+use crate::adapters::markdown::{canonicalize_markdown, file_uri, percent_encode_fragment};
 use crate::domain::scan::{
     build_record_id, fnv1a_hex, Generation, ScanError, ScanOutcome, ScanRunState, ScanStatus,
     SourceInventory,
@@ -54,30 +51,21 @@ use crate::policy;
 /// revision is UPDATEd onto the row once the manifest is snapshotted.
 const PLACEHOLDER_MANIFEST_REVISION: &str = "pending";
 
-/// Provider id of the only provider scannable in Story 2.1. The scan pipeline
-/// hard-codes the Codex adapter / Codex Markdown parser; Story 2.2 lands
-/// Claude parsing. The provider-scannable guard at the top of each scan entry
-/// point uses this constant so a `claude_code` Source cannot be parsed by the
-/// Codex parser (spec I/O matrix — "Codex parser not applied").
-///
-/// Story 2.1 review fix: this is now an alias for `CodexAdapter::PROVIDER_ID`
-/// (the canonical single source of truth) so a Codex rename cannot desync the
-/// scan guard from the registry in `application::source::adapter_for`.
-const CODEX_PROVIDER_ID: &str = CodexAdapter::PROVIDER_ID;
-
-/// Story 2.1 review fix — the provider-aware scan-failed message. The same
-/// text appears on three surfaces:
-/// - the sync `/api/scan` envelope (`ErrorEnvelope::scan_failed_provider_not_scannable`)
-/// - the rescan SSE terminal event (`http::start_rescan`'s worker branch)
-/// - the inventory `latest_error` (derived from `scan_runs.error_code` via
-///   `safe_error_reason`)
-///
-/// Hoisted to one `pub(crate)` const here so the surfaces cannot drift. The
-/// application layer is the natural home (it owns `safe_error_reason`); the
-/// http layer references it via `crate::application::scan::PROVIDER_NOT_SCANNABLE_MSG`
-/// rather than the reverse — application must not depend on http.
-pub(crate) const PROVIDER_NOT_SCANNABLE_MSG: &str =
-    "This provider's scan is not available yet; indexing for it lands in a later release.";
+/// Resolve the provider adapter for a scan dispatch (Story 2.2). Delegates to
+/// [`application::source::adapter_for`] — the **single provider→adapter
+/// registry** — so scan dispatch and the confirm/reject path can never drift
+/// (a provider added to confirm is automatically scannable; a provider missing
+/// from confirm is rejected by both paths identically). Story 2.1 hard-coded
+/// `&CodexAdapter` here; 2.2 generalizes dispatch by `source.provider` so
+/// Claude Code sources scan through their own adapter + parser tag. A
+/// genuinely-unknown provider returns `None` and surfaces as
+/// `ScanError::Internal` (mirroring confirm's `ConfirmFailed`): the
+/// registry's confirm path already rejects unknown providers, so reaching
+/// here with `None` is a registry/invariant drift, not a user-facing "not
+/// scannable" outcome.
+fn adapter_for_scan(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
+    crate::application::source::adapter_for(provider)
+}
 
 /// A single manifest entry: `(relative_path, canonical_target, size, mtime)`
 /// where `mtime` is nanoseconds since the Unix epoch (sub-second precision —
@@ -85,26 +73,55 @@ pub(crate) const PROVIDER_NOT_SCANNABLE_MSG: &str =
 /// file resolved at enumeration time, rather than merely to its visible name.
 type ManifestEntry = (String, String, u64, i64);
 
-/// Scan a confirmed Source using the Codex adapter (AD-1 orchestration).
-///
-/// This is the production entry point the IPC command calls. It delegates to
-/// [`scan_source_with`] with the real [`CodexAdapter`]; the generic seam
-/// exists so the integration tests can drive a scripted adapter through the
-/// SAME public orchestration (e.g. to produce a real manifest drift).
+/// Scan a confirmed Source, dispatching the adapter by `source.provider`
+/// (Story 2.2 generalization). The production entry point the IPC command
+/// calls; delegates to [`scan_source_with`] after resolving the adapter. The
+/// generic seam exists so integration tests can drive a scripted adapter
+/// through the SAME public orchestration (e.g. to produce a real manifest
+/// drift). Pre-2.2 this hard-coded `&CodexAdapter` and refused Claude via
+/// `ProviderNotScannable`; that placeholder is gone now that Claude is
+/// scannable.
 pub fn scan_source(
     registry: &SourceRegistry<'_>,
     conn: &Connection,
     source_id: &SourceId,
 ) -> Result<ScanOutcome, ScanError> {
-    scan_source_with(&CodexAdapter, registry, conn, source_id)
+    // Bootstrap: load the source row FIRST so we can dispatch by provider,
+    // then pass the already-loaded Source through to `scan_source_with` so
+    // production scans do ONE registry read, not two (Story 2.2 review fix).
+    let source = registry.get(source_id).map_err(|_| ScanError::Internal)?;
+    let Some(source) = source else {
+        return Err(ScanError::SourceNotFound);
+    };
+    let adapter = adapter_for_scan(&source.provider).ok_or(ScanError::Internal)?;
+    scan_source_with(adapter.as_ref(), registry, conn, &source)
 }
 
 /// Execute a run reserved before the queued response reached the browser.
+/// Dispatches the adapter by `source.provider` (Story 2.2 generalization).
 pub fn scan_reserved_source(
     registry: &SourceRegistry<'_>, conn: &Connection, source_id: &SourceId,
     scan_id: i64, fencing_token: i64, generation: Generation,
 ) -> Result<ScanOutcome, ScanError> {
-    scan_reserved_source_with(&CodexAdapter, registry, conn, source_id, scan_id, fencing_token, generation)
+    let source = registry.get(source_id).map_err(|_| ScanError::Internal)?;
+    let Some(source) = source else { return Err(ScanError::SourceNotFound); };
+    let adapter = match adapter_for_scan(&source.provider) {
+        Some(adapter) => adapter,
+        None => {
+            // Dispatch failure on the reserved path: the run row was already
+            // `begin_run`'d by the reservation that allocated `scan_id`. Mark
+            // it failed (and set health) BEFORE returning so it is not left
+            // non-terminal — the fail-on-error contract (spec Design Notes —
+            // "失败即 fail_run、不留半态"). Without this, only boot recovery
+            // would clean the row up. `Internal` is an invariant drift here:
+            // confirm already rejects unknown providers, so reaching this arm
+            // means the registry and dispatch tables disagree.
+            let _ = ScanStore::new(conn).fail_run(scan_id, ScanError::Internal.error_code());
+            let _ = registry.set_health(source_id, HealthState::Error);
+            return Err(ScanError::Internal);
+        }
+    };
+    scan_reserved_source_with(adapter.as_ref(), registry, conn, source_id, scan_id, fencing_token, generation)
 }
 
 /// Scan a confirmed Source with an injected adapter (AD-1 orchestration).
@@ -115,38 +132,41 @@ pub fn scan_reserved_source(
 /// scan; any failure after `begin_run` is a structured [`ScanError`] with the
 /// run marked `failed` (except a lost commit CAS — see module doc).
 ///
-/// The adapter is generic so tests can substitute a scripted
-/// [`ProviderAdapter`] (the port exists for exactly this — see the amended
-/// spec's tests task). Production callers use [`scan_source`].
-pub fn scan_source_with<A: ProviderAdapter>(
-    adapter: &A,
+/// Story 2.2: the adapter is now `&dyn ProviderAdapter` (was generic `<A>`)
+/// so production dispatch can route by `source.provider`. Tests still inject a
+/// scripted adapter through this seam — `&adapter` coerces to
+/// `&dyn ProviderAdapter` at the call site.
+///
+/// Story 2.2 review: the Source is now passed IN (was re-loaded via
+/// `registry.get(source_id)`) so the production path does one registry read,
+/// not two. The caller (`scan_source`) loaded it moments ago; tests load it
+/// via `confirm`. Behavior is identical except for the eliminated read.
+pub fn scan_source_with(
+    adapter: &dyn ProviderAdapter,
     registry: &SourceRegistry<'_>,
     conn: &Connection,
-    source_id: &SourceId,
+    source: &crate::domain::source::Source,
 ) -> Result<ScanOutcome, ScanError> {
+    // Defense-in-depth (Story 2.2 review): the 2.1 `ProviderNotScannable`
+    // guard is gone, so this pub seam silently trusts the caller paired the
+    // correct adapter with the source. A mismatch would persist records under
+    // the wrong `parser_version`; assert the pair cheaply in debug builds.
+    debug_assert_eq!(adapter.provider_id(), source.provider);
+
     let scan_store = ScanStore::new(conn);
+    let source_id = &source.source_id;
 
     // --- Validate source + root -------------------------------------------
-    let source = registry.get(source_id).map_err(|_| ScanError::Internal)?;
-    let Some(source) = source else {
-        return Err(ScanError::SourceNotFound);
-    };
     if source.lifecycle_state != SourceLifecycle::Confirmed {
         // Rejected / disabled sources are not scannable (spec I/O matrix).
         return Err(ScanError::NotConfirmed);
     }
     let source_rowid = ScanStore::source_rowid(source_id).ok_or(ScanError::SourceNotFound)?;
 
-    // Story 2.1 provider-scannable guard: only Codex is parseable in this
-    // slice. Claude Code discovery + confirm ship in 2.1, but Claude parsing
-    // and indexing are Story 2.2. The guard must fire BEFORE root validation
-    // (no health change) and BEFORE begin_run (no run row), so a confirmed
-    // Claude Source legitimately retains coverage=Full / records=0 /
-    // health=unknown until 2.2, and the Codex parser is never applied to
-    // Claude files (spec I/O matrix — "Codex parser not applied").
-    if source.provider != CODEX_PROVIDER_ID {
-        return Err(ScanError::ProviderNotScannable);
-    }
+    // Story 2.2: the 2.1 `ProviderNotScannable` guard that refused Claude
+    // sources is removed — Claude is scannable now. Adapter dispatch already
+    // happened in `scan_source`; an unknown provider would have surfaced as
+    // `Internal` before reaching here.
 
     // Re-validate the root (AD-4/NFR-5/6). A deleted / non-dir root fails the
     // scan BEFORE begin_run (no run row — root validation precedes ownership);
@@ -186,7 +206,7 @@ pub fn scan_source_with<A: ProviderAdapter>(
         adapter,
         &scan_store,
         &root.normalized_path,
-        &source,
+        source,
         source_rowid,
         scan_id,
         fencing_token,
@@ -216,26 +236,22 @@ pub fn scan_source_with<A: ProviderAdapter>(
     }
 }
 
-fn scan_reserved_source_with<A: ProviderAdapter>(
-    adapter: &A, registry: &SourceRegistry<'_>, conn: &Connection, source_id: &SourceId,
+fn scan_reserved_source_with(
+    adapter: &dyn ProviderAdapter, registry: &SourceRegistry<'_>, conn: &Connection, source_id: &SourceId,
     scan_id: i64, fencing_token: i64, generation: Generation,
 ) -> Result<ScanOutcome, ScanError> {
     let store = ScanStore::new(conn);
     let source = registry.get(source_id).map_err(|_| ScanError::Internal)?;
     let Some(source) = source else { return Err(ScanError::SourceNotFound); };
+    // Defense-in-depth (Story 2.2 review): mirror the `scan_source_with`
+    // mismatch guard on the reserved seam.
+    debug_assert_eq!(adapter.provider_id(), source.provider);
     if source.lifecycle_state != SourceLifecycle::Confirmed { return Err(ScanError::NotConfirmed); }
     let source_rowid = ScanStore::source_rowid(source_id).ok_or(ScanError::SourceNotFound)?;
-    // Story 2.1 provider-scannable guard (mirror of scan_source_with): a
-    // reserved Claude Code run must not proceed to Codex parsing — Story 2.2
-    // owns Claude indexing. The reserved run was begin_run'd by the rescan
-    // request handler before reaching here; mark it failed so the run row is
-    // not left for boot recovery and the status API reports the structured
-    // outcome immediately. Health is intentionally NOT changed: a Claude
-    // Source is legitimately unscannable in 2.1, not degraded.
-    if source.provider != CODEX_PROVIDER_ID {
-        let _ = store.fail_run(scan_id, ScanError::ProviderNotScannable.error_code());
-        return Err(ScanError::ProviderNotScannable);
-    }
+    // Story 2.2: the 2.1 `ProviderNotScannable` mirror guard is removed —
+    // Claude is scannable now. Adapter dispatch happened in
+    // `scan_reserved_source`; an unknown provider would have surfaced as
+    // `Internal` before reaching here.
     ensure_not_cancelled(&store, scan_id)?;
     let root = match policy::canonicalize_root(Path::new(&source.normalized_root_path)) {
         Ok(root) => root,
@@ -266,8 +282,8 @@ fn reserved_failure(
 /// The staged body of the scan, split out so the caller can apply the
 /// fail-run-on-error policy uniformly.
 #[allow(clippy::too_many_arguments)]
-fn run_pipeline<A: ProviderAdapter>(
-    adapter: &A,
+fn run_pipeline(
+    adapter: &dyn ProviderAdapter,
     scan_store: &ScanStore<'_>,
     canonical_root: &Path,
     source: &crate::domain::source::Source,
@@ -344,7 +360,12 @@ fn run_pipeline<A: ProviderAdapter>(
                 native_unit_id: unit.native_unit_id,
                 native_locator,
                 content_hash: canonical_content_hash(&unit.title, &unit.body),
-                parser_version: CODEX_MARKDOWN_PARSER_VERSION.to_string(),
+                // Story 2.2: read the parser-version tag from the adapter
+                // (single source of truth, replacing the hard-coded
+                // `CODEX_MARKDOWN_PARSER_VERSION` constant). Codex records
+                // carry `codex-markdown/v1`; Claude records carry
+                // `claude-markdown/v1`.
+                parser_version: adapter.parser_version().to_string(),
                 title: unit.title,
                 body: unit.body,
                 native_project: source.native_project.clone(),
@@ -465,10 +486,9 @@ fn health_for_scan_error(error: &ScanError) -> HealthState {
         | ScanError::ParseFailed
         | ScanError::EnumerationFailed
         | ScanError::EmptyScanWithActiveGeneration => HealthState::Degraded,
-        ScanError::SourceNotFound
-        | ScanError::NotConfirmed
-        | ScanError::Cancelled
-        | ScanError::ProviderNotScannable => HealthState::Unknown,
+        ScanError::SourceNotFound | ScanError::NotConfirmed | ScanError::Cancelled => {
+            HealthState::Unknown
+        }
         ScanError::DirtyAfterValidation | ScanError::CommitCasFailed | ScanError::Internal => {
             HealthState::Error
         }
@@ -647,13 +667,6 @@ fn safe_error_reason(error_code: Option<&str>) -> String {
             "The source changed while Tessera was scanning it.".to_string()
         }
         Some("stale_recovered") => "The previous rescan did not finish.".to_string(),
-        // Story 2.1: a non-scannable provider (Claude Code before 2.2 lands)
-        // is an *expected* outcome, not an internal failure. The provider-
-        // aware text must match what the sync envelope and rescan SSE
-        // terminal event already carry, so the inventory row reads the same
-        // honest message everywhere. Reference the hoisted const so the three
-        // surfaces cannot drift (Story 2.1 review fix).
-        Some("provider_not_scannable") => PROVIDER_NOT_SCANNABLE_MSG.to_string(),
         _ => "Tessera could not complete the last rescan.".to_string(),
     }
 }
@@ -782,4 +795,30 @@ fn metadata_mtime(metadata: &std::fs::Metadata) -> Option<i64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
     Some(duration.as_nanos() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::source::adapter_for;
+
+    /// Story 2.2 review — there is ONE provider→adapter registry. Scan dispatch
+    /// (`adapter_for_scan`) delegates to confirm dispatch
+    /// (`application::source::adapter_for`), so a provider added to one path is
+    /// visible to the other and a provider missing from one is rejected by
+    /// both. Both paths resolve identically for every provider id; an unknown
+    /// id yields `None` on both (so confirm rejects it and scan surfaces
+    /// `Internal`, never a silent mismatch).
+    #[test]
+    fn adapter_for_scan_matches_confirm_registry() {
+        for provider in ["codex", "claude_code", "unknown"] {
+            let scan = adapter_for_scan(provider);
+            let confirm = adapter_for(provider);
+            assert_eq!(
+                scan.as_ref().map(|a| a.provider_id()),
+                confirm.as_ref().map(|a| a.provider_id()),
+                "scan dispatch and confirm registry disagree for provider {provider:?}"
+            );
+        }
+    }
 }

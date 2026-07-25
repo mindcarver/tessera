@@ -275,20 +275,6 @@ pub fn start_rescan(
             Err(ScanError::Cancelled) => {
                 append_rescan_event(&worker_state, &worker_source, scan_id, "cancelled", "Rescan cancelled.");
             }
-            // Story 2.1: ProviderNotScannable is an *expected* 2.1 outcome
-            // (Claude parsing lands in 2.2), not an internal failure. The
-            // rescan SSE terminal event MUST surface the same provider-aware
-            // message text the sync `/api/scan` envelope and the inventory
-            // `latest_error` carry — never the generic "Rescan failed"
-            // message — so every surface reads honestly and the Codex parser
-            // is documented as deliberately not applied. Story 2.1 review
-            // fix: reference the hoisted `PROVIDER_NOT_SCANNABLE_MSG` const
-            // (single source of truth in `application::scan`) so the three
-            // surfaces cannot drift; the rescan-message-consistency test in
-            // `http_api.rs` still pins that they match.
-            Err(ScanError::ProviderNotScannable) => {
-                append_rescan_event(&worker_state, &worker_source, scan_id, "failed", application::scan::PROVIDER_NOT_SCANNABLE_MSG);
-            }
             Err(_) => {
                 append_rescan_event(&worker_state, &worker_source, scan_id, "failed", "Rescan failed. The previous index is unchanged.");
             }
@@ -465,7 +451,6 @@ fn map_scan_error(err: ScanError, source_id: &SourceId) -> ErrorEnvelope {
             ErrorEnvelope::confirm_failed(Some(source_id), "scan")
         }
         ScanError::NotConfirmed => ErrorEnvelope::scan_failed_not_confirmed(source_id),
-        ScanError::ProviderNotScannable => ErrorEnvelope::scan_failed_provider_not_scannable(source_id),
         ScanError::EnumerationFailed
         | ScanError::ReadFailed
         | ScanError::ParseFailed
@@ -741,15 +726,6 @@ mod tests {
         assert_eq!(
             map_scan_error(ScanError::Internal, &source_id).code,
             "internal"
-        );
-        // Story 2.1: a Claude Code (or any non-Codex) Source is not scannable
-        // until 2.2; the guard maps to scan_failed with an accurate message.
-        let not_scannable = map_scan_error(ScanError::ProviderNotScannable, &source_id);
-        assert_eq!(not_scannable.code, "scan_failed");
-        assert!(not_scannable.message.contains("not available yet"));
-        assert_ne!(
-            not_scannable.message,
-            map_scan_error(ScanError::ReadFailed, &source_id).message
         );
         // AD-13: safe messages are non-empty and never carry body/query/creds.
         for env in [

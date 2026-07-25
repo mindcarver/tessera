@@ -183,27 +183,6 @@ impl ErrorEnvelope {
             "scan",
         )
     }
-
-    /// Construct a `scan_failed` envelope for the provider-not-scannable case
-    /// (Story 2.1). Same stable code — the UI keys on `code` only — with an
-    /// accurate message. Claude Code sources are discoverable + confirmable
-    /// in 2.1; their parsing/indexing lands in Story 2.2. The Codex parser is
-    /// never applied to Claude files; this envelope is the safe structured
-    /// outcome the scan pipeline returns when a rescan is triggered before
-    /// 2.2 lands.
-    pub fn scan_failed_provider_not_scannable(source_id: &str) -> Self {
-        // Story 2.1 review fix — reference the hoisted const so the sync
-        // envelope, the rescan SSE terminal event, and the inventory
-        // `latest_error` cannot drift. The const lives in `application::scan`
-        // (the application layer must not depend on http, but http may depend
-        // on application).
-        Self::new(
-            "scan_failed",
-            crate::application::scan::PROVIDER_NOT_SCANNABLE_MSG,
-            Some(source_id),
-            "scan",
-        )
-    }
 }
 
 #[cfg(test)]

@@ -29,15 +29,28 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Codex's four allowlisted memory artifact roles. This is provider metadata,
-/// not inferred from a path or a Markdown body by the application layer.
+/// Provider-declared memory artifact roles. This is provider metadata, not
+/// inferred from a path or a Markdown body by the application layer.
+///
+/// Story 2.2 adds [`ProviderMemoryType::TopicMemory`] for Claude Code's topic
+/// `*.md` files (distinct from `Memory`, which is reserved for `MEMORY.md` —
+/// the auto-managed index). Honest role tagging lets 2.3/2.4 filter across
+/// providers without re-inferring the role from the path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderMemoryType {
+    /// Codex `MEMORY.md` or Claude Code `MEMORY.md` — the auto-managed index.
     Memory,
+    /// Codex `memory_summary.md`.
     MemorySummary,
+    /// Codex `raw_memories.md`.
     RawMemories,
+    /// Codex `rollout_summaries/*.md` direct children.
     RolloutSummary,
+    /// Claude Code topic `*.md` under a project `memory/` dir (Story 2.2).
+    /// Distinct from [`ProviderMemoryType::Memory`] so 2.3/2.4 filtering can
+    /// separate the auto-managed index from user-shaped topic files.
+    TopicMemory,
 }
 
 impl ProviderMemoryType {
@@ -47,6 +60,7 @@ impl ProviderMemoryType {
             Self::MemorySummary => "memory_summary",
             Self::RawMemories => "raw_memories",
             Self::RolloutSummary => "rollout_summary",
+            Self::TopicMemory => "topic_memory",
         }
     }
 }
@@ -304,6 +318,16 @@ pub trait ProviderAdapter: std::fmt::Debug {
     /// The provider's declared coverage level (AD-3). Describes the provider
     /// surface, not a single observation.
     fn coverage_level(&self) -> CoverageLevel;
+
+    /// Parser-version tag persisted onto every canonical record this adapter
+    /// produces (Story 2.2 — single source of truth, replacing the hard-coded
+    /// `CODEX_MARKDOWN_PARSER_VERSION` constant at the record-build site).
+    ///
+    /// A separate tag per provider lets a future grammar bump trigger a reparse
+    /// of that provider's records without touching any other provider's
+    /// identity. Output changes require a deliberate version decision rather
+    /// than silently changing record identities or bodies.
+    fn parser_version(&self) -> &'static str;
 
     /// Discover Candidate Sources for this provider on the local machine.
     ///

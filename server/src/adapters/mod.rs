@@ -8,5 +8,9 @@
 //! Fixture contract anchors (AD-14/AD-3) live at
 //! `server/tests/fixtures/providers/{codex,claude_code}`.
 
-pub mod codex;
 pub mod claude_code;
+pub mod codex;
+/// Shared, provider-agnostic Markdown canonicalizer + path/locator helpers
+/// (Story 2.2 extraction). Re-exported by `codex` for backward compat; new
+/// providers import from this module directly. One parser, many version tags.
+pub mod markdown;

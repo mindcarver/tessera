@@ -572,38 +572,66 @@ fn auto_memory_directory_read_from_claude_config_dir_override() {
 }
 
 // ---------------------------------------------------------------------------
-// Story 2.1 review fix — enumerate_* must HARD-FAIL for claude_code
+// Story 2.2 — enumerate_* is REAL now (the 2.1 hard-fail stubs are gone)
 // ---------------------------------------------------------------------------
 
-/// `enumerate_file_units` returns `Err` for `claude_code` — never empty `Ok`.
-/// Returning empty `Ok` would let a misrouted scan (a future change that
-/// bypasses the `ProviderNotScannable` guard) commit an empty generation as
-/// a false-positive success. The hard-fail turns a guard bypass into a loud
-/// `EnumerationFailed`.
+/// `enumerate_file_units` returns `Ok` with the in-matrix `*.md` units for a
+/// Claude `memory/` dir (was a 2.1 hard-fail stub; the guard is removed).
 #[test]
-fn enumerate_file_units_hard_fails_for_claude_code() {
+fn enumerate_file_units_indexes_direct_child_md_for_claude_code() {
     let adapter = ClaudeCodeAdapter;
-    let err = adapter
-        .enumerate_file_units(std::path::Path::new("/tmp/any"))
-        .expect_err("must Err, not empty Ok");
-    assert!(
-        matches!(err, tessera_lib::domain::ports::provider_adapter::EnumerateError::Unreadable),
-        "expected Unreadable, got {err:?}"
-    );
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::write(root.join("MEMORY.md"), "# memory\n").expect("write memory");
+    std::fs::write(root.join("topic.md"), "# topic\n").expect("write topic");
+    // Out-of-matrix: rejected by name + non-markdown.
+    std::fs::write(root.join("CLAUDE.md"), "rules").expect("write claude");
+    std::fs::write(root.join("notes.txt"), "notes").expect("write txt");
+
+    let units = adapter
+        .enumerate_file_units(root)
+        .expect("claude enumerate succeeds (Story 2.2)");
+    let mut rels: Vec<&str> = units.iter().map(|u| u.relative_path.as_str()).collect();
+    rels.sort();
+    assert_eq!(rels, vec!["MEMORY.md", "topic.md"]);
 }
 
-/// `enumerate_artifacts` returns `Err` for `claude_code` (same rationale as
-/// `enumerate_file_units`).
+/// `enumerate_artifacts` returns `Ok` for a Claude `memory/` dir and rejects
+/// `CLAUDE.md`/`AGENTS.md`/non-`*.md` as `unsupported_artifact` diagnostics.
+/// A missing root still returns `Err(RootUnresolvable)` (the only legitimate
+/// failure path now that Claude is scannable).
 #[test]
-fn enumerate_artifacts_hard_fails_for_claude_code() {
+fn enumerate_artifacts_rejects_instruction_files_and_non_markdown() {
     let adapter = ClaudeCodeAdapter;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::write(root.join("MEMORY.md"), "# memory\n").expect("write memory");
+    std::fs::write(root.join("AGENTS.md"), "rules").expect("write agents");
+    std::fs::write(root.join("data.json"), "{}").expect("write json");
+
+    let observation = adapter
+        .enumerate_artifacts(root)
+        .expect("claude enumerate succeeds");
+    assert_eq!(observation.supported.len(), 1);
+    assert_eq!(observation.supported[0].file.relative_path, "MEMORY.md");
+    let mut diag: Vec<&str> = observation
+        .diagnostics
+        .iter()
+        .map(|d| d.observed_path.as_str())
+        .collect();
+    diag.sort();
+    assert_eq!(diag, vec!["AGENTS.md", "data.json"]);
+
+    // A missing root is the one remaining failure path.
     let err = adapter
-        .enumerate_artifacts(std::path::Path::new("/tmp/any"))
-        .expect_err("must Err, not empty Ok");
-    assert!(
-        matches!(err, tessera_lib::domain::ports::provider_adapter::EnumerateError::Unreadable),
-        "expected Unreadable, got {err:?}"
-    );
+        .enumerate_artifacts(std::path::Path::new(
+            "/this/does/not/exist/tessera-2-2-discover",
+        ))
+        .expect_err("missing root must Err");
+    assert!(matches!(
+        err,
+        tessera_lib::domain::ports::provider_adapter::EnumerateError::RootUnresolvable
+    ));
 }
 
 // ---------------------------------------------------------------------------
