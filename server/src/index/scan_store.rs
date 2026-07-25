@@ -821,6 +821,14 @@ impl QueryStore for ScanStore<'_> {
     /// drop records whose id sorts below the cursor but whose recency rank is
     /// worse.
     ///
+    /// Story 3.2 — the one in-source filter dimension (`memory_type`) appends a
+    /// present-flag predicate of the SAME shape search uses
+    /// (`(?F = 0 OR m.provider_memory_type = ?G)`), so a no-filter request runs
+    /// the same SQL shape as before (the flag short-circuits the OR). The
+    /// filter is applied here in the SQL layer, not in the cursor key: the
+    /// cursor body separately binds it so a filter change mid-pagination
+    /// surfaces as `cursor_stale`.
+    ///
     /// Same JOIN shape as `search_records`: `source_registry` JOIN +
     /// `lifecycle_state = 'confirmed'` + active-generation JOIN. The
     /// confirmed-source guarantee is therefore the SQL layer's, not the
@@ -855,11 +863,12 @@ impl QueryStore for ScanStore<'_> {
                        AND (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) = ?4
                        AND m.record_id > ?5)
                )
+               AND (?6 = 0 OR m.provider_memory_type = ?7)
              ORDER BY
                m.observed_at DESC,
                (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) ASC,
                m.record_id ASC
-             LIMIT ?6",
+             LIMIT ?8",
         )?;
         let page_size = i64::try_from(request.limit() + 1).expect("browse limit is bounded");
         let source_rowid: i64 = match request.source().to_rowid() {
@@ -875,6 +884,13 @@ impl QueryStore for ScanStore<'_> {
             None => 0,
         };
         let cursor_record_id: Option<&str> = after.map(|key| key.record_id.as_str());
+        // Story 3.2 — memory_type present-flag predicate (mirrors search's
+        // `(?N = 0 OR m.provider_memory_type = ?M)` shape). The flag is 1 when
+        // the filter is `Some`; 0 when `None` (the OR short-circuits to true so
+        // a no-filter request runs the same SQL shape).
+        let memory_type_present: i64 = request.memory_type().map_or(0, |_| 1);
+        let memory_type_value: Option<&str> =
+            request.memory_type().map(ProviderMemoryType::as_str);
         let rows = stmt.query_map(
             params![
                 source_rowid,
@@ -882,6 +898,8 @@ impl QueryStore for ScanStore<'_> {
                 cursor_observed_at,
                 cursor_coverage_rank,
                 cursor_record_id,
+                memory_type_present,
+                memory_type_value,
                 page_size,
             ],
             |row| {

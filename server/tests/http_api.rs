@@ -1276,6 +1276,17 @@ fn boot_browse_test_server() -> (u16, Arc<tessera_lib::IndexState>) {
             )
             .expect("codex record");
         }
+        // Story 3.2 — a `topic_memory` record under src_1 so the wire-level
+        // memory-type filter has discriminating data (the three records above
+        // are all `memory`). Newer than rec_new so it sorts first under the
+        // filter (asserts the recency ORDER BY still holds within the filtered
+        // set).
+        conn.execute(
+            "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+             VALUES ('rec_topic', 1, 'gen_1', 'codex', 'section', 'rec_topic', 'file:///fixture#topic', 'hash', 'v1', 'rec_topic', 'body', NULL, 'topic_memory', 'full', 400, 'revision', 'file:///fixture#L1-L2')",
+            [],
+        )
+        .expect("codex topic record");
         // Source 2: confirmed Claude Code, never scanned — exercises the
         // `not_yet_scanned` empty state on the wire.
         conn.execute(
@@ -1372,8 +1383,9 @@ fn browse_wire_contract_paginates_and_reuses_search_result_shape() {
     assert_eq!(page["api_version"], "1");
     let results = page["payload"]["results"].as_array().expect("results array");
     assert_eq!(results.len(), 1, "limit=1 returned one row: {results:?}");
-    // ORDER BY observed_at DESC → rec_new (observed_at=300) sorts first.
-    assert_eq!(results[0]["record_id"], "rec_new");
+    // ORDER BY observed_at DESC → rec_topic (observed_at=400, the Story 3.2
+    // fixture record) sorts first. (rec_new=300, rec_mid=200, rec_old=100.)
+    assert_eq!(results[0]["record_id"], "rec_topic");
     // Provenance fields from SearchResult render on the wire.
     for field in [
         "record_id",
@@ -1405,10 +1417,10 @@ fn browse_wire_contract_paginates_and_reuses_search_result_shape() {
         &format!("GET /api/browse?source=src_1&cursor={cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
     );
     assert!(continuation.starts_with("HTTP/1.1 200"), "got:\n{continuation}");
-    // ORDER BY observed_at DESC → rec_mid (200) sorts next. rec_old (100) is
-    // on page 3 (not exercised here; pagination stability is covered by the
+    // ORDER BY observed_at DESC → rec_new (300) sorts next. rec_mid (200) and
+    // rec_old (100) are on later pages (pagination stability is covered by the
     // application-layer tests).
-    assert!(continuation.contains("rec_mid"), "got:\n{continuation}");
+    assert!(continuation.contains("rec_new"), "got:\n{continuation}");
 
     // Stale cursor: activate a new generation under src_1 → revision changes.
     {
@@ -1550,4 +1562,172 @@ fn browse_wire_rejects_invalid_input() {
         &format!("GET /api/browse?source=src_1&unknown=value HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
     );
     assert!(unknown_key.starts_with("HTTP/1.1 400"), "got:\n{unknown_key}");
+}
+
+// ---------------------------------------------------------------------------
+// Story 3.2 — `/api/browse?memory_type=...` filter on the wire contract.
+//
+// The filter narrows the browse WHERE with `AND m.provider_memory_type = ?`,
+// mirroring Search's predicate shape. An invalid value → 400 (phase `browse`);
+// the cursor binds the filter so a filter change mid-pagination → 409
+// `cursor_stale`. The per-confirmed-source sidecar is unaffected by the filter
+// (mirrors search's "sidecar stays unfiltered" guarantee).
+// ---------------------------------------------------------------------------
+
+/// Story 3.2 AC — `/api/browse?source=src_1&memory_type=topic_memory` narrows
+/// the result set to the topic_memory record on the wire, the cursor binds the
+/// filter (b4. envelope), and "Load more" stays within the filtered snapshot.
+/// The sidecar still lists every confirmed source (the filter does not narrow
+/// availability info).
+#[test]
+fn browse_wire_memory_type_filter_narrows_results() {
+    let (port, _state) = boot_browse_test_server();
+    // Baseline: no filter → all four records (rec_topic, rec_new, rec_mid,
+    // rec_old).
+    let baseline = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(baseline.starts_with("HTTP/1.1 200"), "baseline: {baseline}");
+    let baseline_json: serde_json::Value =
+        serde_json::from_str(baseline.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(
+        baseline_json["payload"]["results"].as_array().expect("results").len(),
+        4,
+        "baseline has all four records",
+    );
+
+    // Filtered: memory_type=topic_memory → only rec_topic.
+    let filtered = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&memory_type=topic_memory&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(filtered.starts_with("HTTP/1.1 200"), "filtered: {filtered}");
+    let filtered_json: serde_json::Value =
+        serde_json::from_str(filtered.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    let results = filtered_json["payload"]["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1, "only the topic_memory record matches: {results:?}");
+    assert_eq!(results[0]["record_id"].as_str(), Some("rec_topic"));
+
+    // Filtered to memory → the three memory records, in observed_at DESC order.
+    let memory_filter = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&memory_type=memory&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(memory_filter.starts_with("HTTP/1.1 200"), "memory filter: {memory_filter}");
+    let memory_json: serde_json::Value =
+        serde_json::from_str(memory_filter.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    let memory_results = memory_json["payload"]["results"].as_array().expect("results");
+    let memory_ids: Vec<&str> = memory_results
+        .iter()
+        .map(|value| value["record_id"].as_str().expect("record_id"))
+        .collect();
+    assert_eq!(memory_ids, vec!["rec_new", "rec_mid", "rec_old"], "memory records only, observed_at DESC: {memory_ids:?}");
+
+    // The sidecar lists every confirmed source regardless of the filter
+    // (Design Notes: sidecar stays unfiltered, mirrors Search 2.4).
+    let sources = filtered_json["payload"]["sources"].as_array().expect("sidecar");
+    let source_ids: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|entry| entry["source_id"].as_str().expect("source_id"))
+        .collect();
+    assert!(source_ids.contains("src_1"), "src_1 in filtered sidecar: {source_ids:?}");
+    assert!(source_ids.contains("src_2"), "src_2 in filtered sidecar: {source_ids:?}");
+}
+
+/// Story 3.2 AC — `/api/browse?memory_type=memory` pagination: the cursor
+/// binds the filter so "Load more" continues within the filtered snapshot,
+/// never leaking records of other types in on page 2.
+#[test]
+fn browse_wire_memory_type_filter_paginates_within_filtered_snapshot() {
+    let (port, _state) = boot_browse_test_server();
+    // Page 1 (limit 1): one memory record + a continuation cursor.
+    let page1 = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&memory_type=memory&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(page1.starts_with("HTTP/1.1 200"), "page1: {page1}");
+    let page1_json: serde_json::Value =
+        serde_json::from_str(page1.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(page1_json["payload"]["results"].as_array().expect("results").len(), 1);
+    // The b4. envelope prefix is on the wire.
+    let cursor = page1_json["payload"]["next_cursor"]
+        .as_str()
+        .expect("continuation cursor");
+    assert!(cursor.starts_with("b4."), "cursor must use the b4. envelope (post-3.2): {cursor}");
+
+    // Page 2 (continuation): the next memory record; no topic_memory leak.
+    let page2 = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&memory_type=memory&cursor={cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(page2.starts_with("HTTP/1.1 200"), "page2: {page2}");
+    assert!(
+        !page2.contains("rec_topic"),
+        "page 2 under memory_type=memory must NOT contain the topic_memory record: {page2}",
+    );
+}
+
+/// Story 3.2 AC — a cursor bound to one `memory_type` is rejected as
+/// `cursor_stale` (409) when the next-page request carries a different
+/// `memory_type` (mirrors Search's "resolve filter once on page 1" invariant).
+#[test]
+fn browse_wire_memory_type_filter_change_returns_cursor_stale() {
+    let (port, _state) = boot_browse_test_server();
+    // Issue a cursor under memory_type=memory (page 1, limit 1).
+    let page1 = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&memory_type=memory&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(page1.starts_with("HTTP/1.1 200"), "page1: {page1}");
+    let cursor = page1
+        .split("\"next_cursor\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("continuation cursor");
+
+    // Replay that cursor under memory_type=topic_memory → 409 cursor_stale.
+    let stale = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&memory_type=topic_memory&cursor={cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(stale.starts_with("HTTP/1.1 409"), "got:\n{stale}");
+    assert!(stale.contains("\"code\":\"cursor_stale\""), "got:\n{stale}");
+    assert!(stale.contains("\"phase\":\"browse\""), "phase=browse: {stale}");
+}
+
+/// Story 3.2 I/O matrix — an unknown `memory_type` value → 400 `bad_request`,
+/// mirroring Search's invalid-memory-type behavior so the two surfaces share
+/// one vocabulary. (The HTTP layer's strict-parse error carries
+/// `phase:"transport"` because the rejection happens before the browse
+/// handler runs — that matches Search's wire behavior for the same case.)
+#[test]
+fn browse_wire_rejects_unknown_memory_type_with_bad_request() {
+    let (port, _state) = boot_browse_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&memory_type=bogus_type&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 400"), "got:\n{response}");
+    assert!(response.contains("\"code\":\"bad_request\""), "got:\n{response}");
+}
+
+/// Story 3.2 — a 3.1-era `b3.` cursor is rejected as `cursor_stale` (409) at
+/// the prefix check (the envelope moved to `b4.` so the filter could bind
+/// in). The UI's existing `cursor_stale` recovery path re-runs page 1.
+#[test]
+fn browse_wire_rejects_legacy_b3_cursor_as_stale() {
+    let (port, _state) = boot_browse_test_server();
+    // A well-formed b3. envelope from a 3.1 client. The prefix check rejects
+    // it as cursor_stale before any decode is attempted.
+    let payload = r#"{"version":3,"source":"src_1","revision":"deadbeef","last_record_id":"rec_a","last_observed_at":0,"last_coverage_full":false}"#;
+    let hex: String = payload.bytes().map(|byte| format!("{byte:02x}")).collect();
+    let legacy_cursor = format!("b3.{hex}");
+    let response = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&cursor={legacy_cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 409"), "got:\n{response}");
+    assert!(response.contains("\"code\":\"cursor_stale\""), "got:\n{response}");
+    assert!(response.contains("\"phase\":\"browse\""), "phase=browse: {response}");
 }

@@ -1,5 +1,6 @@
 /**
- * Tessera — typed TS client for the query-less Browse endpoint (Story 3.1).
+ * Tessera — typed TS client for the query-less Browse endpoint (Story 3.1 +
+ * Story 3.2).
  *
  * Mirrors the Rust types in `server/src/domain/query.rs`
  * (`BrowseRequest` / `BrowsePage` / `BrowseEmptyState`) and reuses the
@@ -11,21 +12,33 @@
  * - **Versioned envelope:** response is validated against `API_VERSION`; any
  *   drift throws `TesseraApiError` with code `api_contract`.
  * - **No query:** browse is query-less. The wire params are exactly `source`,
- *   `cursor`, `limit` — no `q`.
+ *   `cursor`, `limit`, and (Story 3.2) an optional `memory_type` — no `q`.
  * - **Confirmed-source only:** a non-confirmed / unknown source surfaces as
  *   `bad_request` (phase `browse`) from the server. The client does not need
  *   to filter; it renders the structured error envelope like any other API
  *   failure.
- * - **Cursor envelope prefix:** browse cursors carry a distinct `b3.<hex>`
- *   prefix so a cross-type (search `v3.<hex>`) cursor is rejected as
- *   `cursor_stale` server-side. The client treats `cursor_stale` the same way
- *   search does (re-run page 1 from a fresh snapshot).
+ * - **Memory-type filter (Story 3.2):** the client validates the
+ *   `memoryType` argument against `PROVIDER_MEMORY_TYPES` BEFORE sending, so
+ *   an unknown value never crosses the wire — mirroring the server-side
+ *   vocabulary check while giving the UI a single failure mode.
+ * - **Cursor envelope prefix:** browse cursors carry a distinct `b4.<hex>`
+ *   prefix (Story 3.2 bumped `b3.` → `b4.` so the memory_type could bind into
+ *   the cursor) so a cross-type (search `v3.<hex>`) cursor or a 3.1-era `b3.`
+ *   cursor is rejected as `cursor_stale` server-side. The client treats
+ *   `cursor_stale` the same way search does (re-run page 1 from a fresh
+ *   snapshot).
+ * - **Response shape unchanged:** `BrowsePage` does NOT echo `memory_type`
+ *   (it is a request param only), so `isBrowseEnvelope` is unchanged. A
+ *   filter-narrows-to-zero page surfaces `empty_state = "no_indexable_memory"`
+ *   on page 1 — the same state 3.1 uses for "scanned, zero records".
  */
 
 import { API_VERSION, apiGet, type Envelope, type TesseraApiError } from "./client";
 import {
+  PROVIDER_MEMORY_TYPES,
   isSearchResult,
   isSourceQueryStatus,
+  type ProviderMemoryType,
   type SearchResult,
   type SourceQueryStatus,
 } from "./search";
@@ -33,8 +46,10 @@ import {
 // Re-export the shared row / sidecar shapes so feature code can import
 // everything from one place. The browse contract reuses both verbatim — there
 // is no BrowseResult type (Design Notes — "Why reuse `SearchResult` as-is").
-export type { SearchResult, SourceQueryStatus };
-export { isSearchResult, isSourceQueryStatus };
+// Story 3.2 re-exports `PROVIDER_MEMORY_TYPES` + `ProviderMemoryType` so the
+// Browse filter UI imports the vocabulary from a single place.
+export type { SearchResult, SourceQueryStatus, ProviderMemoryType };
+export { isSearchResult, isSourceQueryStatus, PROVIDER_MEMORY_TYPES };
 
 /**
  * Browse's three distinct empty-collection states (Epic 3 / FR-16). Mirrors
@@ -89,17 +104,39 @@ export interface BrowsePage {
 /**
  * Browse the query-less list of records for a single confirmed source.
  *
- * @param sourceId  `src_<n>` handle of the source to browse.
- * @param cursor    Continuation cursor from a prior page's `next_cursor`, or
- *                  `undefined` for page 1.
- * @param limit     Page size (defaults to 20, bounded by the server).
+ * @param sourceId    `src_<n>` handle of the source to browse.
+ * @param memoryType  Story 3.2 — optional memory-type filter. Validated
+ *                    against `PROVIDER_MEMORY_TYPES` BEFORE sending so an
+ *                    unknown value never crosses the wire (mirrors the
+ *                    server-side vocabulary check from a single source of
+ *                    truth). `undefined` restores the 3.1 default scope.
+ * @param cursor      Continuation cursor from a prior page's `next_cursor`,
+ *                    or `undefined` for page 1.
+ * @param limit       Page size (defaults to 20, bounded by the server).
  */
 export async function browseMemories(
   sourceId: string,
+  memoryType?: ProviderMemoryType,
   cursor?: string,
   limit = 20,
 ): Promise<Envelope<BrowsePage>> {
   const params = new URLSearchParams({ source: sourceId });
+  if (memoryType) {
+    // Defense-in-depth: reject an unknown value before it crosses the wire.
+    // The TypeScript type already constrains callers, but a runtime guard
+    // keeps a buggy caller (e.g. one widening a string into the typed slot)
+    // from smuggling an arbitrary value into the URL — the server would
+    // reject it too, but failing here gives a single failure mode.
+    if (!PROVIDER_MEMORY_TYPES.includes(memoryType)) {
+      throw {
+        code: "api_contract",
+        message: "Tessera rejected an unknown memory type before sending.",
+        source_id: null,
+        phase: "browse",
+      } satisfies TesseraApiError;
+    }
+    params.set("memory_type", memoryType);
+  }
   if (cursor) params.set("cursor", cursor);
   params.set("limit", String(limit));
   const value = await apiGet(`/api/browse?${params.toString()}`);
