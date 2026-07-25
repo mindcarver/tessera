@@ -29,6 +29,14 @@ test("keyboard rescan posts successfully and announces ordered progress", async 
   await page.route("**/api/sources/rescan", async (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: { api_version: "1", job_id: "job_1", source_id: "src_1", sequence: 1, state: "queued", message: "Rescan queued." } }) }));
   await page.goto("/");
 
+  // Story 2.1: Sources UI copy must stay provider-agnostic — the empty-state
+  // line carries "Agent Memory" and never "Codex" (or any other provider
+  // name), so adding a second provider does not require a copy sweep. Pinned
+  // by an assertion so a future Codex-only regression fails loudly.
+  const candidateRegion = page.getByRole("region", { name: "Discovered candidate sources" });
+  await expect(candidateRegion).toContainText("Agent Memory");
+  await expect(candidateRegion).not.toContainText("Codex");
+
   const rescan = page.getByRole("button", { name: "Rescan", exact: true });
   await expect(rescan).toBeVisible();
   const rescanResponse = page.waitForResponse(
@@ -132,4 +140,82 @@ test("keyboard search renders provenance, empty states, pagination, and safe API
   await input.fill("   ");
   await input.press("Enter");
   await expect(page.getByRole("alert")).toHaveText("The request did not match Tessera's search contract.");
+});
+
+/**
+ * Story 2.1 pass-2 review fix — exercise the TS basis path for Claude Code
+ * discovery. Mocks `/api/sources/discover` to return candidates with each
+ * `claude_*` basis (`claude_default_home`, `claude_config_dir_env`,
+ * `claude_auto_memory_dir`) and asserts every candidate renders in the
+ * "Discovered candidate sources" region.
+ *
+ * This exercises `asDiscoveryBasis` / `asCandidateSource` /
+ * `VALID_DISCOVERY_BASES` in `src/api/discover.ts` so a dropped `claude_*`
+ * entry in the runtime Set causes `discoverSources()` to throw an
+ * `api_contract` error (rejected by `.every((c) => asCandidateSource(c) !== null)`),
+ * which the Sources UI renders as an error state rather than a candidate
+ * list — the test would fail at the `claude_code` text assertion in that
+ * case.
+ *
+ * The run stays hermetic: `playwright.config.ts` already pins
+ * `CLAUDE_CONFIG_DIR` at an empty fixture; the route mock overrides discover
+ * regardless of what the server-side adapter finds.
+ */
+test("renders Claude Code candidates with each claude_* discovery basis", async ({ page }) => {
+  const claudeCandidates = {
+    api_version: "1",
+    payload: [
+      {
+        provider: "claude_code",
+        root_path: "/fixture/claude/auto",
+        basis: "claude_auto_memory_dir",
+        coverage_level: "full",
+        native_project: null,
+      },
+      {
+        provider: "claude_code",
+        root_path: "/fixture/claude/default",
+        basis: "claude_default_home",
+        coverage_level: "full",
+        native_project: "proj-a",
+      },
+      {
+        provider: "claude_code",
+        root_path: "/fixture/claude/env",
+        basis: "claude_config_dir_env",
+        coverage_level: "full",
+        native_project: "proj-b",
+      },
+    ],
+  };
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify(claudeCandidates) }),
+  );
+  // Inventory can stay empty — this test only exercises the candidate path.
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.goto("/");
+
+  const candidateRegion = page.getByRole("region", { name: "Discovered candidate sources" });
+
+  // Each candidate must render with the provider name and its full-coverage
+  // description. A dropped `claude_*` basis in `VALID_DISCOVERY_BASES` would
+  // make `asCandidateSource` reject the whole payload, `discoverSources()`
+  // would throw an `api_contract` error, and the Sources UI would render an
+  // error `role="alert"` instead of a candidate list — every assertion below
+  // would fail in that case.
+  await expect(candidateRegion).toContainText("claude_code");
+  await expect(candidateRegion).toContainText("Full coverage");
+
+  // The load-bearing assertion: all three candidates render as list items.
+  // The list only renders when candidates.kind === "ok" AND value.length > 0,
+  // and the count matches the three basis variants we injected.
+  const items = candidateRegion.getByRole("listitem");
+  await expect(items).toHaveCount(3);
+
+  // Belt-and-suspenders: assert no error alert rendered. If `asDiscoveryBasis`
+  // rejected any `claude_*` basis, the discover promise would reject and the
+  // UI would render `<p role="alert">` with the api_contract message.
+  await expect(candidateRegion.getByRole("alert")).toHaveCount(0);
 });

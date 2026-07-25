@@ -54,6 +54,31 @@ use crate::policy;
 /// revision is UPDATEd onto the row once the manifest is snapshotted.
 const PLACEHOLDER_MANIFEST_REVISION: &str = "pending";
 
+/// Provider id of the only provider scannable in Story 2.1. The scan pipeline
+/// hard-codes the Codex adapter / Codex Markdown parser; Story 2.2 lands
+/// Claude parsing. The provider-scannable guard at the top of each scan entry
+/// point uses this constant so a `claude_code` Source cannot be parsed by the
+/// Codex parser (spec I/O matrix — "Codex parser not applied").
+///
+/// Story 2.1 review fix: this is now an alias for `CodexAdapter::PROVIDER_ID`
+/// (the canonical single source of truth) so a Codex rename cannot desync the
+/// scan guard from the registry in `application::source::adapter_for`.
+const CODEX_PROVIDER_ID: &str = CodexAdapter::PROVIDER_ID;
+
+/// Story 2.1 review fix — the provider-aware scan-failed message. The same
+/// text appears on three surfaces:
+/// - the sync `/api/scan` envelope (`ErrorEnvelope::scan_failed_provider_not_scannable`)
+/// - the rescan SSE terminal event (`http::start_rescan`'s worker branch)
+/// - the inventory `latest_error` (derived from `scan_runs.error_code` via
+///   `safe_error_reason`)
+///
+/// Hoisted to one `pub(crate)` const here so the surfaces cannot drift. The
+/// application layer is the natural home (it owns `safe_error_reason`); the
+/// http layer references it via `crate::application::scan::PROVIDER_NOT_SCANNABLE_MSG`
+/// rather than the reverse — application must not depend on http.
+pub(crate) const PROVIDER_NOT_SCANNABLE_MSG: &str =
+    "This provider's scan is not available yet; indexing for it lands in a later release.";
+
 /// A single manifest entry: `(relative_path, canonical_target, size, mtime)`
 /// where `mtime` is nanoseconds since the Unix epoch (sub-second precision —
 /// AD-34). Including the canonical target binds the manifest to the exact
@@ -111,6 +136,17 @@ pub fn scan_source_with<A: ProviderAdapter>(
         return Err(ScanError::NotConfirmed);
     }
     let source_rowid = ScanStore::source_rowid(source_id).ok_or(ScanError::SourceNotFound)?;
+
+    // Story 2.1 provider-scannable guard: only Codex is parseable in this
+    // slice. Claude Code discovery + confirm ship in 2.1, but Claude parsing
+    // and indexing are Story 2.2. The guard must fire BEFORE root validation
+    // (no health change) and BEFORE begin_run (no run row), so a confirmed
+    // Claude Source legitimately retains coverage=Full / records=0 /
+    // health=unknown until 2.2, and the Codex parser is never applied to
+    // Claude files (spec I/O matrix — "Codex parser not applied").
+    if source.provider != CODEX_PROVIDER_ID {
+        return Err(ScanError::ProviderNotScannable);
+    }
 
     // Re-validate the root (AD-4/NFR-5/6). A deleted / non-dir root fails the
     // scan BEFORE begin_run (no run row — root validation precedes ownership);
@@ -189,6 +225,17 @@ fn scan_reserved_source_with<A: ProviderAdapter>(
     let Some(source) = source else { return Err(ScanError::SourceNotFound); };
     if source.lifecycle_state != SourceLifecycle::Confirmed { return Err(ScanError::NotConfirmed); }
     let source_rowid = ScanStore::source_rowid(source_id).ok_or(ScanError::SourceNotFound)?;
+    // Story 2.1 provider-scannable guard (mirror of scan_source_with): a
+    // reserved Claude Code run must not proceed to Codex parsing — Story 2.2
+    // owns Claude indexing. The reserved run was begin_run'd by the rescan
+    // request handler before reaching here; mark it failed so the run row is
+    // not left for boot recovery and the status API reports the structured
+    // outcome immediately. Health is intentionally NOT changed: a Claude
+    // Source is legitimately unscannable in 2.1, not degraded.
+    if source.provider != CODEX_PROVIDER_ID {
+        let _ = store.fail_run(scan_id, ScanError::ProviderNotScannable.error_code());
+        return Err(ScanError::ProviderNotScannable);
+    }
     ensure_not_cancelled(&store, scan_id)?;
     let root = match policy::canonicalize_root(Path::new(&source.normalized_root_path)) {
         Ok(root) => root,
@@ -418,9 +465,10 @@ fn health_for_scan_error(error: &ScanError) -> HealthState {
         | ScanError::ParseFailed
         | ScanError::EnumerationFailed
         | ScanError::EmptyScanWithActiveGeneration => HealthState::Degraded,
-        ScanError::SourceNotFound | ScanError::NotConfirmed | ScanError::Cancelled => {
-            HealthState::Unknown
-        }
+        ScanError::SourceNotFound
+        | ScanError::NotConfirmed
+        | ScanError::Cancelled
+        | ScanError::ProviderNotScannable => HealthState::Unknown,
         ScanError::DirtyAfterValidation | ScanError::CommitCasFailed | ScanError::Internal => {
             HealthState::Error
         }
@@ -599,6 +647,13 @@ fn safe_error_reason(error_code: Option<&str>) -> String {
             "The source changed while Tessera was scanning it.".to_string()
         }
         Some("stale_recovered") => "The previous rescan did not finish.".to_string(),
+        // Story 2.1: a non-scannable provider (Claude Code before 2.2 lands)
+        // is an *expected* outcome, not an internal failure. The provider-
+        // aware text must match what the sync envelope and rescan SSE
+        // terminal event already carry, so the inventory row reads the same
+        // honest message everywhere. Reference the hoisted const so the three
+        // surfaces cannot drift (Story 2.1 review fix).
+        Some("provider_not_scannable") => PROVIDER_NOT_SCANNABLE_MSG.to_string(),
         _ => "Tessera could not complete the last rescan.".to_string(),
     }
 }

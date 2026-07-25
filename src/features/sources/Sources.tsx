@@ -84,9 +84,9 @@ export function Sources(): ReactElement {
     <p aria-live="polite" data-testid="rescan-progress" className="visually-hidden-text">{message}</p>
     <section aria-label="Discovered candidate sources">
       <h3>Candidates</h3>
-      {candidates.kind === "loading" ? <p>Looking for supported Codex sources…</p> : null}
+      {candidates.kind === "loading" ? <p>Looking for supported Agent Memory sources…</p> : null}
       {candidates.kind === "error" ? <p role="alert">{candidates.message}</p> : null}
-      {candidates.kind === "ok" && candidates.value.length === 0 ? <p>No supported Codex Agent Memory sources were found on this machine.</p> : null}
+      {candidates.kind === "ok" && candidates.value.length === 0 ? <p>No supported Agent Memory sources were found on this machine.</p> : null}
       {candidates.kind === "ok" ? <ul>{candidates.value.map((candidate) => <li key={`${candidate.provider}:${candidate.root_path}`}><strong>{candidate.provider}</strong> — {describeCoverage(candidate.coverage_level)} <button type="button" onClick={() => resolveCandidate(candidate, "confirm")}>Confirm</button> <button type="button" onClick={() => resolveCandidate(candidate, "reject")}>Reject</button></li>)}</ul> : null}
     </section>
     <section aria-label="Source inventory" aria-busy={inventory.kind === "loading"}>

@@ -20,6 +20,7 @@
 //! double-source risk by treating the adapter as authoritative at confirm
 //! time.
 
+use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::codex::CodexAdapter;
 use crate::domain::ports::provider_adapter::{CandidateSource, ProviderAdapter};
 use crate::domain::source::{
@@ -47,13 +48,23 @@ pub enum SourceError {
     Internal,
 }
 
-/// Resolve the provider adapter for a provider id. MVP only wires Codex; a
-/// future adapter registry (Epic 2) replaces the match without changing the
-/// return shape. Returns `None` for unknown providers so confirm fails with
-/// `ConfirmFailed` rather than crashing.
-fn adapter_for(provider: &str) -> Option<CodexAdapter> {
+/// Resolve the provider adapter for a provider id. Story 2.1 widens this from
+/// the mono-Codex match to a multi-provider registry so Claude Code candidates
+/// route through the same confirm pipeline. Returns `None` for unknown
+/// providers so confirm fails with `ConfirmFailed` rather than crashing.
+///
+/// The Design Notes prefer `Option<Box<dyn ProviderAdapter>>` (matches the
+/// architecture's "adapter registry" language); each call returns a freshly
+/// boxed unit struct, but the unit structs are zero-sized so the heap cost is
+/// negligible. The boxed trait object preserves the existing confirm/reject
+/// dispatch shape — only the registry width changes.
+fn adapter_for(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
     match provider {
-        "codex" => Some(CodexAdapter),
+        // Reference Codex's canonical provider-id constant (single source of
+        // truth) so a rename cannot desync the registry from the scan guard,
+        // which uses the same constant. See `CodexAdapter::PROVIDER_ID`.
+        CodexAdapter::PROVIDER_ID => Some(Box::new(CodexAdapter)),
+        "claude_code" => Some(Box::new(ClaudeCodeAdapter)),
         _ => None,
     }
 }
@@ -61,13 +72,22 @@ fn adapter_for(provider: &str) -> Option<CodexAdapter> {
 /// Discover local Candidate Sources (Story 1.2; moved here from
 /// `application/mod.rs` per the spec's "application 内联"兑现 Note).
 ///
-/// Stateless orchestrator over the registered provider adapters. Today only
-/// Codex is wired. Returns the union of each adapter's `discover()`; an empty
-/// result is NOT an error and means "no supported source on this machine right
-/// now".
+/// Stateless orchestrator over the registered provider adapters. Story 2.1
+/// widens this from Codex-only to the union of every registered adapter's
+/// `discover()`, so Codex and Claude Code candidates surface alongside each
+/// other. An empty result is NOT an error and means "no supported source on
+/// this machine right now".
 pub fn discover_sources() -> Vec<CandidateSource> {
-    let codex = CodexAdapter;
-    codex.discover()
+    let mut all = Vec::new();
+    all.extend(CodexAdapter.discover());
+    all.extend(ClaudeCodeAdapter.discover());
+    // Deterministic cross-provider ordering: stable by `(provider, root_path)`
+    // so UI lists do not flicker between boots. Within a provider, each
+    // adapter already emits sorted candidates.
+    all.sort_by(|a, b| {
+        (a.provider.as_str(), a.root_path.as_str()).cmp(&(b.provider.as_str(), b.root_path.as_str()))
+    });
+    all
 }
 
 /// Confirm a Candidate Source (AD-4 "allowlist 入边界" action).
@@ -217,12 +237,17 @@ fn flip_lifecycle(
 mod tests {
     use super::*;
 
-    /// adapter_for returns the Codex adapter for the known provider id and
-    /// None for an unknown one. This is the precondition for coverage being a
-    /// single source of truth (Design Notes — "coverage 单一事实源").
+    /// adapter_for returns the Codex and Claude Code adapters for their known
+    /// provider ids and None for an unknown one. This is the precondition for
+    /// coverage being a single source of truth (Design Notes — "coverage 单一
+    /// 事实源") and for the multi-provider confirm/dispatch path Story 2.1
+    /// ships.
     #[test]
     fn adapter_for_returns_codex_for_known_provider() {
-        assert!(adapter_for("codex").is_some());
+        let codex = adapter_for("codex").expect("codex registered");
+        assert_eq!(codex.provider_id(), "codex");
+        let claude = adapter_for("claude_code").expect("claude_code registered");
+        assert_eq!(claude.provider_id(), "claude_code");
         assert!(adapter_for("unknown").is_none());
     }
 
@@ -236,5 +261,18 @@ mod tests {
         let _ = format!("{e:?}");
         let e = SourceError::Internal;
         let _ = format!("{e:?}");
+    }
+
+    /// Story 2.1 review fix — `CodexAdapter::PROVIDER_ID` is the canonical
+    /// provider id used in BOTH the registry match arm (`adapter_for`) and the
+    /// scan guard (`application::scan`). Pin that the constant equals the
+    /// trait's `provider_id()` so a rename cannot desync the two surfaces.
+    #[test]
+    fn codex_provider_id_constant_matches_trait_provider_id() {
+        assert_eq!(CodexAdapter::PROVIDER_ID, CodexAdapter.provider_id());
+        // The match arm in `adapter_for` references the same constant; verify
+        // it routes the canonical id to the Codex adapter.
+        let adapter = adapter_for(CodexAdapter::PROVIDER_ID).expect("codex registered");
+        assert_eq!(adapter.provider_id(), CodexAdapter::PROVIDER_ID);
     }
 }

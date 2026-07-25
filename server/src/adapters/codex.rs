@@ -67,7 +67,15 @@ use crate::domain::ports::provider_adapter::{
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodexAdapter;
 
-const PROVIDER_ID: &str = "codex";
+impl CodexAdapter {
+    /// Canonical provider id for Codex (Story 2.1 review fix). The single
+    /// source of truth referenced by both the multi-provider registry
+    /// (`application::source::adapter_for`) and the Story 2.1 provider-
+    /// scannable scan guard (`application::scan`), so a rename cannot desync
+    /// the scan guard from the registry. Mirrors the const-on-adapter pattern
+    /// the Codex slice already uses for `CODEX_MARKDOWN_PARSER_VERSION`.
+    pub const PROVIDER_ID: &'static str = "codex";
+}
 
 /// The three known first-level filenames in the Supported Artifact Matrix
 /// (AD-11). Only these exact names at the root's first level are indexed;
@@ -80,7 +88,7 @@ const ROLLOUT_SUMMARIES_DIR: &str = "rollout_summaries";
 
 impl ProviderAdapter for CodexAdapter {
     fn provider_id(&self) -> &'static str {
-        PROVIDER_ID
+        Self::PROVIDER_ID
     }
 
     fn coverage_level(&self) -> CoverageLevel {
@@ -154,7 +162,7 @@ impl CodexAdapter {
             return Vec::new();
         };
         vec![CandidateSource {
-            provider: PROVIDER_ID.to_string(),
+            provider: Self::PROVIDER_ID.to_string(),
             root_path: path_str.to_string(),
             basis,
             coverage_level: self.coverage_level(),

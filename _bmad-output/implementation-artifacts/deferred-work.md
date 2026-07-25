@@ -87,3 +87,15 @@ Tauri 移除、传输改为 loopback-only HTTP（tiny_http）后，上述条目�
 - 读时 containment 重校验失败接到 `fail_run` 而非跳过该文件（`server/src/application/scan.rs:184-190`）——spec Block If 字面语义是"逃逸文件跳过不索引"；需真实并发改名竞态才可触发，与本次 review decision 2（读时 realpath vs 枚举 manifest 粒度不对齐）同根因，随其修订一并处理。
 - boot 回收测试仅覆盖 `staging` 一种 stale 状态、单 source（`server/tests/scan_pipeline.rs:532-553`）——`queued/running/committing` 回收路径与多 source GC 隔离无测试；回收逻辑本身已被单路径真实执行验证，属测试加固。
 - 损坏的 `tessera_meta.active_generation`（指向不存在的 generation）被静默报 0 记录（`server/src/index/scan_store.rs:414-425`）——正常路径不可达（CAS 单事务写入 + GC 保留 active，仅外部 DB 编辑可产生），但与同模块 `latest_run` 的"损坏要响亮"原则不一致；4.x 索引重建主题落地时一并处理。
+
+## Deferred from: code review of spec-2-1-claude-discover (pass 2, 2026-07-25)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-claude-discover.md`
+  summary: `ClaudeCodeAdapter::enumerate_*` hard-fails with `EnumerateError::Unreadable`, whose documented meaning is "a directory inside the root could not be read" — a misleading diagnostic if the scan guard is ever bypassed.
+  evidence: The loud-fail itself holds (a misrouted scan errors rather than silently indexing), so this is diagnostic-only. `EnumerateError` has no semantically-correct "provider unsupported" variant today. Revisit when Story 2.2 implements real Claude enumeration (the enumerate path will be replaced then).
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-claude-discover.md`
+  summary: On the reserved-rescan path, `store.fail_run(...)` for `ProviderNotScannable` discards its `Result` (`let _ =`), so a SQLite write failure could leave the run row non-terminal and let boot recovery re-label it `stale_recovered`, overriding the provider-aware inventory message.
+  evidence: `server/src/application/scan.rs` reserved guard. The `let _ =` pattern matches the file's existing convention at other sites; the `stale_recovered` override only triggers on a DB write failure during `fail_run` (narrow). Low severity, consistent with current style.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-claude-discover.md`
+  summary: Sync `POST /api/scan` on a `claude_code` source leaves no persistent trace (no `scan_runs` row), so the inventory `latest_error` only reflects rescan failures, not sync-scan failures — an unobvious asymmetry.
+  evidence: The sync guard fires before `begin_run` by design (spec scopes the inventory surface to "when a rescan is triggered"). The asymmetry is undocumented. Document it, or have the sync guard write a failed row if cross-entry-point consistency is later desired.
