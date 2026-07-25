@@ -4,10 +4,10 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::ports::provider_adapter::ProviderMemoryType;
-use crate::domain::ports::query_store::{QueryStore, SearchCursorKey};
+use crate::domain::ports::query_store::{BrowseCursorKey, QueryStore, SearchCursorKey};
 use crate::domain::query::{
-    SearchEmptyState, SearchPage, SearchRequest, SourceQueryStatus, SourceQueryStatusKind,
-    MAX_CURSOR_BYTES,
+    BrowseEmptyState, BrowsePage, BrowseRequest, SearchEmptyState, SearchPage, SearchRequest,
+    SourceQueryStatus, SourceQueryStatusKind, MAX_CURSOR_BYTES,
 };
 use crate::domain::scan::ScanRunState;
 use crate::domain::source::{HealthState, SourceId, SourceLifecycle};
@@ -136,6 +136,215 @@ pub fn search(
         empty_state(registry, &store)?
     } else { None };
     Ok(SearchPage::new(results, next_cursor, empty_state, sources))
+}
+
+// ---------------------------------------------------------------------------
+// Story 3.1 — query-less Browse entry.
+//
+// `browse()` mirrors `search()`'s contract mechanics (revision-bound cursor,
+// limit+1 truncation, per-confirmed-source sidecar, three-state empty
+// derivation) but is query-less and scoped to a single confirmed source. The
+// cursor binds to the SAME index revision (FNV-1a over confirmed sources) so
+// any generation change → `cursor_stale`, and carries a distinct version
+// prefix (`b3.<hex>`) so decoding a cross-type (search) cursor yields
+// `CursorStale` rather than `BadRequest` — mirroring the existing v1/v2
+// rejection path's choice of `CursorStale` for forward-compatible recovery
+// (the existing UI `cursor_stale` recovery path re-runs page 1, which is the
+// correct outcome under a cross-type cursor swap).
+//
+// The empty-state derivation reads ONLY the browsed source's scan facts
+// (active generation + latest run state), reusing the per-source facts
+// already aggregated by `list_inventory`/`ScanStore` (Design Notes /
+// Boundaries — "derived from the browsed source's scan facts"). The three
+// states are distinct from Search's three: browse is query-less so
+// `no_match` is meaningless, and it needs `no_indexable_memory` (scanned OK,
+// zero records) which search lacks.
+// ---------------------------------------------------------------------------
+
+/// Browse cursor envelope payload. Version 3 (the only version that exists in
+/// 3.1 — bump on a future shape change). Carries the three ORDER BY keys
+/// (browse drops the `title_match` rank from search's four-key cursor) plus
+/// the source the cursor was issued under, so a cursor bound to `src_N`
+/// cannot be replayed against `src_M` (the application layer rejects a
+/// cross-source cursor as `CursorStale`, mirroring search's filter-mismatch
+/// path).
+#[derive(Debug, Serialize, Deserialize)]
+struct BrowseCursor {
+    version: u8,
+    /// `src_<n>` handle the cursor was issued under. Stored as a string so
+    /// decoding round-trips through `to_rowid()` on the comparison path,
+    /// mirroring search's `source` slot.
+    source: String,
+    revision: String,
+    last_record_id: String,
+    last_observed_at: i64,
+    last_coverage_full: bool,
+}
+
+const BROWSE_CURSOR_VERSION: u8 = 3;
+
+pub fn browse(
+    registry: &SourceRegistry<'_>,
+    conn: &Connection,
+    request: BrowseRequest,
+) -> Result<BrowsePage, QueryError> {
+    let store = ScanStore::new(conn);
+    let revision = store.current_index_revision().map_err(|_| QueryError::Internal)?;
+    // Story 3.1 I/O matrix — a non-confirmed/disabled/rejected/unknown source
+    // must surface as `400 bad_request` (phase `browse`). The SQL layer's
+    // `lifecycle_state = 'confirmed'` JOIN honestly yields zero rows for a
+    // non-confirmed id, so without this check a disabled source would render
+    // as `not_yet_scanned`/`no_indexable_memory`, hiding the real lifecycle
+    // state. Resolve the registry row and explicitly reject anything that is
+    // NOT `confirmed`.
+    let source = registry
+        .get(request.source())
+        .map_err(|_| QueryError::Internal)?
+        .ok_or(QueryError::BadRequest)?;
+    if source.lifecycle_state != SourceLifecycle::Confirmed {
+        return Err(QueryError::BadRequest);
+    }
+    let cursor = match request.cursor() {
+        Some(raw) => {
+            // Any envelope other than `b3.<hex>` (a search cursor, or a future
+            // version) is rejected as `CursorStale` so the UI's existing
+            // recovery path re-runs page 1. `BadRequest` would surface an
+            // opaque error; `CursorStale` keeps the UX honest (mirrors
+            // search's v1/v2 rejection choice).
+            if !raw.starts_with("b3.") {
+                return Err(QueryError::CursorStale);
+            }
+            let cursor = decode_browse_cursor(raw).ok_or(QueryError::BadRequest)?;
+            if cursor.version != BROWSE_CURSOR_VERSION {
+                return Err(QueryError::CursorStale);
+            }
+            // Cross-source / cross-revision cursors invalidate pagination.
+            // Compare the source via normalized rowid so equivalent handles
+            // (`src_2` vs `src_02`) match (mirrors search's
+            // `cursor_source_rowid` comparison).
+            let cursor_source_rowid = SourceId(cursor.source.clone()).to_rowid();
+            if cursor_source_rowid != request.source().to_rowid()
+                || cursor.revision != revision
+            {
+                return Err(QueryError::CursorStale);
+            }
+            Some(cursor)
+        }
+        None => None,
+    };
+    let after_key = cursor.as_ref().map(|item| BrowseCursorKey {
+        observed_at: item.last_observed_at,
+        coverage_full: item.last_coverage_full,
+        record_id: item.last_record_id.clone(),
+    });
+    let mut results = store
+        .browse_records(&request, after_key.as_ref())
+        .map_err(|_| QueryError::Internal)?;
+    let has_more = results.len() > request.limit();
+    results.truncate(request.limit());
+    let next_cursor = if has_more {
+        results.last().map(|last| encode_browse_cursor(&BrowseCursor {
+            version: BROWSE_CURSOR_VERSION,
+            source: request.source().0.clone(),
+            revision,
+            last_record_id: last.record_id().to_string(),
+            last_observed_at: last.observed_at(),
+            last_coverage_full: last.coverage_level() == "full",
+        }))
+    } else { None };
+    let sources = source_status_sidecar(registry, &store)?;
+    let empty_state = if results.is_empty() && cursor.is_none() {
+        Some(browse_empty_state(&store, request.source())?)
+    } else { None };
+    Ok(BrowsePage::new(results, next_cursor, empty_state, sources))
+}
+
+/// Derive the browsed source's three-state empty value from its OWN scan facts
+/// (active generation + latest run state). Reuses the same `ScanStore`
+/// aggregations that back `list_inventory` (Design Notes — "reusing the
+/// per-source facts already aggregated by `list_inventory`/`ScanStore`").
+///
+/// Decision table (Boundaries/I/O matrix), exhaustive over `ScanRunState`:
+/// - Active generation present but zero records → `NoIndexableMemory`.
+/// - No active generation:
+///   - No run at all (never scanned) → `NotYetScanned`.
+///   - Latest run `succeeded` but no generation activated (diagnostic-only
+///     `complete_without_activation`) → `NoIndexableMemory`. The scan ran and
+///     succeeded; it simply has no activatable Agent Memory, so "not yet
+///     scanned" would be dishonest.
+///   - Latest run `failed`/`retry` → `SourceUnavailable` (no prior generation).
+///   - Latest run in flight (`queued`/`running`/`staging`/`committing`) →
+///     `NotYetScanned` (no completed generation to show yet).
+fn browse_empty_state(
+    store: &ScanStore<'_>,
+    source_id: &SourceId,
+) -> Result<BrowseEmptyState, QueryError> {
+    let Some(rowid) = source_id.to_rowid() else {
+        // The application layer validated the handle upstream; treat an
+        // invalid handle here as `Internal` rather than silently mapping to
+        // an empty state.
+        return Err(QueryError::Internal);
+    };
+    let active_generation = store
+        .active_generation(rowid)
+        .map_err(|_| QueryError::Internal)?;
+    if active_generation.is_some() {
+        // The source scanned successfully and activated a generation, but
+        // browse returned zero rows → the generation is empty.
+        return Ok(BrowseEmptyState::NoIndexableMemory);
+    }
+    // No active generation. Classify by the latest run's state so every
+    // `ScanRunState` variant has an explicit verdict (no silent fall-through).
+    let latest_run = store.latest_run(rowid).map_err(|_| QueryError::Internal)?;
+    Ok(match latest_run.as_ref().map(|run| run.state) {
+        None => BrowseEmptyState::NotYetScanned,
+        Some(ScanRunState::Failed) | Some(ScanRunState::Retry) => BrowseEmptyState::SourceUnavailable,
+        // A run can finish `succeeded` without activating a generation
+        // (`complete_without_activation`); the scan ran, so "not yet scanned"
+        // would be wrong — map to `NoIndexableMemory`.
+        Some(ScanRunState::Succeeded) => BrowseEmptyState::NoIndexableMemory,
+        // Scan in flight, no completed generation yet: "not yet scanned" is the
+        // honest three-state fit.
+        Some(ScanRunState::Queued)
+        | Some(ScanRunState::Running)
+        | Some(ScanRunState::Staging)
+        | Some(ScanRunState::Committing) => BrowseEmptyState::NotYetScanned,
+    })
+}
+
+fn encode_browse_cursor(cursor: &BrowseCursor) -> String {
+    let json = serde_json::to_vec(cursor).expect("cursor DTO serialization is total");
+    let mut encoded = String::with_capacity(3 + json.len() * 2);
+    encoded.push_str("b3.");
+    for byte in json { encoded.push_str(&format!("{byte:02x}")); }
+    encoded
+}
+
+fn decode_browse_cursor(raw: &str) -> Option<BrowseCursor> {
+    let hex = raw.strip_prefix("b3.")?;
+    if hex.is_empty() || hex.len() % 2 != 0 || raw.len() > MAX_CURSOR_BYTES { return None; }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        bytes.push(((hi << 4) | lo) as u8);
+    }
+    let cursor: BrowseCursor = serde_json::from_slice(&bytes).ok()?;
+    // NOTE: the cursor `version` is intentionally NOT validated here. A future
+    // version must reach `browse()`'s version check and be rejected as
+    // `CursorStale` (forward-compat recovery), not `BadRequest`; rejecting it
+    // in decode would short-circuit that to an opaque 400.
+    if cursor.source.is_empty()
+        || cursor.source.len() > crate::domain::query::MAX_FILTER_BYTES
+        || SourceId(cursor.source.clone()).to_rowid().is_none()
+        || cursor.revision.is_empty()
+        || cursor.revision.len() > 64
+        || cursor.last_record_id.is_empty()
+        || cursor.last_record_id.len() > 512
+    {
+        return None;
+    }
+    Some(cursor)
 }
 
 /// Compare the cursor's bound filters against the incoming request's filters.

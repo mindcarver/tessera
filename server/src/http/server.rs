@@ -34,14 +34,17 @@ use std::sync::Arc;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::domain::open::OpenRequest;
-use crate::domain::query::{SearchFilters, SearchRequest, MAX_CURSOR_BYTES, MAX_FILTER_BYTES, MAX_QUERY_BYTES};
+use crate::domain::query::{
+    BrowseRequest, SearchFilters, SearchRequest, MAX_CURSOR_BYTES, MAX_FILTER_BYTES,
+    MAX_QUERY_BYTES,
+};
 use crate::domain::ports::provider_adapter::ProviderMemoryType;
 use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
-    cancel_rescan_request, confirm_source, disable_source, discover_sources, get_scan_status,
-    list_sources, open_original_location, ping, reject_source, rescan_events, scan_source, search,
-    source_inventory, start_rescan,
+    browse, cancel_rescan_request, confirm_source, disable_source, discover_sources,
+    get_scan_status, list_sources, open_original_location, ping, reject_source, rescan_events,
+    scan_source, search, source_inventory, start_rescan,
 };
 use crate::IndexState;
 
@@ -212,6 +215,22 @@ fn route(
                 }
             };
             respond_result(request, search(request_dto, state))
+        }
+        // Story 3.1 — query-less browse entry. Same envelope + cursor_stale →
+        // 409 mapping as search; bad input → 400 (phase `browse`) per the I/O
+        // matrix.
+        (Method::Get, "/api/browse") => {
+            let request_dto = match parse_browse_query(query) {
+                Ok(request_dto) => request_dto,
+                Err(()) => {
+                    return request.respond(json_error(
+                        StatusCode(400),
+                        "bad_request",
+                        "The request did not match Tessera's browse contract.",
+                    ))
+                }
+            };
+            respond_result(request, browse(request_dto, state))
         }
         (Method::Post, "/api/scan") => {
             let source_id = match read_source_id_body(&mut request) {
@@ -434,6 +453,52 @@ fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
         },
     )
     .map_err(|_| ())
+}
+
+/// Story 3.1 — parse exactly `source`, `cursor`, and `limit` for the
+/// query-less browse endpoint. Text values are percent-decoded before the
+/// request domain validates byte length and shape; `source` is a `src_<n>`
+/// handle. Unknown/duplicate keys are rejected so API behavior stays bounded
+/// and unambiguous (mirrors `parse_search_query`). Validation (`source`
+/// well-formed, `limit` in `[1, MAX_SEARCH_LIMIT]`) lives in
+/// [`BrowseRequest::new`]. The confirmed-source check is the SQL layer's
+/// `lifecycle_state = 'confirmed'` JOIN plus the application layer's
+/// explicit registry lookup.
+fn parse_browse_query(query: &str) -> Result<BrowseRequest, ()> {
+    let mut source = None;
+    let mut cursor = None;
+    let mut limit = None;
+    if query.is_empty() {
+        return Err(());
+    }
+    for pair in query.split('&') {
+        let (key, raw_value) = pair.split_once('=').ok_or(())?;
+        match key {
+            // `src_<n>` handle. Shape validated by `BrowseRequest::new`
+            // (`to_rowid().is_some()`); the confirmed-source check is the
+            // SQL JOIN on `lifecycle_state`.
+            "source" if source.is_none() => {
+                let value = percent_decode_bounded(raw_value, MAX_FILTER_BYTES).ok_or(())?;
+                source = Some(SourceId(value));
+            }
+            "cursor" if cursor.is_none() => {
+                cursor = Some(percent_decode_bounded(raw_value, MAX_CURSOR_BYTES).ok_or(())?);
+            }
+            "limit" if limit.is_none() => {
+                if raw_value.len() > 16 {
+                    return Err(());
+                }
+                limit = Some(
+                    percent_decode_bounded(raw_value, 16)
+                        .ok_or(())?
+                        .parse::<usize>()
+                        .map_err(|_| ())?,
+                );
+            }
+            _ => return Err(()),
+        }
+    }
+    BrowseRequest::new(source.ok_or(())?, cursor, limit).map_err(|_| ())
 }
 
 /// Reject oversized encoded values before allocating their decoded buffer.

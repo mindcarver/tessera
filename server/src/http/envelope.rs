@@ -93,13 +93,15 @@ impl ErrorEnvelope {
         Self::new("bad_request", message, None, phase)
     }
 
-    pub fn cursor_stale() -> Self {
-        Self::new(
-            "cursor_stale",
-            "The index changed. Run the search again.",
-            None,
-            "search",
-        )
+    /// `cursor_stale` carries the endpoint `phase` so the UI can distinguish a
+    /// browse pagination staleness from a search one without parsing the
+    /// message. The safe message never includes body / query / record ids.
+    pub fn cursor_stale(phase: &str) -> Self {
+        let message = match phase {
+            "browse" => "The index changed. Run the browse again.",
+            _ => "The index changed. Run the search again.",
+        };
+        Self::new("cursor_stale", message, None, phase)
     }
 
     pub fn record_not_found() -> Self {

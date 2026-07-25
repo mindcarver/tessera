@@ -747,3 +747,269 @@ test("non-full inventory source renders the honest unavailable count copy", asyn
   // a count).
   await expect(inventoryRegion.getByText(/complete indexed records?\./)).toHaveCount(0);
 });
+
+/**
+ * Story 3.1 — Browse is keyboard-reachable (AD-21): enter from a confirmed
+ * source's Inventory card via the Browse button, paginate via Load more, read
+ * the Provenance `<dl>` fields, and render each of the three query-less
+ * empty states distinctly. Mirrors the existing keyboard-search test's shape
+ * (focus + Enter, assert Provenance labels, exercise the cursor/pagination
+ * contract).
+ *
+ * The mock exercises every Browse branch the AC calls out:
+ * - happy path (one record on page 1, a second record on page 2 via Load more),
+ * - the three distinct empty states (`not_yet_scanned`, `no_indexable_memory`,
+ *   `source_unavailable`).
+ *
+ * Keyboard contract (AD-21): the user can enter Browse, paginate, read
+ * Provenance, and return to the Inventory without ever using a pointer.
+ */
+test("keyboard browse enters from inventory paginates and renders three empty states", async ({ page }) => {
+  // No candidates; one confirmed source so the Browse button renders.
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  const inventory = [
+    {
+      source_id: "src_1",
+      provider: "codex",
+      lifecycle_state: "confirmed",
+      root: "/fixture/codex",
+      native_project: null,
+      coverage_level: "full",
+      health_state: "healthy",
+      last_successful_scan: 100,
+      complete_record_count: 2,
+      latest_error: null,
+    },
+  ];
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: inventory }) }),
+  );
+  let browseCalls = 0;
+  const result = {
+    record_id: "rec-mock",
+    excerpt: "browse mock excerpt",
+    provider: "codex",
+    source_id: "src_1",
+    native_project: null,
+    native_locator: "file:///fixture#semantic",
+    display_locator: "file:///fixture#L1-L2",
+    observed_at: 1,
+    coverage_level: "full",
+    health_state: "healthy",
+  };
+  // The browse mock returns one result + a cursor on page 1 and a different
+  // result with no cursor on page 2. When the test later swaps the `source`
+  // param to `src_*`, it returns the matching empty state (no cursor).
+  await page.route("**/api/browse?*", async (route) => {
+    browseCalls += 1;
+    const params = new URL(route.request().url()).searchParams;
+    const source = params.get("source");
+    const cursor = params.get("cursor");
+    if (source === "src_not_yet_scanned") {
+      return route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ api_version: "1", payload: { results: [], next_cursor: null, empty_state: "not_yet_scanned", sources: [] } }),
+      });
+    }
+    if (source === "src_no_memory") {
+      return route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ api_version: "1", payload: { results: [], next_cursor: null, empty_state: "no_indexable_memory", sources: [] } }),
+      });
+    }
+    if (source === "src_unavailable") {
+      return route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ api_version: "1", payload: { results: [], next_cursor: null, empty_state: "source_unavailable", sources: [] } }),
+      });
+    }
+    // src_1 (happy path).
+    if (!cursor) {
+      return route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ api_version: "1", payload: { results: [result], next_cursor: "b3.page2", empty_state: null, sources: [] } }),
+      });
+    }
+    // Page 2: a distinct result, no cursor.
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: { results: [{ ...result, record_id: "rec-mock-2" }], next_cursor: null, empty_state: null, sources: [] } }),
+    });
+  });
+
+  await page.goto("/");
+
+  // The Inventory card for the confirmed source carries a keyboard-reachable
+  // Browse button. Story 3.1 AC: "enter from inventory via keyboard".
+  const browseButton = page.getByRole("button", { name: "Browse", exact: true });
+  await expect(browseButton).toBeVisible();
+  await browseButton.focus();
+  await page.keyboard.press("Enter");
+
+  // The Browse view swapped in (App's hand-rolled view state, no router).
+  const browseRegion = page.getByRole("region", { name: "Memory browse" });
+  await expect(browseRegion).toBeVisible();
+  // The Provenance fields render (Search's shared ResultCard is reused, so
+  // the labels are identical: Provider, Source, Native project, Semantic
+  // location, Display location, Last observed (scan), Coverage, Source
+  // health).
+  await expect(browseRegion.getByText("Provider").first()).toBeVisible();
+  await expect(browseRegion.getByText("Semantic location").first()).toBeVisible();
+  await expect(browseRegion.getByText("Source health").first()).toBeVisible();
+  await expect(browseRegion.getByText("browse mock excerpt")).toBeVisible();
+
+  // Load more (page 2): keyboard-reachable.
+  const loadMore = browseRegion.getByRole("button", { name: "Load more" });
+  await expect(loadMore).toBeVisible();
+  await loadMore.focus();
+  await page.keyboard.press("Enter");
+  await expect(browseRegion.getByRole("listitem")).toHaveCount(2);
+
+  // Back to inventory is keyboard-reachable (first focusable in the Browse
+  // view).
+  const backButton = browseRegion.getByRole("button", { name: "Back to inventory" });
+  await expect(backButton).toBeVisible();
+  await backButton.focus();
+  await page.keyboard.press("Enter");
+  // The Inventory region is visible again.
+  await expect(page.getByRole("region", { name: "Source inventory" })).toBeVisible();
+
+  // Three-state empty coverage: swap the inventory's source_id between
+  // confirmed sources so the same Browse button activates Browse for each
+  // distinct empty state. The mock keys off `source`, so we re-route the
+  // inventory to return the next confirmed source's row and reload the
+  // view.
+  for (const [sourceId, expectedText] of [
+    ["src_not_yet_scanned", "This source has not been scanned yet."],
+    ["src_no_memory", "This source scanned successfully but contains no indexable Agent Memory."],
+    ["src_unavailable", "This source is currently unavailable; its stored health was not changed."],
+  ] as const) {
+    await page.route("**/api/sources/inventory", async (route) =>
+      route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          api_version: "1",
+          payload: [{ ...inventory[0], source_id: sourceId }],
+        }),
+      }),
+    );
+    await page.reload();
+    // The Browse button is keyboard-reachable after reload too.
+    const reloadBrowse = page.getByRole("button", { name: "Browse", exact: true });
+    await reloadBrowse.focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("region", { name: "Memory browse" })).toBeVisible();
+    await expect(page.getByText(expectedText)).toBeVisible();
+    // No results render alongside the empty state — the three states describe
+    // the browsed source's initial zero-result page.
+    await expect(page.getByRole("region", { name: "Memory browse" }).getByRole("listitem")).toHaveCount(0);
+    // Back to inventory to reset for the next iteration (or finish).
+    await page.getByRole("button", { name: "Back to inventory" }).press("Enter");
+  }
+
+  // Smoke: at least the page-1 browse call fired during the test.
+  expect(browseCalls).toBeGreaterThan(0);
+});
+
+/**
+ * Story 3.1 (review pass) — the Browse view surfaces the FR-14 partial-
+ * unavailability banner when the sidecar carries a non-`available` source,
+ * and recovers from a mid-pagination `cursor_stale` (409) via the "Restart
+ * from the new snapshot" affordance. Both paths were dead code under the
+ * happy-path mock in the test above.
+ */
+test("browse surfaces partial-unavailability banner and recovers from cursor_stale", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: [
+          {
+            source_id: "src_1",
+            provider: "codex",
+            lifecycle_state: "confirmed",
+            root: "/fixture/codex",
+            native_project: null,
+            coverage_level: "full",
+            health_state: "healthy",
+            last_successful_scan: 100,
+            complete_record_count: 2,
+            latest_error: null,
+          },
+        ],
+      }),
+    }),
+  );
+  const result = {
+    record_id: "rec-mock",
+    excerpt: "browse mock excerpt",
+    provider: "codex",
+    source_id: "src_1",
+    native_project: null,
+    native_locator: "file:///fixture#semantic",
+    display_locator: "file:///fixture#L1-L2",
+    observed_at: 1,
+    coverage_level: "full",
+    health_state: "healthy",
+  };
+  // Page 1 (no cursor): one result + a sidecar where another source is
+  // `unavailable` (so the banner renders), plus a continuation cursor. Page 2
+  // (cursor present): the generation changed → 409 cursor_stale.
+  await page.route("**/api/browse?*", async (route) => {
+    const cursor = new URL(route.request().url()).searchParams.get("cursor");
+    if (cursor) {
+      return route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "cursor_stale", message: "The index changed. Run the browse again.", source_id: null, phase: "browse" }),
+      });
+    }
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: {
+          results: [result],
+          next_cursor: "b3.page2",
+          empty_state: null,
+          sources: [{ source_id: "src_2", provider: "claude_code", native_project: null, status: "unavailable" }],
+        },
+      }),
+    });
+  });
+
+  await page.goto("/");
+
+  // Enter Browse via keyboard.
+  const browseButton = page.getByRole("button", { name: "Browse", exact: true });
+  await browseButton.focus();
+  await page.keyboard.press("Enter");
+  const browseRegion = page.getByRole("region", { name: "Memory browse" });
+  await expect(browseRegion).toBeVisible();
+
+  // V6 — the partial-unavailability banner renders for the unavailable
+  // sidecar source (single-source browse: informational about OTHER sources).
+  const banner = browseRegion.getByTestId("browse-source-status");
+  await expect(banner).toBeVisible();
+  await expect(banner).toContainText("Claude Code");
+
+  // V5 — Load more hits the 409 cursor_stale; the stale message + Restart
+  // button render (keyboard-reachable).
+  const loadMore = browseRegion.getByRole("button", { name: "Load more" });
+  await loadMore.focus();
+  await page.keyboard.press("Enter");
+  await expect(browseRegion.getByRole("alert")).toContainText("The index changed.");
+  const restart = browseRegion.getByRole("button", { name: "Restart from the new snapshot" });
+  await expect(restart).toBeVisible();
+
+  // Activating Restart re-fetches page 1 (no cursor) → the result renders.
+  await restart.focus();
+  await page.keyboard.press("Enter");
+  await expect(browseRegion.getByText("browse mock excerpt")).toBeVisible();
+});

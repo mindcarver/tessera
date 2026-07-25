@@ -171,7 +171,7 @@ function isSearchEnvelope(value: unknown): value is Envelope<SearchPage> {
   return page.empty_state === null || (page.results.length === 0 && page.next_cursor === null);
 }
 
-function isSourceQueryStatus(value: unknown): value is SourceQueryStatus {
+export function isSourceQueryStatus(value: unknown): value is SourceQueryStatus {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return typeof v.source_id === "string"
@@ -180,7 +180,7 @@ function isSourceQueryStatus(value: unknown): value is SourceQueryStatus {
     && (v.status === "available" || v.status === "degraded" || v.status === "unavailable");
 }
 
-function isSearchResult(value: unknown): value is SearchResult {
+export function isSearchResult(value: unknown): value is SearchResult {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return ["record_id", "excerpt", "provider", "source_id", "native_locator", "display_locator", "coverage_level", "health_state"].every((key) => typeof v[key] === "string") &&

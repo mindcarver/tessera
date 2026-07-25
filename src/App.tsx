@@ -5,8 +5,9 @@
  * composed the first business component; Story 1.3 replaces it with
  * `<Sources />` (discovery candidates + confirm/reject + registered inventory
  * with disable) alongside the ping section so the API contract round-trip
- * remains visible. Future Stories (1.4 scan, 1.6 search) append their feature
- * components into this same shell.
+ * remains visible. Story 1.6 adds `<Search />` and Story 3.1 adds `<Browse />`
+ * — the latter entered from a Source Inventory card via hand-rolled view
+ * state (no router, per the spec's "no router" constraint).
  *
  * Architecture invariants honored here:
  * - AD-1: the shell only calls the versioned loopback HTTP API. It never
@@ -15,13 +16,20 @@
  *   underlying semantic regions (`<section aria-label>`), and shared
  *   `aria-live` announcements so status changes are spoken without moving
  *   focus.
+ * - Story 3.1: Browse is a single-source view entered from the Source
+ *   Inventory. The App holds the active view in hand-rolled state (no router
+ *   dependency): the `Sources` component notifies App via `onBrowse` when the
+ *   user activates "Browse" on a confirmed source's card, and App swaps
+ *   `<Browse>` in until the user activates "Back to inventory".
  */
 
 import { useEffect, useState, type ReactElement } from "react";
 import { ping, type Pong } from "./api/ping";
 import { Sources } from "./features/sources/Sources";
 import { Search } from "./features/search/Search";
+import { Browse } from "./features/browse/Browse";
 import { readTesseraErrorMessage } from "./api/errors";
+import { providerDisplayName } from "./components/providerDisplayName";
 
 type PingState =
   | { kind: "idle" }
@@ -29,8 +37,29 @@ type PingState =
   | { kind: "ok"; pong: Pong; apiVersion: string }
   | { kind: "error"; message: string };
 
+/**
+ * Story 3.1 — hand-rolled view state (no router). The shell swaps between
+ * the Source Inventory / Search default composition and the single-source
+ * Browse view. Entered from the Inventory's "Browse" button (only rendered
+ * for confirmed sources); exited via Browse's "Back to inventory".
+ *
+ * `providerLabel` / `nativeProject` are passed in at swap time so the Browse
+ * heading can name the source without re-fetching the inventory row from the
+ * Browse component. The fields come from the Inventory row the user
+ * activated, so they always match what the user just saw.
+ */
+type View =
+  | { kind: "default" }
+  | {
+      kind: "browse";
+      sourceId: string;
+      providerLabel: string;
+      nativeProject: string | null;
+    };
+
 export function App(): ReactElement {
   const [state, setState] = useState<PingState>({ kind: "idle" });
+  const [view, setView] = useState<View>({ kind: "default" });
 
   // Trigger the ping round-trip on mount so the Phase 0 accessibility smoke
   // (`tests/ui/accessibility.spec.ts`) has a stable keyboard-reachable
@@ -57,10 +86,34 @@ export function App(): ReactElement {
     };
   }, []);
 
+  if (view.kind === "browse") {
+    return (
+      <main aria-live="polite">
+        <h1>Tessera</h1>
+        <Browse
+          sourceId={view.sourceId}
+          providerLabel={view.providerLabel}
+          nativeProject={view.nativeProject}
+          onBack={() => setView({ kind: "default" })}
+        />
+        <section aria-label="API ping status">{renderPingState(state)}</section>
+      </main>
+    );
+  }
+
   return (
     <main aria-busy={state.kind === "loading"} aria-live="polite">
       <h1>Tessera</h1>
-      <Sources />
+      <Sources
+        onBrowse={(source) =>
+          setView({
+            kind: "browse",
+            sourceId: source.source_id,
+            providerLabel: providerDisplayName(source.provider),
+            nativeProject: source.native_project,
+          })
+        }
+      />
       <Search />
       <section aria-label="API ping status">{renderPingState(state)}</section>
     </main>

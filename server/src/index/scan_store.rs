@@ -39,8 +39,8 @@ use rusqlite::{params, Connection};
 
 use crate::domain::open::OpenTarget;
 use crate::domain::ports::provider_adapter::ProviderMemoryType;
-use crate::domain::ports::query_store::{QueryStore, SearchCursorKey};
-use crate::domain::query::{SearchRequest, SearchResult};
+use crate::domain::ports::query_store::{BrowseCursorKey, QueryStore, SearchCursorKey};
+use crate::domain::query::{BrowseRequest, SearchRequest, SearchResult};
 use crate::domain::scan::{Generation, ScanRunState};
 use crate::domain::source::{HealthState, SourceId};
 
@@ -805,6 +805,107 @@ impl QueryStore for ScanStore<'_> {
                     coverage_level,
                     health_state,
                     title_match,
+                ))
+            },
+        )?;
+        rows.collect()
+    }
+
+    /// Story 3.1 — Browse a single confirmed source's active generation,
+    /// ordered by the query-less form of search's relevance key: `observed_at
+    /// DESC → coverage_full → record_id ASC`. Drops the `instr` predicate and
+    /// the `title_match` rank (browse is query-less). The cursor predicate
+    /// mirrors the ORDER BY exactly (a lexicographic "strictly-after"
+    /// comparison over the same three keys) so pagination stays stable across
+    /// the recency/coverage tiers — a `record_id`-only cursor would silently
+    /// drop records whose id sorts below the cursor but whose recency rank is
+    /// worse.
+    ///
+    /// Same JOIN shape as `search_records`: `source_registry` JOIN +
+    /// `lifecycle_state = 'confirmed'` + active-generation JOIN. The
+    /// confirmed-source guarantee is therefore the SQL layer's, not the
+    /// caller's: a non-confirmed/non-existent `source_id` honestly yields no
+    /// rows.
+    fn browse_records(
+        &self,
+        request: &BrowseRequest,
+        after: Option<&BrowseCursorKey>,
+    ) -> rusqlite::Result<Vec<SearchResult>> {
+        // The cursor predicate is the same lexicographic "strictly-after"
+        // comparison `search_records` uses, minus the `title_match` rank:
+        //   observed_at:        compared DESC, so "after" = strictly smaller
+        //   coverage_rank:      0 when coverage='full' (sorts first), 1 otherwise
+        //   record_id:          final ASC tiebreak
+        let mut stmt = self.conn.prepare(
+            "SELECT m.record_id, m.title, m.body, m.provider, m.source_id,
+                    m.native_project, m.native_locator, m.display_locator,
+                    m.observed_at, m.coverage_level, s.health_state
+             FROM memory_records m
+             JOIN source_registry s ON s.id = m.source_id
+             JOIN tessera_meta active ON active.key = ('active_generation:' || m.source_id)
+                                       AND active.value = m.generation
+             WHERE s.lifecycle_state = 'confirmed'
+               AND m.source_id = ?1
+               AND (
+                   ?2 = 0
+                   OR m.observed_at < ?3
+                   OR (m.observed_at = ?3
+                       AND (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) > ?4)
+                   OR (m.observed_at = ?3
+                       AND (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) = ?4
+                       AND m.record_id > ?5)
+               )
+             ORDER BY
+               m.observed_at DESC,
+               (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) ASC,
+               m.record_id ASC
+             LIMIT ?6",
+        )?;
+        let page_size = i64::try_from(request.limit() + 1).expect("browse limit is bounded");
+        let source_rowid: i64 = match request.source().to_rowid() {
+            Some(rowid) => rowid,
+            // The application layer validates the handle upstream; defense-in-
+            // depth returns an empty page here rather than panicking.
+            None => return Ok(Vec::new()),
+        };
+        let cursor_present: i64 = if after.is_some() { 1 } else { 0 };
+        let cursor_observed_at: i64 = after.map(|key| key.observed_at).unwrap_or(0);
+        let cursor_coverage_rank: i64 = match after {
+            Some(key) => i64::from(!key.coverage_full),
+            None => 0,
+        };
+        let cursor_record_id: Option<&str> = after.map(|key| key.record_id.as_str());
+        let rows = stmt.query_map(
+            params![
+                source_rowid,
+                cursor_present,
+                cursor_observed_at,
+                cursor_coverage_rank,
+                cursor_record_id,
+                page_size,
+            ],
+            |row| {
+                let health: String = row.get(10)?;
+                let health_state =
+                    HealthState::parse_str(&health).ok_or(rusqlite::Error::InvalidQuery)?;
+                let title: String = row.get(1)?;
+                let body: String = row.get(2)?;
+                Ok(SearchResult::new(
+                    row.get(0)?,
+                    excerpt(&title, &body),
+                    row.get(3)?,
+                    SourceId::from_rowid(row.get(4)?),
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    health_state,
+                    // Browse is query-less, so `title_match` is meaningless;
+                    // `false` keeps the SearchResult DTO happy without
+                    // inventing a query. The field is `#[serde(skip)]` so it
+                    // never crosses the wire.
+                    false,
                 ))
             },
         )?;

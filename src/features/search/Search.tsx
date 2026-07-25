@@ -15,6 +15,10 @@ import {
   type SearchTimePreset,
   type SourceQueryStatus,
 } from "../../api/search";
+import { EmptyState } from "../../components/EmptyState";
+import { LoadMore } from "../../components/LoadMore";
+import { ResultCard } from "../../components/ResultCard";
+import { providerDisplayName } from "../../components/providerDisplayName";
 
 const SEARCH_PAGE_SIZE = 2;
 
@@ -439,7 +443,7 @@ function renderState(
   if (state.kind === "error") return <>{partialUnavailableBanner(state.sources ?? [], Boolean(state.results))}{state.results ? renderResults(state.results, null, loadMore, openRecord, openingId, resultList) : null}<p ref={alert} tabIndex={-1} role="alert">{state.message}</p></>;
   if (state.kind === "stale") return <>{partialUnavailableBanner(state.sources, true)}<p ref={alert} tabIndex={-1} role="alert">{state.message}</p>{renderResults(state.results, null, loadMore, openRecord, openingId, resultList)}</>;
   // ready
-  if (state.empty) return <p>{emptyCopy(state.empty, filters, filtersActive, confirmedProviders)}</p>;
+  if (state.empty) return <EmptyState message={emptyCopy(state.empty, filters, filtersActive, confirmedProviders)} />;
   return <>{partialUnavailableBanner(state.sources, state.results.length > 0)}{renderResults(state.results, state.cursor, loadMore, openRecord, openingId, resultList)}</>;
 }
 
@@ -475,25 +479,18 @@ function partialUnavailableBanner(sources: SourceQueryStatus[], hasResults: bool
 }
 
 function renderResults(results: SearchResult[], cursor: string | null, loadMore: () => void, openRecord: (recordId: string) => void, openingRecordId: string | null, resultList: RefObject<HTMLOListElement | null>, loadingMore = false): ReactElement {
-  return <><p>{results.length} result{results.length === 1 ? "" : "s"}.</p><ol ref={resultList}>{results.map((result) => <li key={result.record_id} tabIndex={0}><p>{result.excerpt}</p><dl><dt>Provider</dt><dd>{providerBadge(result.provider)}</dd><dt>Source</dt><dd>{result.source_id}</dd><dt>Native project</dt><dd>{result.native_project ?? "Unmapped"}</dd><dt>Semantic location</dt><dd>{result.native_locator}</dd><dt>Display location</dt><dd>{result.display_locator}</dd><dt>Last observed (scan)</dt><dd>{result.observed_at}</dd><dt>Coverage</dt><dd>{result.coverage_level}</dd><dt>Source health</dt><dd>{result.health_state}</dd></dl><button type="button" onClick={() => openRecord(result.record_id)} disabled={openingRecordId === result.record_id}>Open original location</button></li>)}</ol>{cursor ? <button type="button" onClick={loadMore} disabled={loadingMore}>Load more</button> : null}</>;
-}
-
-/**
- * Provider badge — renders a short label so Codex vs Claude Code cards are
- * visually comparable at a glance. The data layer needs no change for
- * comparison; this is purely a layout affordance (Design Notes: YAGNI for a
- * split-view compare component).
- */
-function providerBadge(provider: string): ReactElement {
-  return <span className="tessera-provider-badge" data-provider={provider}>{providerDisplayName(provider)}</span>;
-}
-
-function providerDisplayName(provider: string): string {
-  switch (provider) {
-    case "codex": return "Codex";
-    case "claude_code": return "Claude Code";
-    default: return provider;
-  }
+  // Story 3.1 — the result card, Provenance `<dl>`, Coverage/Health readout,
+  // and Load-more button are shared with Browse via `src/components/`. Search
+  // stays the canonical consumer of these components; the extraction does not
+  // change the wire shape or the existing accessibility contract.
+  return <><p>{results.length} result{results.length === 1 ? "" : "s"}.</p><ol ref={resultList}>{results.map((result) => (
+    <ResultCard
+      key={result.record_id}
+      result={result}
+      onOpen={openRecord}
+      openInFlight={openingRecordId === result.record_id}
+    />
+  ))}</ol>{cursor ? <LoadMore onClick={loadMore} disabled={loadingMore} /> : null}</>;
 }
 
 function renderOpenState(state: OpenState): ReactElement | null {

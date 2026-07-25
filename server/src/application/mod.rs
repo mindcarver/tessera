@@ -32,7 +32,7 @@ pub use source::{
 pub use open::{
     open_original_location, reset_open_path_for_tests, set_open_path_for_tests, OpenError,
 };
-pub use query::search;
+pub use query::{browse, search};
 pub use scan::{
     cancel_rescan, get_scan_status, list_inventory, recover_scans, scan_reserved_source,
     scan_source, scan_source_with,
