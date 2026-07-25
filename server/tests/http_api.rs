@@ -1228,3 +1228,326 @@ fn search_rejects_unknown_query_key_with_bad_request() {
     assert!(response.starts_with("HTTP/1.1 400"), "got:\n{response}");
     assert!(response.contains("\"code\":\"bad_request\""), "got:\n{response}");
 }
+
+// ---------------------------------------------------------------------------
+// Story 3.1 — /api/browse wire contract.
+//
+// Mirrors the search wire tests at the HTTP boundary: the versioned envelope
+// crosses HTTP, the browse list reuses SearchResult rows, the cursor paginates
+// stably, a generation change surfaces `cursor_stale` (409), non-confirmed /
+// unknown sources surface `bad_request` (400, phase `browse`), and the three
+// distinct empty states are present on page 1 only.
+// ---------------------------------------------------------------------------
+
+/// A live loopback server with a confirmed Codex source carrying three records
+/// under one active generation, plus a confirmed-but-never-scanned source and
+/// a disabled source (for the lifecycle-exclusion + bad-request wire tests).
+fn boot_browse_test_server() -> (u16, Arc<tessera_lib::IndexState>) {
+    let dir = tempfile::tempdir().expect("scratch app-data dir");
+    let state = tessera_lib::boot(dir.path()).expect("boot");
+    {
+        let conn = state.conn.lock().expect("connection lock");
+        // Source 1: confirmed Codex with three records (varied observed_at +
+        // coverage so the browse ORDER BY is exercised on the wire).
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (1, 'codex', 'agent_memory', 'confirmed', 'healthy', 'full', '/fixture-codex', 'fp-codex', NULL)",
+            [],
+        )
+        .expect("codex source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (1, 'gen_1', 'succeeded', 1, 'gen_1', 'fixture')",
+            [],
+        )
+        .expect("codex scan run");
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')",
+            [],
+        )
+        .expect("codex active gen");
+        for (id, observed_at, coverage) in
+            [("rec_old", 100, "full"), ("rec_new", 300, "full"), ("rec_mid", 200, "search_only")]
+        {
+            conn.execute(
+                "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+                 VALUES (?1, 1, 'gen_1', 'codex', 'section', ?1, 'file:///fixture#x', 'hash', 'v1', ?1, 'body', NULL, 'memory', ?2, ?3, 'revision', 'file:///fixture#L1-L2')",
+                params![id, coverage, observed_at],
+            )
+            .expect("codex record");
+        }
+        // Source 2: confirmed Claude Code, never scanned — exercises the
+        // `not_yet_scanned` empty state on the wire.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (2, 'claude_code', 'agent_memory', 'confirmed', 'unknown', 'full', '/fixture-claude', 'fp-claude', 'proj-claude')",
+            [],
+        )
+        .expect("claude source");
+        // Source 3: a DISABLED source with an active generation — exercises the
+        // lifecycle-exclusion boundary: its records must NEVER appear in browse.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (3, 'codex', 'agent_memory', 'disabled', 'unknown', 'full', '/fixture-disabled', 'fp-disabled', NULL)",
+            [],
+        )
+        .expect("disabled source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (3, 'gen_3', 'succeeded', 1, 'gen_3', 'fixture')",
+            [],
+        )
+        .expect("disabled scan run");
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:3', 'gen_3')",
+            [],
+        )
+        .expect("disabled active gen");
+        conn.execute(
+            "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+             VALUES ('rec_hidden_disabled', 3, 'gen_3', 'codex', 'section', 'rec_hidden_disabled', 'file:///fixture#hidden', 'hash', 'v1', 'hidden', 'body', NULL, 'memory', 'full', 999, 'revision', 'file:///fixture#L1-L2')",
+            [],
+        )
+        .expect("disabled record");
+        // Source 4: confirmed, active generation but ZERO records → exercises
+        // the `no_indexable_memory` empty state on the wire.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (4, 'codex', 'agent_memory', 'confirmed', 'healthy', 'full', '/fixture-empty', 'fp-empty', NULL)",
+            [],
+        )
+        .expect("empty source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (4, 'gen_4', 'succeeded', 1, 'gen_4', 'fixture')",
+            [],
+        )
+        .expect("empty scan run");
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:4', 'gen_4')",
+            [],
+        )
+        .expect("empty active gen");
+        // Source 5: confirmed, latest run FAILED, no active generation →
+        // exercises the `source_unavailable` empty state on the wire.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (5, 'codex', 'agent_memory', 'confirmed', 'error', 'full', '/fixture-failed', 'fp-failed', NULL)",
+            [],
+        )
+        .expect("failed source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision, error_code)
+             VALUES (5, 'gen_5', 'failed', 1, 'gen_5', 'fixture', 'enumeration_failed')",
+            [],
+        )
+        .expect("failed scan run");
+    }
+    let server = bind("127.0.0.1:0");
+    let port = server.server_addr().to_ip().expect("bound addr").port();
+    let state = Arc::new(state);
+    let server_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let _dir = dir;
+        serve_with(server, server_state, PathBuf::from("dist"), Some(port));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    (port, state)
+}
+
+/// Story 3.1 AC — `/api/browse?source=src_<n>` returns a paginated list from
+/// the confirmed source's active generation on the wire. The result rows
+/// reuse SearchResult's shape verbatim; the cursor paginates stably; the
+/// sidecar lists every confirmed source.
+#[test]
+fn browse_wire_contract_paginates_and_reuses_search_result_shape() {
+    let (port, state) = boot_browse_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("browse body");
+    let page: serde_json::Value = serde_json::from_str(body).expect("versioned browse JSON");
+    assert_eq!(page["api_version"], "1");
+    let results = page["payload"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "limit=1 returned one row: {results:?}");
+    // ORDER BY observed_at DESC → rec_new (observed_at=300) sorts first.
+    assert_eq!(results[0]["record_id"], "rec_new");
+    // Provenance fields from SearchResult render on the wire.
+    for field in [
+        "record_id",
+        "excerpt",
+        "provider",
+        "source_id",
+        "native_locator",
+        "display_locator",
+        "observed_at",
+        "coverage_level",
+        "health_state",
+    ] {
+        assert!(!results[0][field].is_null(), "missing {field}: {results:?}");
+    }
+    // The per-confirmed-source sidecar is present on every page (mirrors
+    // search). Sources 1 and 2 are confirmed; source 3 (disabled) is not.
+    let sources = page["payload"]["sources"].as_array().expect("sources sidecar array");
+    let source_ids: std::collections::HashSet<&str> = sources
+        .iter()
+        .map(|entry| entry["source_id"].as_str().expect("source_id"))
+        .collect();
+    assert!(source_ids.contains("src_1"), "src_1 in sidecar: {source_ids:?}");
+    assert!(source_ids.contains("src_2"), "src_2 in sidecar: {source_ids:?}");
+    assert!(!source_ids.contains("src_3"), "src_3 (disabled) must NOT be in sidecar: {source_ids:?}");
+
+    let cursor = page["payload"]["next_cursor"].as_str().expect("continuation cursor");
+    let continuation = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&cursor={cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(continuation.starts_with("HTTP/1.1 200"), "got:\n{continuation}");
+    // ORDER BY observed_at DESC → rec_mid (200) sorts next. rec_old (100) is
+    // on page 3 (not exercised here; pagination stability is covered by the
+    // application-layer tests).
+    assert!(continuation.contains("rec_mid"), "got:\n{continuation}");
+
+    // Stale cursor: activate a new generation under src_1 → revision changes.
+    {
+        let conn = state.conn.lock().expect("connection lock");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (1, 'gen_99', 'succeeded', 2, 'gen_99', 'fixture')",
+            [],
+        )
+        .expect("new scan run");
+        conn.execute(
+            "UPDATE tessera_meta SET value = 'gen_99' WHERE key = 'active_generation:1'",
+            [],
+        )
+        .expect("activate new generation");
+    }
+    let stale = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&cursor={cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(stale.starts_with("HTTP/1.1 409"), "got:\n{stale}");
+    assert!(stale.contains("\"code\":\"cursor_stale\""), "got:\n{stale}");
+    // cursor_stale now specializes the phase per endpoint (`browse` here) so
+    // the UI can distinguish a browse pagination staleness. The safe message
+    // must NOT carry any source id / record id / query detail.
+    assert!(stale.contains("\"phase\":\"browse\""), "browse cursor_stale must carry phase=browse: {stale}");
+    assert!(!stale.contains("rec_"), "cursor_stale must not carry record ids: {stale}");
+}
+
+/// Story 3.1 AC — `/api/browse?source=src_2` (confirmed but never scanned)
+/// returns `empty_state = "not_yet_scanned"` on the wire.
+#[test]
+fn browse_wire_returns_not_yet_scanned_empty_state() {
+    let (port, _state) = boot_browse_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_2 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    assert!(
+        response.contains("\"empty_state\":\"not_yet_scanned\""),
+        "got:\n{response}"
+    );
+}
+
+/// Story 3.1 AC — `/api/browse?source=src_4` (confirmed, active generation,
+/// zero records) returns `empty_state = "no_indexable_memory"` on the wire.
+#[test]
+fn browse_wire_returns_no_indexable_memory_empty_state() {
+    let (port, _state) = boot_browse_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_4 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    assert!(
+        response.contains("\"empty_state\":\"no_indexable_memory\""),
+        "got:\n{response}"
+    );
+}
+
+/// Story 3.1 AC — `/api/browse?source=src_5` (confirmed, latest run failed,
+/// no active generation) returns `empty_state = "source_unavailable"` on the
+/// wire.
+#[test]
+fn browse_wire_returns_source_unavailable_empty_state() {
+    let (port, _state) = boot_browse_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_5 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    assert!(
+        response.contains("\"empty_state\":\"source_unavailable\""),
+        "got:\n{response}"
+    );
+}
+
+/// Story 3.1 AC — `/api/browse?source=src_3` (disabled) returns 400
+/// `bad_request` (phase `browse`) and NEVER returns the disabled source's
+/// records.
+#[test]
+fn browse_wire_rejects_disabled_source_with_bad_request() {
+    let (port, _state) = boot_browse_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_3 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 400"), "got:\n{response}");
+    assert!(response.contains("\"code\":\"bad_request\""), "got:\n{response}");
+    // Phase is `browse` so the UI can distinguish the failure context without
+    // parsing the display message.
+    assert!(response.contains("\"phase\":\"browse\""), "got:\n{response}");
+    // The disabled source's records must NEVER appear.
+    assert!(!response.contains("rec_hidden_disabled"), "got:\n{response}");
+}
+
+/// Story 3.1 I/O matrix — `/api/browse?source=src_99` (unknown) returns 400
+/// `bad_request` (phase `browse`).
+#[test]
+fn browse_wire_rejects_unknown_source_with_bad_request() {
+    let (port, _state) = boot_browse_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_99 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 400"), "got:\n{response}");
+    assert!(response.contains("\"code\":\"bad_request\""), "got:\n{response}");
+    assert!(response.contains("\"phase\":\"browse\""), "got:\n{response}");
+}
+
+/// Story 3.1 I/O matrix — a missing `source` param, malformed source handle,
+/// or invalid `limit` is rejected with 400 `bad_request` (phase `browse`).
+#[test]
+fn browse_wire_rejects_invalid_input() {
+    let (port, _state) = boot_browse_test_server();
+    // Missing source.
+    let missing = raw_http(
+        port,
+        &format!("GET /api/browse?limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(missing.starts_with("HTTP/1.1 400"), "got:\n{missing}");
+    assert!(missing.contains("\"code\":\"bad_request\""), "got:\n{missing}");
+    // Malformed source handle.
+    let malformed = raw_http(
+        port,
+        &format!("GET /api/browse?source=not-a-source HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(malformed.starts_with("HTTP/1.1 400"), "got:\n{malformed}");
+    // Invalid limit (zero).
+    let bad_limit = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&limit=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(bad_limit.starts_with("HTTP/1.1 400"), "got:\n{bad_limit}");
+    // Unknown query key.
+    let unknown_key = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&unknown=value HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(unknown_key.starts_with("HTTP/1.1 400"), "got:\n{unknown_key}");
+}

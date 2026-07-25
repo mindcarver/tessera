@@ -10,12 +10,35 @@ import {
 } from "../../api/sources";
 import { cancelRescan, getRescanProgress, startRescan, type RescanProgress } from "../../api/scan";
 import { readTesseraErrorMessage } from "../../api/errors";
+import { providerDisplayName } from "../../components/providerDisplayName";
 
 type LoadState<T> = { kind: "loading" } | { kind: "error"; message: string } | { kind: "ok"; value: T };
 
+/**
+ * Story 3.1 — the minimum facts App needs to swap into the Browse view for a
+ * confirmed source. Passed up from the Inventory card when the user
+ * activates "Browse"; App threads them into `<Browse>`'s heading so the user
+ * sees which source they are browsing without re-fetching the row.
+ */
+export interface BrowseEntry {
+  source_id: string;
+  provider: string;
+  native_project: string | null;
+}
+
+interface SourcesProps {
+  /**
+   * Story 3.1 — invoked when the user activates "Browse" on a confirmed
+   * source's Inventory card. The parent (App) swaps in the Browse view for
+   * that source id. Optional so existing callers that do not wire Browse
+   * (e.g. unit tests) keep working unchanged.
+   */
+  onBrowse?: (source: BrowseEntry) => void;
+}
+
 /** Source Inventory is intentionally server-derived: the browser renders
  * coverage and health facts but never infers them from paths or scan output. */
-export function Sources(): ReactElement {
+export function Sources({ onBrowse }: SourcesProps = {}): ReactElement {
   const [candidates, setCandidates] = useState<LoadState<CandidateSource[]>>({ kind: "loading" });
   const [inventory, setInventory] = useState<LoadState<SourceInventory[]>>({ kind: "loading" });
   const [progress, setProgress] = useState<Record<string, RescanProgress>>({});
@@ -101,7 +124,7 @@ export function Sources(): ReactElement {
           const name = providerDisplayName(group.provider);
           return <section key={group.provider} aria-label={`${name} provider group`} data-provider-group={group.provider}>
             <h4>{name}</h4>
-            <ul>{group.items.map((item) => <InventoryCard key={item.source_id} item={item} progress={progress[item.source_id]} onRescan={onRescan} onCancel={onCancel} onDisable={(id) => disableSource(id).then(refresh).catch((error: unknown) => setMessage(readTesseraErrorMessage(error)))} />)}</ul>
+            <ul>{group.items.map((item) => <InventoryCard key={item.source_id} item={item} progress={progress[item.source_id]} onRescan={onRescan} onCancel={onCancel} onDisable={(id) => disableSource(id).then(refresh).catch((error: unknown) => setMessage(readTesseraErrorMessage(error)))} onBrowse={onBrowse ? () => onBrowse({ source_id: item.source_id, provider: item.provider, native_project: item.native_project }) : undefined} />)}</ul>
           </section>;
         })}</section>
       </> : null}
@@ -109,7 +132,7 @@ export function Sources(): ReactElement {
   </section>;
 }
 
-function InventoryCard({ item, progress, onRescan, onCancel, onDisable }: { item: SourceInventory; progress?: RescanProgress; onRescan: (id: string) => void; onCancel: (id: string) => void; onDisable: (id: string) => void }): ReactElement {
+function InventoryCard({ item, progress, onRescan, onCancel, onDisable, onBrowse }: { item: SourceInventory; progress?: RescanProgress; onRescan: (id: string) => void; onCancel: (id: string) => void; onDisable: (id: string) => void; onBrowse?: () => void }): ReactElement {
   const running = progress?.state === "queued" || progress?.state === "running";
   return <li data-provider={item.provider}><article>
     <h5>{providerDisplayName(item.provider)} source</h5>
@@ -130,6 +153,14 @@ function InventoryCard({ item, progress, onRescan, onCancel, onDisable }: { item
       <button type="button" onClick={() => onRescan(item.source_id)} disabled={running}>Rescan</button>
       {running ? <button type="button" onClick={() => onCancel(item.source_id)}>Cancel rescan</button> : null}
       <button type="button" onClick={() => onDisable(item.source_id)}>Disable</button>
+      {/*
+        Story 3.1 — the per-source Browse entry affordance. Rendered ONLY on
+        confirmed sources (the I/O matrix forbids browse for disabled /
+        rejected / unconfirmed). Activating it switches App's view state to
+        `<Browse>` for this `source_id`. Keyboard-reachable by default
+        (`<button type="button">`).
+      */}
+      {onBrowse ? <button type="button" onClick={onBrowse}>Browse</button> : null}
     </> : null}
   </article></li>;
 }
@@ -170,14 +201,6 @@ function healthSeverityRank(state: HealthState): number {
     // Treat any unexpected (future-widened) HealthState as least-attention-
     // worthy so a new state can never yield `NaN` and scramble the sort.
     default: return Number.MAX_SAFE_INTEGER;
-  }
-}
-
-function providerDisplayName(provider: string): string {
-  switch (provider) {
-    case "codex": return "Codex";
-    case "claude_code": return "Claude Code";
-    default: return provider;
   }
 }
 

@@ -308,3 +308,125 @@ impl SearchPage {
     pub fn empty_state(&self) -> Option<SearchEmptyState> { self.empty_state.clone() }
     pub fn sources(&self) -> &[SourceQueryStatus] { &self.sources }
 }
+
+// ---------------------------------------------------------------------------
+// Story 3.1 — BrowsePage contract (query-less browse entry).
+//
+// Browse shares SearchPage's contract mechanics (api_version envelope, cursor
+// + limit, deterministic stable sort, revision-bound cursor returning
+// `cursor_stale` on a generation change, per-result Coverage + Health, the per-
+// confirmed-source `SourceQueryStatus` sidecar, and the SAME `SearchResult`
+// DTO reused verbatim for result rows). The Boundaries "Never collapse Browse's
+// three empty states into fewer, and never reuse Search's query-bound
+// `no_match` for browse (browse is query-less)" pins why Browse has its OWN
+// three-state enum instead of reusing `SearchEmptyState`: Browse is query-less
+// so `no_match` is meaningless, and it needs `no_indexable_memory` (scanned OK,
+// zero records) which Search lacks. The "shares EmptyState with SearchPage"
+// directive is honored at the mechanism level — an enum field on the page,
+// computed only on page 1 when results are empty, communicated identically via
+// the envelope — not as one literal shared type (Design Notes).
+// ---------------------------------------------------------------------------
+
+/// Browse's three distinct empty-collection states (Epic 3 / FR-16). Computed
+/// from the browsed source's scan facts (active generation + latest run state)
+/// only on page 1 when results are empty; never on a continuation page.
+///
+/// Snake_case on the wire; the TS mirror in `src/api/browse.ts` must match
+/// exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowseEmptyState {
+    /// Confirmed source with no active generation and no successful scan —
+    /// Carver has not yet scanned this source. Distinct from "scanned OK, zero
+    /// records" so the user can tell "not yet" from "empty after scan".
+    NotYetScanned,
+    /// Confirmed source whose latest scan succeeded and activated a generation,
+    /// but that generation contains zero records. The source IS indexed; it
+    /// just has no Agent Memory to browse. Search has no analog (a search with
+    /// no matches is `no_match`, which is query-bound and meaningless for a
+    /// query-less browse).
+    NoIndexableMemory,
+    /// Confirmed source whose latest run is Failed/Retry with no usable active
+    /// generation. Mirrors `SearchEmptyState::SourceUnavailable` semantically
+    /// but is a separate wire string so the browse UI's copy can name the
+    /// query-less situation accurately.
+    SourceUnavailable,
+}
+
+/// A validated Browse request scoped to a single confirmed source. Mirrors
+/// `SearchRequest`'s `cursor + limit` shape but drops the query and the
+/// cross-provider filters (Browse is query-less and single-source).
+///
+/// Validation:
+/// - `source` must be a well-formed `src_<n>` handle (`to_rowid().is_some()`).
+///   The confirmed-source check is enforced by the browse SQL's
+///   `lifecycle_state = 'confirmed'` JOIN (mirroring search's per-source
+///   filter), and the application layer maps a non-confirmed id to
+///   `QueryError::BadRequest` (phase `browse`) per the I/O matrix.
+/// - `cursor` is bounded by `MAX_CURSOR_BYTES`.
+/// - `limit` defaults to `DEFAULT_SEARCH_LIMIT` and stays within
+///   `[1, MAX_SEARCH_LIMIT]` so a loopback request cannot force an unbounded
+///   read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowseRequest {
+    source: SourceId,
+    cursor: Option<String>,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseRequestError { Invalid }
+
+impl BrowseRequest {
+    pub fn new(
+        source: SourceId,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<Self, BrowseRequestError> {
+        if source.to_rowid().is_none() {
+            return Err(BrowseRequestError::Invalid);
+        }
+        if cursor.as_ref().is_some_and(|value| value.len() > MAX_CURSOR_BYTES) {
+            return Err(BrowseRequestError::Invalid);
+        }
+        let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+        if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
+            return Err(BrowseRequestError::Invalid);
+        }
+        Ok(Self { source, cursor, limit })
+    }
+
+    pub fn source(&self) -> &SourceId { &self.source }
+    pub fn cursor(&self) -> Option<&str> { self.cursor.as_deref() }
+    pub fn limit(&self) -> usize { self.limit }
+}
+
+/// Browse's page-1 payload. Carries the same shape as `SearchPage` (results +
+/// cursor + empty_state + per-source sidecar) so the UI can reuse Search's
+/// result-card / Provenance / Coverage / Health components without
+/// duplication. The `sources` sidecar is unfiltered (one row per confirmed
+/// source, mirroring search) so the browse UI can surface a partial-
+/// unavailability banner identical to search's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowsePage {
+    results: Vec<SearchResult>,
+    next_cursor: Option<String>,
+    empty_state: Option<BrowseEmptyState>,
+    sources: Vec<SourceQueryStatus>,
+}
+
+impl BrowsePage {
+    pub(crate) fn new(
+        results: Vec<SearchResult>,
+        next_cursor: Option<String>,
+        empty_state: Option<BrowseEmptyState>,
+        sources: Vec<SourceQueryStatus>,
+    ) -> Self {
+        Self { results, next_cursor, empty_state, sources }
+    }
+
+    pub fn results(&self) -> &[SearchResult] { &self.results }
+    pub fn next_cursor(&self) -> Option<&str> { self.next_cursor.as_deref() }
+    pub fn empty_state(&self) -> Option<BrowseEmptyState> { self.empty_state.clone() }
+    pub fn sources(&self) -> &[SourceQueryStatus] { &self.sources }
+}

@@ -39,7 +39,7 @@ use crate::application;
 use crate::application::query::QueryError;
 use crate::application::{OpenError, SourceError};
 use crate::domain::open::{OpenRequest, OpenResult};
-use crate::domain::query::{SearchPage, SearchRequest};
+use crate::domain::query::{BrowsePage, BrowseRequest, SearchPage, SearchRequest};
 use crate::domain::scan::{ScanError, ScanOutcome, ScanStatus};
 use crate::domain::source::{Source, SourceId};
 use crate::domain::CandidateSource;
@@ -179,8 +179,31 @@ pub fn search(
     let registry = SourceRegistry::new(&conn);
     let page = application::search(&registry, &conn, request).map_err(|error| match error {
         QueryError::BadRequest => ErrorEnvelope::bad_request("search"),
-        QueryError::CursorStale => ErrorEnvelope::cursor_stale(),
+        QueryError::CursorStale => ErrorEnvelope::cursor_stale("search"),
         QueryError::Internal => ErrorEnvelope::internal_for(None, "search"),
+    })?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: page,
+    })
+}
+
+/// Story 3.1 — Browse one confirmed Source's active generation. Query-less
+/// entry: the request is scoped to a single `source_id` (validated as a
+/// well-formed `src_<n>` upstream; non-confirmed/disabled/rejected/unknown →
+/// `400 bad_request` per the I/O matrix). Cursor and empty-state mechanics
+/// mirror `search`; `CursorStale → 409` so the UI's existing recovery path
+/// re-runs page 1.
+pub fn browse(
+    request: BrowseRequest,
+    state: &IndexState,
+) -> Result<Envelope<BrowsePage>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let page = application::browse(&registry, &conn, request).map_err(|error| match error {
+        QueryError::BadRequest => ErrorEnvelope::bad_request("browse"),
+        QueryError::CursorStale => ErrorEnvelope::cursor_stale("browse"),
+        QueryError::Internal => ErrorEnvelope::internal_for(None, "browse"),
     })?;
     Ok(Envelope {
         api_version: API_VERSION,
