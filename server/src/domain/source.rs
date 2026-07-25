@@ -57,9 +57,17 @@ impl SourceId {
     /// Parse the rowid back out of a `src_<n>` handle, or `None` if the string
     /// is malformed. Used by the registry to translate an externally-supplied
     /// id into the SQLite rowid for `UPDATE ... WHERE id = ?`.
+    ///
+    /// Rejects non-positive values (`src_0`, `src_-5`): SQLite
+    /// `INTEGER PRIMARY KEY AUTOINCREMENT` rowids are always `>= 1`, so a
+    /// non-positive handle is not a well-formed Source id regardless of whether
+    /// it parses as an integer. This also normalizes the cursor/source
+    /// comparison path (Story 2.4 pass-2): a hand-edited cursor cannot smuggle
+    /// `src_-5` past `to_rowid().is_some()`.
     pub fn to_rowid(&self) -> Option<i64> {
         let s = &self.0;
-        s.strip_prefix("src_").and_then(|n| n.parse::<i64>().ok())
+        let n = s.strip_prefix("src_")?.parse::<i64>().ok()?;
+        (n > 0).then_some(n)
     }
 }
 
@@ -326,6 +334,15 @@ mod tests {
         assert!(SourceId("src_x".to_string()).to_rowid().is_none());
         assert!(SourceId("not_prefixed".to_string()).to_rowid().is_none());
         assert!(SourceId("src_".to_string()).to_rowid().is_none());
+        // Story 2.4 pass-2 — non-positive rowids are not well-formed Source
+        // ids (AUTOINCREMENT rowids are always >= 1), so they must be rejected
+        // even though they parse as integers. Guards the cursor decode path
+        // against hand-edited `src_-5` / `src_0` handles.
+        assert!(SourceId("src_0".to_string()).to_rowid().is_none(), "src_0 must be rejected");
+        assert!(SourceId("src_-5".to_string()).to_rowid().is_none(), "src_-5 must be rejected");
+        // src_02 still canonicalizes to rowid 2 (leading zeros parse fine);
+        // the cursor comparison relies on this normalization.
+        assert_eq!(SourceId("src_02".to_string()).to_rowid(), Some(2));
     }
 
     #[test]

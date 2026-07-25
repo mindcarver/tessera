@@ -839,3 +839,250 @@ fn search_sidecar_flags_mixed_availability_over_http() {
     // No empty_state — the query succeeded partially.
     assert!(page["payload"]["empty_state"].is_null(), "partial unavailability must not produce an empty_state");
 }
+
+// ---------------------------------------------------------------------------
+// Story 2.4 — cross-provider filter params on the /api/search wire contract
+// ---------------------------------------------------------------------------
+
+/// Boot a live loopback server with a Codex + Claude Code fixture for Story
+/// 2.4 filter-param tests. Both sources confirmed + indexed with records
+/// carrying the shared keyword "federation"; the two providers carry different
+/// `native_project` (Codex NULL, Claude "proj-claude") and different
+/// `provider_memory_type` (Codex "memory", Claude "topic_memory") so each
+/// filter dimension has a discriminating wire-level fixture.
+fn boot_filter_test_server() -> u16 {
+    let dir = tempfile::tempdir().expect("scratch app-data dir");
+    let state = tessera_lib::boot(dir.path()).expect("boot");
+    {
+        let conn = state.conn.lock().expect("connection lock");
+        // Source 1: Codex, NULL native_project.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (1, 'codex', 'agent_memory', 'confirmed', 'healthy', 'full', '/fixture-codex', 'fp-codex', NULL)",
+            [],
+        ).expect("codex source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (1, 'gen_1', 'succeeded', 1, 'gen_1', 'fixture')",
+            [],
+        ).expect("codex scan run");
+        conn.execute("INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')", []).expect("codex active gen");
+        conn.execute(
+            "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+             VALUES ('rec_codex', 1, 'gen_1', 'codex', 'section', 'rec_codex', 'file:///fixture#x', 'hash', 'v1', 'federation patterns', 'body', NULL, 'memory', 'full', 100, 'revision', 'file:///fixture#L1-L2')",
+            [],
+        ).expect("codex record");
+        // Source 2: Claude Code, proj-claude, topic_memory type.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (2, 'claude_code', 'agent_memory', 'confirmed', 'healthy', 'full', '/fixture-claude', 'fp-claude', 'proj-claude')",
+            [],
+        ).expect("claude source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (2, 'gen_2', 'succeeded', 1, 'gen_2', 'fixture')",
+            [],
+        ).expect("claude scan run");
+        conn.execute("INSERT INTO tessera_meta(key, value) VALUES ('active_generation:2', 'gen_2')", []).expect("claude active gen");
+        conn.execute(
+            "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+             VALUES ('rec_claude', 2, 'gen_2', 'claude_code', 'section', 'rec_claude', 'file:///fixture#y', 'hash', 'v1', 'federation topic', 'body', 'proj-claude', 'topic_memory', 'full', 200, 'revision', 'file:///fixture#L3-L4')",
+            [],
+        ).expect("claude record");
+    }
+    let server = bind("127.0.0.1:0");
+    let port = server.server_addr().to_ip().expect("bound addr").port();
+    let state = Arc::new(state);
+    let server_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let _dir = dir;
+        serve_with(server, server_state, PathBuf::from("dist"), Some(port));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    port
+}
+
+/// Story 2.4 AC — `/api/search?provider=codex` narrows the result set to Codex
+/// records on the wire. The unfiltered query returns both providers; the
+/// provider-filtered query returns only Codex.
+#[test]
+fn search_provider_filter_narrows_results_over_http() {
+    let port = boot_filter_test_server();
+    // Baseline: no filter → both providers.
+    let baseline = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(baseline.starts_with("HTTP/1.1 200"), "baseline: {baseline}");
+    let baseline_body = baseline.split("\r\n\r\n").nth(1).expect("body");
+    let baseline_json: serde_json::Value = serde_json::from_str(baseline_body).expect("json");
+    let baseline_providers: std::collections::HashSet<String> = baseline_json["payload"]["results"]
+        .as_array().expect("results array")
+        .iter()
+        .map(|value| value["provider"].as_str().expect("provider string").to_string())
+        .collect();
+    assert!(baseline_providers.contains("codex") && baseline_providers.contains("claude_code"),
+        "baseline must include both providers: {baseline_providers:?}");
+
+    // Filtered: provider=codex → only Codex.
+    let filtered = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&provider=codex&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(filtered.starts_with("HTTP/1.1 200"), "filtered: {filtered}");
+    let filtered_body = filtered.split("\r\n\r\n").nth(1).expect("body");
+    let filtered_json: serde_json::Value = serde_json::from_str(filtered_body).expect("json");
+    let filtered_providers: std::collections::HashSet<String> = filtered_json["payload"]["results"]
+        .as_array().expect("results array")
+        .iter()
+        .map(|value| value["provider"].as_str().expect("provider string").to_string())
+        .collect();
+    assert!(filtered_providers.contains("codex"), "codex must remain: {filtered_providers:?}");
+    assert!(!filtered_providers.contains("claude_code"), "claude must be excluded: {filtered_providers:?}");
+}
+
+/// Story 2.4 AC (Spec Change Log 2026-07-25) — `/api/search?source=src_2`
+/// narrows to that one specific source's records on the wire, distinct from the
+/// coarser provider filter. The fixture has src_1 (codex) + src_2 (claude).
+#[test]
+fn search_source_filter_narrows_results_over_http() {
+    let port = boot_filter_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&source=src_2&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("body");
+    let json: serde_json::Value = serde_json::from_str(body).expect("json");
+    let results = json["payload"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "only the src_2 (claude) record must match: {results:?}");
+    assert_eq!(results[0]["provider"].as_str(), Some("claude_code"));
+    assert_eq!(results[0]["source_id"].as_str(), Some("src_2"));
+    // A non-confirmed source id is accepted at the contract layer but yields no
+    // rows (the SQL JOIN on lifecycle_state='confirmed' excludes it).
+    let empty = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&source=src_99&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(empty.starts_with("HTTP/1.1 200"), "non-confirmed source is not an error: {empty}");
+    let empty_body = empty.split("\r\n\r\n").nth(1).expect("body");
+    let empty_json: serde_json::Value = serde_json::from_str(empty_body).expect("json");
+    assert_eq!(empty_json["payload"]["results"].as_array().expect("results").len(), 0, "src_99 yields no rows");
+}
+
+/// Story 2.4 I/O matrix — a malformed `source` handle → 400 `bad_request`.
+#[test]
+fn search_rejects_malformed_source_handle_with_bad_request() {
+    let port = boot_filter_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&source=not-a-source&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 400"), "got:\n{response}");
+    assert!(response.contains("\"code\":\"bad_request\""), "got:\n{response}");
+}
+
+/// Story 2.4 AC — `/api/search?memory_type=topic_memory` narrows to the Claude
+/// topic_memory record on the wire.
+#[test]
+fn search_memory_type_filter_narrows_results_over_http() {
+    let port = boot_filter_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&memory_type=topic_memory&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("body");
+    let json: serde_json::Value = serde_json::from_str(body).expect("json");
+    let results = json["payload"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "only the topic_memory record must match: {results:?}");
+    assert_eq!(results[0]["record_id"].as_str(), Some("rec_claude"));
+}
+
+/// Story 2.4 AC — `/api/search?native_project=proj-claude` matches Claude's
+/// record and excludes Codex's NULL native_project (SQL `NULL = 'x'` is NULL).
+#[test]
+fn search_native_project_filter_excludes_null_over_http() {
+    let port = boot_filter_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&native_project=proj-claude&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("body");
+    let json: serde_json::Value = serde_json::from_str(body).expect("json");
+    let results = json["payload"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "only the proj-claude record must match: {results:?}");
+    assert_eq!(results[0]["provider"].as_str(), Some("claude_code"));
+}
+
+/// Story 2.4 AC — `/api/search?since=N` narrows by `observed_at >= N`. The
+/// fixture has Codex at 100 and Claude at 200; `since=150` must exclude Codex.
+#[test]
+fn search_since_filter_narrows_results_over_http() {
+    let port = boot_filter_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&since=150&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("body");
+    let json: serde_json::Value = serde_json::from_str(body).expect("json");
+    let results = json["payload"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "only the observed_at>=150 record must match: {results:?}");
+    assert_eq!(results[0]["provider"].as_str(), Some("claude_code"));
+}
+
+/// Story 2.4 I/O matrix — unknown `provider` value → 400 `bad_request`.
+#[test]
+fn search_rejects_unknown_provider_value_with_bad_request() {
+    let port = boot_filter_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&provider=bogus_provider&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 400"), "got:\n{response}");
+    assert!(response.contains("\"code\":\"bad_request\""), "got:\n{response}");
+}
+
+/// Story 2.4 I/O matrix — unknown `memory_type` value → 400 `bad_request`.
+#[test]
+fn search_rejects_unknown_memory_type_value_with_bad_request() {
+    let port = boot_filter_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&memory_type=bogus_type&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 400"), "got:\n{response}");
+    assert!(response.contains("\"code\":\"bad_request\""), "got:\n{response}");
+}
+
+/// Story 2.4 I/O matrix — `tessera_project` param is accepted and ignored at
+/// the SQL layer (reserved for Epic 5). The result set equals the unfiltered
+/// default scope.
+#[test]
+fn search_accepts_and_ignores_tessera_project_param_over_http() {
+    let port = boot_filter_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&tessera_project=epic-5-future&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("body");
+    let json: serde_json::Value = serde_json::from_str(body).expect("json");
+    let results = json["payload"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2, "tessera_project must not narrow: both records must match: {results:?}");
+}
+
+/// Story 2.4 AC — unknown query keys are still rejected (the filter params are
+/// allowlisted, not arbitrary). This keeps the contract bounded.
+#[test]
+fn search_rejects_unknown_query_key_with_bad_request() {
+    let port = boot_filter_test_server();
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&unknown_key=value&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 400"), "got:\n{response}");
+    assert!(response.contains("\"code\":\"bad_request\""), "got:\n{response}");
+}

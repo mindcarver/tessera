@@ -4,8 +4,9 @@ use tempfile::tempdir;
 
 use tessera_lib::application;
 use tessera_lib::application::query::QueryError;
-use tessera_lib::domain::ports::provider_adapter::{CoverageLevel, DiscoveryBasis};
-use tessera_lib::domain::query::{SearchEmptyState, SearchRequest, SourceQueryStatusKind};
+use tessera_lib::domain::ports::provider_adapter::{CoverageLevel, DiscoveryBasis, ProviderMemoryType};
+use tessera_lib::domain::query::{SearchEmptyState, SearchFilters, SearchRequest, SourceQueryStatusKind, KNOWN_PROVIDER_IDS};
+use tessera_lib::domain::source::SourceId;
 use tessera_lib::index::{migrations, SourceRegistry};
 use tessera_lib::domain::CandidateSource;
 
@@ -180,10 +181,40 @@ fn insert_record(
     coverage_level: &str,
     native_project: Option<&str>,
 ) {
+    insert_record_typed(
+        conn,
+        record_id,
+        source_rowid,
+        provider,
+        title,
+        body,
+        observed_at,
+        coverage_level,
+        native_project,
+        "memory",
+    );
+}
+
+/// Story 2.4 helper — like [`insert_record`] but also sets
+/// `provider_memory_type`, needed by the memory-type filter tests. The default
+/// helper keeps `'memory'` so 2.3 callers are unchanged.
+#[allow(clippy::too_many_arguments)]
+fn insert_record_typed(
+    conn: &Connection,
+    record_id: &str,
+    source_rowid: i64,
+    provider: &str,
+    title: &str,
+    body: &str,
+    observed_at: i64,
+    coverage_level: &str,
+    native_project: Option<&str>,
+    memory_type: &str,
+) {
     let generation = format!("gen_{source_rowid}");
     conn.execute(
         "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
-         VALUES (?1, ?2, ?3, ?4, 'section', ?1, ?5, 'hash', 'v1', ?6, ?7, ?8, 'memory', ?9, ?10, 'revision', ?5)",
+         VALUES (?1, ?2, ?3, ?4, 'section', ?1, ?5, 'hash', 'v1', ?6, ?7, ?8, ?9, ?10, ?11, 'revision', ?5)",
         params![
             record_id,
             source_rowid,
@@ -193,6 +224,7 @@ fn insert_record(
             title,
             body,
             native_project,
+            memory_type,
             coverage_level,
             observed_at,
         ],
@@ -430,4 +462,503 @@ fn v1_cursor_is_rejected_as_stale_not_bad_request() {
         SearchRequest::new("中文".into(), Some(v1_cursor), Some(1)).unwrap(),
     ).unwrap_err();
     assert!(matches!(err, QueryError::CursorStale), "v1 cursor must map to CursorStale, got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Story 2.4 — cross-provider combined filtering & range visibility
+// ---------------------------------------------------------------------------
+
+/// Build a multi-provider fixture for Story 2.4 filter tests: Codex (NULL
+/// native_project) and Claude Code (proj-claude) both confirmed + indexed with
+/// records carrying the shared keyword "federation". Records vary
+/// `provider_memory_type` and `observed_at` so each filter dimension has a
+/// discriminating fixture.
+fn build_filter_fixture() -> Connection {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    migrations::apply(&mut conn).unwrap();
+    insert_confirmed_source(&conn, 1, "codex", "healthy", None, true);
+    insert_confirmed_source(&conn, 2, "claude_code", "healthy", Some("proj-claude"), true);
+    // Codex records: NULL native_project, type=memory.
+    insert_record_typed(&conn, "rec_codex_old", 1, "codex", "federation early", "body", 100, "full", None, "memory");
+    insert_record_typed(&conn, "rec_codex_summary", 1, "codex", "federation summary", "body", 500, "full", None, "memory_summary");
+    // Claude records: proj-claude, mix of memory + topic_memory.
+    insert_record_typed(&conn, "rec_claude_mem", 2, "claude_code", "federation memory", "body", 200, "full", Some("proj-claude"), "memory");
+    insert_record_typed(&conn, "rec_claude_topic", 2, "claude_code", "federation topic", "body", 300, "full", Some("proj-claude"), "topic_memory");
+    conn
+}
+
+/// Story 2.4 AC — provider filter narrows to one provider's records.
+#[test]
+fn provider_filter_narrows_to_one_provider() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters { provider: Some("codex".into()), ..Default::default() },
+        ).unwrap(),
+    ).unwrap();
+    let providers: std::collections::HashSet<&str> = page.results().iter().map(|r| r.provider()).collect();
+    assert!(providers.contains("codex"), "codex must be present: {providers:?}");
+    assert!(!providers.contains("claude_code"), "claude must be excluded by provider filter: {providers:?}");
+    // The sidecar stays unfiltered (Design Notes: availability info, not
+    // result info) — both confirmed sources are still listed.
+    let sidecar_providers: std::collections::HashSet<&str> = page.sources().iter().map(|s| s.provider.as_str()).collect();
+    assert!(sidecar_providers.contains("codex") && sidecar_providers.contains("claude_code"),
+        "sidecar must stay unfiltered: {sidecar_providers:?}");
+}
+
+/// Story 2.4 AC (Spec Change Log 2026-07-25) — the per-source filter narrows to
+/// one specific confirmed source's records. With the multi-source fixture,
+/// `source=src_2` returns only Claude's records and `source=src_1` only Codex's.
+#[test]
+fn source_filter_narrows_to_one_specific_source() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    // src_2 → only the two Claude records.
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters { source: Some(SourceId("src_2".into())), ..Default::default() },
+        ).unwrap(),
+    ).unwrap();
+    let providers: std::collections::HashSet<&str> = page.results().iter().map(|r| r.provider()).collect();
+    assert!(!providers.contains("codex"), "codex (src_1) must be excluded by source=src_2: {providers:?}");
+    assert!(providers.contains("claude_code"), "claude (src_2) must be present: {providers:?}");
+    assert_eq!(page.results().len(), 2, "both src_2 records must match: {:?}", page.results().iter().map(|r| r.record_id()).collect::<Vec<_>>());
+
+    // src_1 → only the two Codex records.
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters { source: Some(SourceId("src_1".into())), ..Default::default() },
+        ).unwrap(),
+    ).unwrap();
+    let providers: std::collections::HashSet<&str> = page.results().iter().map(|r| r.provider()).collect();
+    assert!(providers.contains("codex") && !providers.contains("claude_code"),
+        "source=src_1 must narrow to codex only: {providers:?}");
+    assert_eq!(page.results().len(), 2);
+}
+
+/// Story 2.4 AC (Spec Change Log) — the source filter is DISTINCT from the
+/// coarser provider filter: when one provider owns several confirmed sources,
+/// `source=src_<n>` narrows to just that source's records. Two Claude sources
+/// each carry a record; `source=src_3` returns only src_3's record.
+#[test]
+fn source_filter_is_distinct_from_provider_filter() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    migrations::apply(&mut conn).unwrap();
+    // Two Claude sources under one provider.
+    insert_confirmed_source(&conn, 2, "claude_code", "healthy", Some("proj-a"), true);
+    insert_confirmed_source(&conn, 3, "claude_code", "healthy", Some("proj-b"), true);
+    insert_record(&conn, "rec_src2", 2, "claude_code", "federation a", "body", 100, "full", Some("proj-a"));
+    insert_record(&conn, "rec_src3", 3, "claude_code", "federation b", "body", 200, "full", Some("proj-b"));
+
+    let registry = SourceRegistry::new(&conn);
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters { source: Some(SourceId("src_3".into())), ..Default::default() },
+        ).unwrap(),
+    ).unwrap();
+    let ids: Vec<&str> = page.results().iter().map(|r| r.record_id()).collect();
+    assert_eq!(ids, vec!["rec_src3"], "source=src_3 must narrow to only src_3's record: {ids:?}");
+
+    // AND-combines with another filter: source=src_2 AND memory_type.
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters {
+                source: Some(SourceId("src_2".into())),
+                memory_type: Some(ProviderMemoryType::Memory),
+                ..Default::default()
+            },
+        ).unwrap(),
+    ).unwrap();
+    let ids: Vec<&str> = page.results().iter().map(|r| r.record_id()).collect();
+    assert_eq!(ids, vec!["rec_src2"], "source AND memory_type must narrow to src_2's memory record: {ids:?}");
+}
+
+/// Story 2.4 — a malformed `source` handle is rejected at request construction
+/// (the HTTP layer maps this to 400 `bad_request`).
+#[test]
+fn source_filter_rejects_malformed_handle() {
+    assert!(SearchRequest::new_with_filters(
+        "federation".into(), None, Some(20),
+        SearchFilters { source: Some(SourceId("not-a-source".into())), ..Default::default() },
+    ).is_err());
+    // A bare `src_` with no rowid is also malformed.
+    assert!(SearchRequest::new_with_filters(
+        "federation".into(), None, Some(20),
+        SearchFilters { source: Some(SourceId("src_".into())), ..Default::default() },
+    ).is_err());
+}
+
+/// Story 2.4 — native_project is trimmed at request construction so stray
+/// whitespace does not silently fail to match.
+#[test]
+fn native_project_filter_is_trimmed() {
+    let request = SearchRequest::new_with_filters(
+        "federation".into(), None, Some(20),
+        SearchFilters { native_project: Some("  proj-claude  ".into()), ..Default::default() },
+    ).unwrap();
+    assert_eq!(request.native_project(), Some("proj-claude"));
+    // All-whitespace becomes None (no predicate).
+    let request = SearchRequest::new_with_filters(
+        "federation".into(), None, Some(20),
+        SearchFilters { native_project: Some("   ".into()), ..Default::default() },
+    ).unwrap();
+    assert_eq!(request.native_project(), None);
+}
+
+/// Story 2.4 AC — memory-type filter narrows to the matching
+/// `provider_memory_type` across providers.
+#[test]
+fn memory_type_filter_narrows_across_providers() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters { memory_type: Some(ProviderMemoryType::Memory), ..Default::default() },
+        ).unwrap(),
+    ).unwrap();
+    // Only type=memory records match (rec_codex_old + rec_claude_mem); the
+    // memory_summary and topic_memory records are excluded.
+    let ids: std::collections::HashSet<&str> = page.results().iter().map(|r| r.record_id()).collect();
+    assert!(ids.contains("rec_codex_old"), "codex memory must match: {ids:?}");
+    assert!(ids.contains("rec_claude_mem"), "claude memory must match: {ids:?}");
+    assert!(!ids.contains("rec_codex_summary"), "memory_summary must be excluded: {ids:?}");
+    assert!(!ids.contains("rec_claude_topic"), "topic_memory must be excluded: {ids:?}");
+}
+
+/// Story 2.4 AC — native-project filter matches across providers, and Codex's
+/// NULL `native_project` honestly does NOT match (SQL `NULL = 'x'` is NULL).
+#[test]
+fn native_project_filter_matches_across_providers_and_excludes_null() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    migrations::apply(&mut conn).unwrap();
+    insert_confirmed_source(&conn, 1, "codex", "healthy", None, true);
+    insert_confirmed_source(&conn, 2, "claude_code", "healthy", Some("proj-claude"), true);
+    // Add a second Claude source carrying the same project so the cross-
+    // provider aspect is exercised within the Claude provider too.
+    insert_confirmed_source(&conn, 3, "claude_code", "healthy", Some("proj-claude"), true);
+    insert_record(&conn, "rec_codex_null_proj", 1, "codex", "federation global", "body", 100, "full", None);
+    insert_record(&conn, "rec_claude_a", 2, "claude_code", "federation proj a", "body", 200, "full", Some("proj-claude"));
+    insert_record(&conn, "rec_claude_b", 3, "claude_code", "federation proj b", "body", 300, "full", Some("proj-claude"));
+
+    let registry = SourceRegistry::new(&conn);
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters { native_project: Some("proj-claude".into()), ..Default::default() },
+        ).unwrap(),
+    ).unwrap();
+    let ids: std::collections::HashSet<&str> = page.results().iter().map(|r| r.record_id()).collect();
+    assert!(ids.contains("rec_claude_a") && ids.contains("rec_claude_b"),
+        "both proj-claude records must match across sources: {ids:?}");
+    assert!(!ids.contains("rec_codex_null_proj"),
+        "Codex NULL native_project must NOT match a project filter: {ids:?}");
+}
+
+/// Story 2.4 AC — time filter (`since`) narrows by `observed_at >= since`.
+#[test]
+fn time_filter_narrows_by_observed_at() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    // Only records with observed_at >= 250 should match.
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters { since: Some(250), ..Default::default() },
+        ).unwrap(),
+    ).unwrap();
+    let observed: Vec<i64> = page.results().iter().map(|r| r.observed_at()).collect();
+    assert!(observed.iter().all(|&value| value >= 250), "all results must satisfy observed_at >= 250: {observed:?}");
+    assert!(observed.contains(&500), "the 500 record must be present: {observed:?}");
+    assert!(observed.contains(&300), "the 300 record must be present: {observed:?}");
+    assert!(!observed.contains(&100) && !observed.contains(&200),
+        "the 100/200 records must be excluded by since=250: {observed:?}");
+}
+
+/// Story 2.4 AC — combined filters narrow with AND.
+#[test]
+fn combined_filters_narrow_with_and() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    // provider=codex AND memory_type=memory AND since=50 → only rec_codex_old
+    // (codex, memory, observed_at=100). rec_codex_summary is memory_summary;
+    // both Claude records are excluded by provider.
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters {
+                provider: Some("codex".into()),
+                memory_type: Some(ProviderMemoryType::Memory),
+                since: Some(50),
+                ..Default::default()
+            },
+        ).unwrap(),
+    ).unwrap();
+    let ids: Vec<&str> = page.results().iter().map(|r| r.record_id()).collect();
+    assert_eq!(ids, vec!["rec_codex_old"], "AND combination must narrow to exactly the codex memory record: {ids:?}");
+}
+
+/// Story 2.4 AC — no filters (Default) is the 2.3 default scope: all confirmed
+/// sources, relevance-ordered. This is the Clear-filters equivalent.
+#[test]
+fn no_filters_returns_default_confirmed_source_scope() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    let unfiltered = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters::default(),
+        ).unwrap(),
+    ).unwrap();
+    let providers: std::collections::HashSet<&str> = unfiltered.results().iter().map(|r| r.provider()).collect();
+    assert!(providers.contains("codex") && providers.contains("claude_code"),
+        "default scope must include both providers: {providers:?}");
+    assert_eq!(unfiltered.results().len(), 4, "all four fixture records must match under no filters");
+}
+
+/// Story 2.4 I/O matrix — a filter change mid-pagination is rejected as
+/// `CursorStale`. The cursor binds the active filters (v3); a cursor whose
+/// filters differ from the request cannot page through a stale result set.
+/// The UI's existing `cursor_stale` recovery path re-runs page 1 under the new
+/// filters.
+#[test]
+fn cursor_stale_on_filter_change_mid_pagination() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    // Page 1 with no filters (limit 1 → has more).
+    let first = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(1),
+            SearchFilters::default(),
+        ).unwrap(),
+    ).unwrap();
+    let cursor = first.next_cursor().expect("first page cursor").to_string();
+    // Continue with the cursor but ADD a provider filter — the cursor's bound
+    // filters (none) differ from the request's filters (provider=codex), so
+    // the server must reject it as CursorStale.
+    let err = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            Some(cursor),
+            Some(1),
+            SearchFilters { provider: Some("codex".into()), ..Default::default() },
+        ).unwrap(),
+    ).unwrap_err();
+    assert!(matches!(err, QueryError::CursorStale), "filter-change cursor must be CursorStale, got {err:?}");
+}
+
+/// Story 2.4 — a cursor issued UNDER a filter set must be accepted when the
+/// request repeats the SAME filter set (pagination continues). This pins the
+/// positive path so the stale-rejection test above is not vacuous.
+#[test]
+fn cursor_is_accepted_when_filters_match_the_request() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    let filters = SearchFilters { provider: Some("codex".into()), ..Default::default() };
+    let first = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters("federation".into(), None, Some(1), filters.clone()).unwrap(),
+    ).unwrap();
+    let cursor = first.next_cursor().expect("first page cursor").to_string();
+    let second = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters("federation".into(), Some(cursor), Some(1), filters).unwrap(),
+    ).unwrap();
+    // Page 2 under the same filter set must return the next codex record,
+    // not error.
+    assert_eq!(second.results().len(), 1, "page 2 must return the next codex record");
+    assert_eq!(second.results()[0].provider(), "codex");
+    assert_ne!(second.results()[0].record_id(), first.results()[0].record_id());
+}
+
+/// Story 2.4 (Spec Change Log) — a cursor issued UNDER a per-source filter
+/// round-trips the `source` binding: pagination continues when the same source
+/// filter repeats, and is rejected as stale when the source filter changes.
+#[test]
+fn source_filter_binds_into_cursor_and_round_trips() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    let filters = SearchFilters { source: Some(SourceId("src_1".into())), ..Default::default() };
+    // Page 1 (limit 1): one codex record, has more.
+    let first = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters("federation".into(), None, Some(1), filters.clone()).unwrap(),
+    ).unwrap();
+    let cursor = first.next_cursor().expect("first page cursor").to_string();
+    assert_eq!(first.results()[0].provider(), "codex");
+
+    // Same source filter → page 2 accepts the cursor and returns the next codex record.
+    let second = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters("federation".into(), Some(cursor.clone()), Some(1), filters).unwrap(),
+    ).unwrap();
+    assert_eq!(second.results()[0].provider(), "codex");
+    assert_ne!(second.results()[0].record_id(), first.results()[0].record_id());
+
+    // Different source filter (src_2) with the src_1 cursor → CursorStale.
+    let err = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            Some(cursor),
+            Some(1),
+            SearchFilters { source: Some(SourceId("src_2".into())), ..Default::default() },
+        ).unwrap(),
+    ).unwrap_err();
+    assert!(matches!(err, QueryError::CursorStale), "source filter change must be CursorStale, got {err:?}");
+}
+
+/// Story 2.4 I/O matrix — `tessera_project` is accepted but produces NO
+/// predicate (reserved for Epic 5). A request carrying it returns the same
+/// result set as one without it.
+#[test]
+fn tessera_project_filter_is_accepted_but_ignored_at_sql_layer() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    let with_reserved = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters { tessera_project: Some("epic-5-future".into()), ..Default::default() },
+        ).unwrap(),
+    ).unwrap();
+    // Same result set as the unfiltered default scope — no predicate applied.
+    assert_eq!(with_reserved.results().len(), 4, "tessera_project must not narrow results");
+    let providers: std::collections::HashSet<&str> = with_reserved.results().iter().map(|r| r.provider()).collect();
+    assert!(providers.contains("codex") && providers.contains("claude_code"));
+}
+
+/// Story 2.4 I/O matrix — unknown provider / memory_type / negative `since`
+/// are rejected at `SearchRequest::new_with_filters` (the HTTP layer maps this
+/// to 400 `bad_request`).
+#[test]
+fn invalid_filter_values_are_rejected_at_request_construction() {
+    // Unknown provider id.
+    assert!(SearchRequest::new_with_filters(
+        "federation".into(), None, Some(20),
+        SearchFilters { provider: Some("bogus_provider".into()), ..Default::default() },
+    ).is_err());
+    // Negative `since`.
+    assert!(SearchRequest::new_with_filters(
+        "federation".into(), None, Some(20),
+        SearchFilters { since: Some(-1), ..Default::default() },
+    ).is_err());
+    // `memory_type` is a typed enum, so the HTTP layer's `from_str` is the
+    // rejection boundary — covered by http_api tests. Here we just confirm the
+    // typed path does not itself invent a bogus variant.
+    assert_eq!(ProviderMemoryType::parse_str("bogus_type"), None);
+    assert_eq!(ProviderMemoryType::parse_str("memory"), Some(ProviderMemoryType::Memory));
+}
+
+/// Story 2.4 — `ProviderMemoryType::parse_str` is the exact reverse of `as_str`
+/// for the whole vocabulary, so the filter contract has one source of truth.
+#[test]
+fn provider_memory_type_from_str_reverses_as_str_for_whole_vocabulary() {
+    for variant in [
+        ProviderMemoryType::Memory,
+        ProviderMemoryType::MemorySummary,
+        ProviderMemoryType::RawMemories,
+        ProviderMemoryType::RolloutSummary,
+        ProviderMemoryType::TopicMemory,
+    ] {
+        assert_eq!(
+            ProviderMemoryType::parse_str(variant.as_str()),
+            Some(variant),
+            "from_str(as_str({:?})) must round-trip",
+            variant,
+        );
+    }
+    assert_eq!(ProviderMemoryType::parse_str(""), None);
+    assert_eq!(ProviderMemoryType::parse_str("MEMORY"), None, "parse_str is case-sensitive");
+}
+
+/// Patch 11 — `KNOWN_PROVIDER_IDS` is an explicit allowlist in `domain`, which
+/// cannot import the adapter registry without breaking the hexagonal rule
+/// (`domain` depends only on its own ports; `adapters` implement them). The
+/// allowlist can therefore drift from the adapters' `PROVIDER_ID` constants.
+/// This test fails if the two desync: a missing adapter id would make a valid
+/// provider filter reject as `bad_request`, and a stale allowlist entry would
+/// let the UI offer a provider filter that always yields zero rows.
+#[test]
+fn known_provider_ids_match_registered_adapters() {
+    use tessera_lib::adapters::claude_code::ClaudeCodeAdapter;
+    use tessera_lib::adapters::codex::CodexAdapter;
+    let adapter_ids = [CodexAdapter::PROVIDER_ID, ClaudeCodeAdapter::PROVIDER_ID];
+    // Every registered adapter's id is in the allowlist.
+    for id in adapter_ids.iter() {
+        assert!(
+            KNOWN_PROVIDER_IDS.contains(id),
+            "adapter PROVIDER_ID {id:?} must be in KNOWN_PROVIDER_IDS"
+        );
+    }
+    // The allowlist carries no id that no adapter claims.
+    for id in KNOWN_PROVIDER_IDS.iter() {
+        assert!(
+            adapter_ids.contains(id),
+            "KNOWN_PROVIDER_IDS entry {id:?} must map to a registered adapter"
+        );
+    }
 }

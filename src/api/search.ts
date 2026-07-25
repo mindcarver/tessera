@@ -46,10 +46,108 @@ export interface SearchPage {
   sources?: SourceQueryStatus[];
 }
 
-export async function searchMemories(q: string, cursor?: string, limit = 20): Promise<Envelope<SearchPage>> {
+/**
+ * Story 2.4 — provider memory-type vocabulary, mirroring the Rust
+ * `ProviderMemoryType::as_str` snake_case wire strings. Keep in lockstep with
+ * `server/src/domain/ports/provider_adapter.rs`.
+ */
+export const PROVIDER_MEMORY_TYPES = [
+  "memory",
+  "memory_summary",
+  "raw_memories",
+  "rollout_summary",
+  "topic_memory",
+] as const;
+export type ProviderMemoryType = (typeof PROVIDER_MEMORY_TYPES)[number];
+
+/**
+ * Story 2.4 — provider id vocabulary. Keep in lockstep with the Rust
+ * `KNOWN_PROVIDER_IDS` constant in `server/src/domain/query.rs`.
+ */
+export const KNOWN_PROVIDER_IDS = ["codex", "claude_code"] as const;
+export type KnownProviderId = (typeof KNOWN_PROVIDER_IDS)[number];
+
+/**
+ * Story 2.4 — time-preset filter options. The UI computes an absolute
+ * `since = now - N*86400` client-side; the server stays stateless.
+ */
+export const SEARCH_TIME_PRESETS = ["7d", "30d", "all"] as const;
+export type SearchTimePreset = (typeof SEARCH_TIME_PRESETS)[number];
+
+/**
+ * Story 2.4 — optional cross-provider filters. `undefined` everywhere is the
+ * 2.3 default scope (all confirmed sources, relevance-ordered). Each set
+ * value narrows the result set with AND. `since` is an ABSOLUTE Unix-epoch
+ * seconds value, NOT a relative preset: the UI resolves a time preset to an
+ * absolute `since` ONCE on page 1 and reuses that same value for every "Load
+ * more" in the session (Spec Change Log — `since` stable across a pagination
+ * session). Recomputing `now` per page would change `since` between page 1 and
+ * a later page, binding a different value into the cursor → `cursor_stale` →
+ * "Load more" breaks under a time preset. The server stays stateless and never
+ * computes relative time.
+ */
+export interface SearchFilters {
+  provider?: KnownProviderId;
+  /**
+   * Per-source filter (Spec Change Log 2026-07-25): narrows to one specific
+   * confirmed source's `src_<n>` id, distinct from the coarser provider filter.
+   */
+  source?: string;
+  memory_type?: ProviderMemoryType;
+  native_project?: string;
+  /**
+   * Absolute Unix-epoch seconds (`observed_at >= since`). Resolved once per
+   * pagination session by the UI; the server never computes relative time.
+   */
+  since?: number;
+}
+
+/**
+ * Story 2.4 — build the URLSearchParams for a search request. Exposed so the
+ * UI's effective-range readout can reason about exactly which params will be
+ * sent without duplicating the serialization logic. `since` is serialized
+ * verbatim (the caller resolves the preset to an absolute value once).
+ */
+export function buildSearchParams(
+  q: string,
+  cursor: string | undefined,
+  limit: number,
+  filters: SearchFilters | undefined,
+): URLSearchParams {
   const params = new URLSearchParams({ q });
   if (cursor) params.set("cursor", cursor);
   params.set("limit", String(limit));
+  if (filters) {
+    if (filters.provider) params.set("provider", filters.provider);
+    if (filters.source) params.set("source", filters.source);
+    if (filters.memory_type) params.set("memory_type", filters.memory_type);
+    if (filters.native_project) params.set("native_project", filters.native_project);
+    if (filters.since !== undefined) params.set("since", String(filters.since));
+  }
+  return params;
+}
+
+/**
+ * Resolve a UI time preset to an absolute Unix-epoch seconds value, or
+ * `undefined` when the preset is `"all"` / absent (no `since` on the wire).
+ * The UI calls this ONCE on page 1 and reuses the result for every "Load
+ * more" in the session so the cursor's bound `since` does not drift across
+ * pages (Spec Change Log — `since` stability).
+ */
+export function sinceFromPreset(preset: SearchTimePreset | undefined): number | undefined {
+  if (!preset || preset === "all") return undefined;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const days = preset === "7d" ? 7 : 30;
+  return nowSec - days * 86400;
+}
+
+export async function searchMemories(
+  q: string,
+  cursor?: string,
+  limit = 20,
+  filters?: SearchFilters,
+): Promise<Envelope<SearchPage>> {
+  const params = buildSearchParams(q, cursor, limit, filters);
   const value = await apiGet(`/api/search?${params.toString()}`);
   if (!isSearchEnvelope(value)) throw apiContractError();
   return value;

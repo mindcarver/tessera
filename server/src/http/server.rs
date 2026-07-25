@@ -34,7 +34,8 @@ use std::sync::Arc;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::domain::open::OpenRequest;
-use crate::domain::query::{SearchRequest, MAX_CURSOR_BYTES, MAX_QUERY_BYTES};
+use crate::domain::query::{SearchFilters, SearchRequest, MAX_CURSOR_BYTES, MAX_FILTER_BYTES, MAX_QUERY_BYTES};
+use crate::domain::ports::provider_adapter::ProviderMemoryType;
 use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
@@ -338,13 +339,24 @@ fn parse_rescan_events_query(query: &str) -> Option<(SourceId, String, u64)> {
     Some((source_id?, job_id?, after?))
 }
 
-/// Parse exactly q/cursor/limit. Values are percent-decoded before the
-/// request domain validates byte length and range; unknown/duplicate keys are
-/// rejected so API behavior stays bounded and unambiguous.
+/// Parse exactly q/cursor/limit plus the Story 2.4 cross-provider filter
+/// params (`provider`, `source`, `memory_type`, `native_project`, `since`,
+/// reserved `tessera_project`). Text values are percent-decoded before the
+/// request domain validates byte length and vocabulary; `since` is parsed as a
+/// Unix-epoch `i64`; `source` is a `src_<n>` handle; unknown/duplicate keys are
+/// rejected so API behavior stays bounded and unambiguous. Validation (known
+/// provider id, valid memory type, `since >= 0`, well-formed `source`) lives
+/// in [`SearchRequest::new_with_filters`].
 fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
     let mut q = None;
     let mut cursor = None;
     let mut limit = None;
+    let mut provider = None;
+    let mut source = None;
+    let mut memory_type = None;
+    let mut native_project = None;
+    let mut since = None;
+    let mut tessera_project = None;
     if query.is_empty() {
         return Err(());
     }
@@ -368,10 +380,60 @@ fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
                         .map_err(|_| ())?,
                 );
             }
+            // Story 2.4 — text filters are percent-decoded and bounded; the
+            // request domain validates provider id membership and memory-type
+            // vocabulary.
+            "provider" if provider.is_none() => {
+                provider = Some(percent_decode_bounded(raw_value, MAX_FILTER_BYTES).ok_or(())?);
+            }
+            // Per-source filter (Spec Change Log 2026-07-25): `src_<n>` handle.
+            // The shape is validated by `SearchRequest::new_with_filters`
+            // (`to_rowid().is_some()`); the confirmed-source check is the SQL
+            // JOIN on `lifecycle_state`.
+            "source" if source.is_none() => {
+                let value = percent_decode_bounded(raw_value, MAX_FILTER_BYTES).ok_or(())?;
+                source = Some(SourceId(value));
+            }
+            "memory_type" if memory_type.is_none() => {
+                let value = percent_decode_bounded(raw_value, MAX_FILTER_BYTES).ok_or(())?;
+                memory_type = Some(ProviderMemoryType::parse_str(&value).ok_or(())?);
+            }
+            "native_project" if native_project.is_none() => {
+                native_project = Some(percent_decode_bounded(raw_value, MAX_FILTER_BYTES).ok_or(())?);
+            }
+            "since" if since.is_none() => {
+                if raw_value.len() > 20 {
+                    return Err(());
+                }
+                since = Some(
+                    percent_decode_bounded(raw_value, 20)
+                        .ok_or(())?
+                        .parse::<i64>()
+                        .map_err(|_| ())?,
+                );
+            }
+            // Reserved for Epic 5 — accepted on the wire so Epic 5 can fill the
+            // slot without a contract change; ignored at the SQL layer.
+            "tessera_project" if tessera_project.is_none() => {
+                tessera_project = Some(percent_decode_bounded(raw_value, MAX_FILTER_BYTES).ok_or(())?);
+            }
             _ => return Err(()),
         }
     }
-    SearchRequest::new(q.ok_or(())?, cursor, limit).map_err(|_| ())
+    SearchRequest::new_with_filters(
+        q.ok_or(())?,
+        cursor,
+        limit,
+        SearchFilters {
+            provider,
+            source,
+            memory_type,
+            native_project,
+            since,
+            tessera_project,
+        },
+    )
+    .map_err(|_| ())
 }
 
 /// Reject oversized encoded values before allocating their decoded buffer.

@@ -63,6 +63,26 @@ impl ProviderMemoryType {
             Self::TopicMemory => "topic_memory",
         }
     }
+
+    /// Reverse of [`ProviderMemoryType::as_str`] — parse the wire vocabulary
+    /// back into the enum. Returns `None` for an unknown value so the caller
+    /// (Story 2.4 `SearchRequest::new`) can map it to a 400 `bad_request`
+    /// rather than inventing a new variant. The set of accepted strings is
+    /// exactly the set `as_str` produces, so the filter vocabulary has a single
+    /// source of truth (Design Notes — "validate the memory-type vocabulary
+    /// from one source of truth"). Named `parse_str` (not `from_str`) to
+    /// avoid clashing with the `std::str::FromStr` trait, matching the
+    /// `HealthState::parse_str` / `SourceKind::parse_str` convention.
+    pub fn parse_str(value: &str) -> Option<Self> {
+        match value {
+            "memory" => Some(Self::Memory),
+            "memory_summary" => Some(Self::MemorySummary),
+            "raw_memories" => Some(Self::RawMemories),
+            "rollout_summary" => Some(Self::RolloutSummary),
+            "topic_memory" => Some(Self::TopicMemory),
+            _ => None,
+        }
+    }
 }
 
 /// Coverage Level declared by a provider adapter (AD-3 / AD-7 / AD-18).
