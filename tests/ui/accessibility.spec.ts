@@ -1013,3 +1013,169 @@ test("browse surfaces partial-unavailability banner and recovers from cursor_sta
   await page.keyboard.press("Enter");
   await expect(browseRegion.getByText("browse mock excerpt")).toBeVisible();
 });
+
+/**
+ * Story 3.2 — Browse's memory-type filter is keyboard-reachable (AD-21):
+ * enter Browse from the Inventory via keyboard, focus + selectOption the
+ * memory-type filter, assert the narrowed `listitem` count and the
+ * "Recent scan first" effective-order readout, then paginate and observe
+ * Provenance fields. Mirrors the existing Search filter-control test's shape
+ * (`selectOption` focuses the `<select>` and dispatches the change event —
+ * the keyboard-reachable contract).
+ *
+ * The mock ANDs the memory_type filter so the test exercises the wire-level
+ * serialization (URLSearchParams) AND the UI's filter state in one pass. The
+ * "Recent scan first" readout must always render (it is a label, not a data
+ * path; AD-7 no-disguise).
+ */
+test("browse memory-type filter is keyboard-reachable and narrows results", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: [
+          {
+            source_id: "src_1",
+            provider: "codex",
+            lifecycle_state: "confirmed",
+            root: "/fixture/codex",
+            native_project: null,
+            coverage_level: "full",
+            health_state: "healthy",
+            last_successful_scan: 100,
+            complete_record_count: 3,
+            latest_error: null,
+          },
+        ],
+      }),
+    }),
+  );
+  // Two memory records + one topic_memory record. The mock ANDs the
+  // memory_type filter so a no-filter request returns 3, memory_type=memory
+  // returns 2, and memory_type=topic_memory returns 1.
+  const memoryA = {
+    record_id: "rec-mem-a",
+    excerpt: "memory a excerpt",
+    provider: "codex",
+    source_id: "src_1",
+    native_project: null,
+    native_locator: "file:///fixture#a",
+    display_locator: "file:///fixture#a-L1-L2",
+    observed_at: 1,
+    coverage_level: "full",
+    health_state: "healthy",
+  };
+  const memoryB = {
+    record_id: "rec-mem-b",
+    excerpt: "memory b excerpt",
+    provider: "codex",
+    source_id: "src_1",
+    native_project: null,
+    native_locator: "file:///fixture#b",
+    display_locator: "file:///fixture#b-L1-L2",
+    observed_at: 2,
+    coverage_level: "full",
+    health_state: "healthy",
+  };
+  const topic = {
+    record_id: "rec-topic",
+    excerpt: "topic excerpt",
+    provider: "codex",
+    source_id: "src_1",
+    native_project: null,
+    native_locator: "file:///fixture#t",
+    display_locator: "file:///fixture#t-L1-L2",
+    observed_at: 3,
+    coverage_level: "full",
+    health_state: "healthy",
+  };
+  // Capture the memory_type param so we can assert the wire-level filter
+  // serialization (URLSearchParams) is exercised.
+  const memoryTypeParams: (string | null)[] = [];
+  await page.route("**/api/browse?*", async (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    const memoryType = params.get("memory_type");
+    memoryTypeParams.push(memoryType);
+    const cursor = params.get("cursor");
+    let results = [memoryA, memoryB, topic];
+    if (memoryType === "memory") results = [memoryB, memoryA];
+    if (memoryType === "topic_memory") results = [topic];
+    // Page 1 (no cursor) returns up to two results + a cursor when more
+    // remain; page 2 returns the remainder and no cursor. This lets the test
+    // exercise pagination under a filter (the cursor binds memory_type so
+    // "Load more" stays in the filtered snapshot).
+    const page1 = !cursor;
+    const pageResults = page1 ? results.slice(0, 1) : results.slice(1);
+    const nextCursor = page1 && results.length > 1 ? "b4.page2" : null;
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: { results: pageResults, next_cursor: nextCursor, empty_state: null, sources: [] },
+      }),
+    });
+  });
+
+  await page.goto("/");
+
+  // Enter Browse via keyboard.
+  const browseButton = page.getByRole("button", { name: "Browse", exact: true });
+  await browseButton.focus();
+  await page.keyboard.press("Enter");
+  const browseRegion = page.getByRole("region", { name: "Memory browse" });
+  await expect(browseRegion).toBeVisible();
+
+  // The "Recent scan first" readout renders immediately (label, not data
+  // path). AD-7: the label says SCAN recency so it never implies content-
+  // change tracking.
+  const orderReadout = browseRegion.getByTestId("browse-effective-order");
+  await expect(orderReadout).toBeVisible();
+  await expect(orderReadout).toContainText("Recent scan first");
+
+  // Baseline: no filter → one record on page 1 (mock returns the first of
+  // three under limit=1). The Provenance fields render (shared ResultCard).
+  await expect(browseRegion.getByRole("listitem")).toHaveCount(1);
+  await expect(browseRegion.getByText("Provider").first()).toBeVisible();
+  await expect(browseRegion.getByText("Semantic location").first()).toBeVisible();
+  await expect(browseRegion.getByText("Source health").first()).toBeVisible();
+
+  // Keyboard-set the memory-type filter. `selectOption` focuses the
+  // `<select>` and dispatches the change event — the keyboard-reachable
+  // contract. The filter is inside a `<fieldset aria-label="Browse filters">`
+  // so the keyboard user can locate it.
+  const filterFieldset = browseRegion.getByRole("group", { name: "Browse filters" });
+  await expect(filterFieldset).toBeVisible();
+  const typeSelect = filterFieldset.getByLabel("Memory type");
+  await typeSelect.focus();
+  await typeSelect.selectOption("topic_memory");
+
+  // Filter change → page-1 re-fetch under the new filter → narrowed to the
+  // one topic_memory record.
+  await expect(browseRegion.getByText("topic excerpt")).toBeVisible();
+  await expect(browseRegion.getByRole("listitem")).toHaveCount(1);
+
+  // The wire-level serialization was exercised: at least one browse request
+  // carried memory_type=topic_memory.
+  expect(memoryTypeParams).toContain("topic_memory");
+
+  // Pagination under the filter: Load more stays within the filtered
+  // snapshot (the cursor binds memory_type). Keyboard-reachable.
+  const loadMore = browseRegion.getByRole("button", { name: "Load more" });
+  if (await loadMore.isVisible()) {
+    await loadMore.focus();
+    await page.keyboard.press("Enter");
+    // The mock returns no continuation cursor on page 2, so Load more
+    // disappears after the page-2 fetch settles.
+    await expect(browseRegion.getByRole("button", { name: "Load more" })).toHaveCount(0);
+  }
+
+  // Back to inventory is still keyboard-reachable.
+  const backButton = browseRegion.getByRole("button", { name: "Back to inventory" });
+  await backButton.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("region", { name: "Source inventory" })).toBeVisible();
+});

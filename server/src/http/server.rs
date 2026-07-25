@@ -464,10 +464,17 @@ fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
 /// [`BrowseRequest::new`]. The confirmed-source check is the SQL layer's
 /// `lifecycle_state = 'confirmed'` JOIN plus the application layer's
 /// explicit registry lookup.
+///
+/// Story 3.2 — also accept an optional `memory_type` query param, validated
+/// against the `ProviderMemoryType` vocabulary (mirrors search's
+/// `memory_type` handling). An invalid value returns `Err(())` → `400
+/// bad_request` (phase `browse`), matching Search's invalid-memory-type
+/// behavior so the two surfaces share one vocabulary.
 fn parse_browse_query(query: &str) -> Result<BrowseRequest, ()> {
     let mut source = None;
     let mut cursor = None;
     let mut limit = None;
+    let mut memory_type = None;
     if query.is_empty() {
         return Err(());
     }
@@ -495,10 +502,18 @@ fn parse_browse_query(query: &str) -> Result<BrowseRequest, ()> {
                         .map_err(|_| ())?,
                 );
             }
+            // Story 3.2 — memory_type filter. Vocabulary validated via
+            // `ProviderMemoryType::parse_str` (single source of truth shared
+            // with Search); an unknown value → 400 (phase `browse`).
+            "memory_type" if memory_type.is_none() => {
+                let value = percent_decode_bounded(raw_value, MAX_FILTER_BYTES).ok_or(())?;
+                memory_type = Some(ProviderMemoryType::parse_str(&value).ok_or(())?);
+            }
             _ => return Err(()),
         }
     }
-    BrowseRequest::new(source.ok_or(())?, cursor, limit).map_err(|_| ())
+    BrowseRequest::new_with_memory_type(source.ok_or(())?, cursor, limit, memory_type)
+        .map_err(|_| ())
 }
 
 /// Reject oversized encoded values before allocating their decoded buffer.

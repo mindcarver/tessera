@@ -139,18 +139,22 @@ pub fn search(
 }
 
 // ---------------------------------------------------------------------------
-// Story 3.1 — query-less Browse entry.
+// Story 3.1 — query-less Browse entry. Extended in 3.2 with the in-source
+// `memory_type` filter.
 //
 // `browse()` mirrors `search()`'s contract mechanics (revision-bound cursor,
 // limit+1 truncation, per-confirmed-source sidecar, three-state empty
 // derivation) but is query-less and scoped to a single confirmed source. The
 // cursor binds to the SAME index revision (FNV-1a over confirmed sources) so
-// any generation change → `cursor_stale`, and carries a distinct version
-// prefix (`b3.<hex>`) so decoding a cross-type (search) cursor yields
-// `CursorStale` rather than `BadRequest` — mirroring the existing v1/v2
-// rejection path's choice of `CursorStale` for forward-compatible recovery
-// (the existing UI `cursor_stale` recovery path re-runs page 1, which is the
-// correct outcome under a cross-type cursor swap).
+// any generation change → `cursor_stale`. Cross-type / cross-version recovery
+// is handled by the ENVELOPE PREFIX GATE in `browse()`: a search `v3.<hex>`
+// cursor, a 3.1-era `b3.<hex>` cursor, or a future `b5.<hex>` cursor is
+// rejected as `CursorStale` before decode runs (the inner `version` field is
+// only a same-prefix integrity backstop — see `decode_browse_cursor`). This
+// mirrors the existing v1/v2 rejection path's choice of `CursorStale` for
+// forward-compatible recovery (the UI's `cursor_stale` recovery path re-runs
+// page 1, which is the correct outcome under a cross-type/cross-version
+// cursor swap).
 //
 // The empty-state derivation reads ONLY the browsed source's scan facts
 // (active generation + latest run state), reusing the per-source facts
@@ -161,13 +165,17 @@ pub fn search(
 // zero records) which search lacks.
 // ---------------------------------------------------------------------------
 
-/// Browse cursor envelope payload. Version 3 (the only version that exists in
-/// 3.1 — bump on a future shape change). Carries the three ORDER BY keys
-/// (browse drops the `title_match` rank from search's four-key cursor) plus
-/// the source the cursor was issued under, so a cursor bound to `src_N`
-/// cannot be replayed against `src_M` (the application layer rejects a
-/// cross-source cursor as `CursorStale`, mirroring search's filter-mismatch
-/// path).
+/// Browse cursor envelope payload. Version 4 (Story 3.2) binds the in-effect
+/// `memory_type` filter so a filter change mid-pagination invalidates an
+/// in-flight cursor (mirrors Search 2.4's "resolve filter once on page 1"
+/// invariant at the browse layer). Version 3 (Story 3.1) carried the three
+/// ORDER BY keys plus the source only.
+///
+/// Carries the three ORDER BY keys (browse drops the `title_match` rank from
+/// search's four-key cursor) plus the source the cursor was issued under, so a
+/// cursor bound to `src_N` cannot be replayed against `src_M` (the application
+/// layer rejects a cross-source cursor as `CursorStale`, mirroring search's
+/// filter-mismatch path).
 #[derive(Debug, Serialize, Deserialize)]
 struct BrowseCursor {
     version: u8,
@@ -179,9 +187,19 @@ struct BrowseCursor {
     last_record_id: String,
     last_observed_at: i64,
     last_coverage_full: bool,
+    /// Story 3.2 — the in-effect memory-type filter, stored as the wire string
+    /// (`ProviderMemoryType::as_str`) so a future variant addition does not
+    /// silently break cursor decode. On the comparison path in `browse()`,
+    /// both sides are normalized through `ProviderMemoryType::parse_str`
+    /// before comparing (so a future variant with two accepted spellings
+    /// cannot spuriously mismatch on the raw string). `None` means "no filter
+    /// was active when the cursor was issued" (3.1's only state). Decode does
+    /// NOT vocabulary-validate this field; an unknown stored value funnels to
+    /// `CursorStale` via the comparison path (see `decode_browse_cursor`).
+    memory_type: Option<String>,
 }
 
-const BROWSE_CURSOR_VERSION: u8 = 3;
+const BROWSE_CURSOR_VERSION: u8 = 4;
 
 pub fn browse(
     registry: &SourceRegistry<'_>,
@@ -206,15 +224,29 @@ pub fn browse(
     }
     let cursor = match request.cursor() {
         Some(raw) => {
-            // Any envelope other than `b3.<hex>` (a search cursor, or a future
-            // version) is rejected as `CursorStale` so the UI's existing
-            // recovery path re-runs page 1. `BadRequest` would surface an
-            // opaque error; `CursorStale` keeps the UX honest (mirrors
-            // search's v1/v2 rejection choice).
-            if !raw.starts_with("b3.") {
+            // CROSS-VERSION / CROSS-TYPE GATE (the real forward-compat
+            // boundary). The envelope prefix is the single discriminator a
+            // real client produces for its contract: a search cursor is
+            // `v3.<hex>`, a 3.1-era browse cursor is `b3.<hex>`, the current
+            // browse cursor is `b4.<hex>`, and a future bump would be
+            // `b5.<hex>` (etc.). Anything that does not match THIS contract's
+            // prefix is rejected as `CursorStale` so the UI's existing
+            // recovery path re-runs page 1 — `BadRequest` would surface an
+            // opaque error and break the recovery contract. This mirrors
+            // search's v1/v2 rejection choice and 3.1's cross-type rejection
+            // of a `v3.` search cursor.
+            if !raw.starts_with("b4.") {
                 return Err(QueryError::CursorStale);
             }
             let cursor = decode_browse_cursor(raw).ok_or(QueryError::BadRequest)?;
+            // SAME-PREFIX INTEGRITY BACKSTOP. `decode_browse_cursor` does NOT
+            // validate the inner `version` (a future-version `b5.` cursor is
+            // rejected by the prefix gate above; a same-prefix cursor with a
+            // tampered inner `version` reaches this check). This field
+            // therefore only ever sees `version == 4` in practice; a value of
+            // e.g. `99` here means a hand-edited same-prefix cursor, and
+            // surfacing it as `CursorStale` (rather than `BadRequest`) keeps
+            // the recovery path uniform.
             if cursor.version != BROWSE_CURSOR_VERSION {
                 return Err(QueryError::CursorStale);
             }
@@ -226,6 +258,36 @@ pub fn browse(
             if cursor_source_rowid != request.source().to_rowid()
                 || cursor.revision != revision
             {
+                return Err(QueryError::CursorStale);
+            }
+            // Story 3.2 — a memory_type mismatch vs the request funnels to
+            // `CursorStale`. This covers EVERY "cursor filter ≠ request"
+            // shape uniformly:
+            //   - the user changed the filter mid-pagination (the normal
+            //     path; the UI clears its local cursor on every filter change
+            //     so this is rare in flow),
+            //   - a stale filtered cursor from an older client,
+            //   - a hand-edited cursor carrying an UNKNOWN `memory_type`
+            //     string (the cursor's stored value is normalized through
+            //     `parse_str` below; an unknown value becomes `None`, which
+            //     cannot equal a valid request filter unless the request is
+            //     ALSO unfiltered — in which case the cursor simply had no
+            //     filter, which is a legal state and matches).
+            // Routing all three through `CursorStale` keeps the recovery UX
+            // uniform (re-run page 1 under the new filter), rather than
+            // splitting them across `CursorStale` and `BadRequest`. The
+            // decode path performs only structural/length validation (no
+            // vocabulary check) so it cannot preempt this funnel. Mirrors
+            // search's `cursor_filters_match` recovery.
+            //
+            // Normalize both sides through `ProviderMemoryType::parse_str`
+            // before comparing (P4): a future variant with two accepted
+            // spellings must not spuriously mismatch on the raw stored string.
+            let cursor_memory_type = cursor
+                .memory_type
+                .as_deref()
+                .and_then(ProviderMemoryType::parse_str);
+            if cursor_memory_type != request.memory_type() {
                 return Err(QueryError::CursorStale);
             }
             Some(cursor)
@@ -250,6 +312,12 @@ pub fn browse(
             last_record_id: last.record_id().to_string(),
             last_observed_at: last.observed_at(),
             last_coverage_full: last.coverage_level() == "full",
+            // Story 3.2 — bind the in-effect memory_type so a filter change
+            // invalidates the cursor (mirrors search's filter-bound cursor).
+            memory_type: request
+                .memory_type()
+                .map(ProviderMemoryType::as_str)
+                .map(str::to_string),
         }))
     } else { None };
     let sources = source_status_sidecar(registry, &store)?;
@@ -315,13 +383,13 @@ fn browse_empty_state(
 fn encode_browse_cursor(cursor: &BrowseCursor) -> String {
     let json = serde_json::to_vec(cursor).expect("cursor DTO serialization is total");
     let mut encoded = String::with_capacity(3 + json.len() * 2);
-    encoded.push_str("b3.");
+    encoded.push_str("b4.");
     for byte in json { encoded.push_str(&format!("{byte:02x}")); }
     encoded
 }
 
 fn decode_browse_cursor(raw: &str) -> Option<BrowseCursor> {
-    let hex = raw.strip_prefix("b3.")?;
+    let hex = raw.strip_prefix("b4.")?;
     if hex.is_empty() || hex.len() % 2 != 0 || raw.len() > MAX_CURSOR_BYTES { return None; }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for pair in hex.as_bytes().chunks_exact(2) {
@@ -330,10 +398,20 @@ fn decode_browse_cursor(raw: &str) -> Option<BrowseCursor> {
         bytes.push(((hi << 4) | lo) as u8);
     }
     let cursor: BrowseCursor = serde_json::from_slice(&bytes).ok()?;
-    // NOTE: the cursor `version` is intentionally NOT validated here. A future
-    // version must reach `browse()`'s version check and be rejected as
-    // `CursorStale` (forward-compat recovery), not `BadRequest`; rejecting it
-    // in decode would short-circuit that to an opaque 400.
+    // Decode performs ONLY structural / length validation. It intentionally
+    // does NOT validate the inner `version` OR the `memory_type` vocabulary:
+    //   - The `version` field is a same-prefix integrity backstop (a future-
+    //     version cursor is rejected by the prefix gate in `browse()` before
+    //     decode is ever called; only a same-prefix hand-edited cursor reaches
+    //     the inner version check). Validating it here would short-circuit
+    //     `browse()`'s `CursorStale` mapping to an opaque `BadRequest`.
+    //   - The `memory_type` vocabulary is normalized through `parse_str` on
+    //     the comparison path in `browse()`, where an unknown stored value
+    //     becomes `None` and is funneled to `CursorStale` (the same recovery
+    //     UX as a filter change). Validating it here would split the failure
+    //     mode between `BadRequest` (smuggled value) and `CursorStale`
+    //     (legitimate filter change), which is the wrong shape — both mean
+    //     "cursor filter ≠ request," and both should re-run page 1.
     if cursor.source.is_empty()
         || cursor.source.len() > crate::domain::query::MAX_FILTER_BYTES
         || SourceId(cursor.source.clone()).to_rowid().is_none()
@@ -341,6 +419,12 @@ fn decode_browse_cursor(raw: &str) -> Option<BrowseCursor> {
         || cursor.revision.len() > 64
         || cursor.last_record_id.is_empty()
         || cursor.last_record_id.len() > 512
+        // Story 3.2 — every cursor string field has an explicit length cap
+        // for defense-in-depth (mirrors `decode_cursor`'s sibling shape).
+        // `memory_type` is bounded by `MAX_CURSOR_BYTES` overall, but capping
+        // it here keeps the decode shape consistent with the other fields.
+        // The vocabulary check is intentionally NOT here (see above).
+        || cursor.memory_type.as_ref().is_some_and(|value| value.len() > crate::domain::query::MAX_FILTER_BYTES)
     {
         return None;
     }

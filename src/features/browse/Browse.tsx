@@ -1,15 +1,22 @@
 /**
- * Tessera — query-less Browse view (Story 3.1).
+ * Tessera — query-less Browse view (Story 3.1 + Story 3.2).
  *
  * The no-query browse entry surface: enter from a Source Inventory card,
- * fetch `browseMemories(sourceId)`, render the shared `ResultCard` list +
- * `EmptyState` + `LoadMore`, with `aria-live` status and a "Back to
- * inventory" button. Browse reuses Search's result-card / Provenance /
- * Coverage / Health / EmptyState / pagination components verbatim (Epic 3
- * Boundaries: "reuse, do not re-implement").
+ * fetch `browseMemories(sourceId, memoryType?, cursor?, limit?)`, render the
+ * shared `ResultCard` list + `EmptyState` + `LoadMore`, with `aria-live`
+ * status and a "Back to inventory" button. Browse reuses Search's result-card
+ * / Provenance / Coverage / Health / EmptyState / pagination components
+ * verbatim (Epic 3 Boundaries: "reuse, do not re-implement").
+ *
+ * Story 3.2 adds the one in-source filter dimension that genuinely varies
+ * within a single source (`memory_type`), and surfaces the existing
+ * `observed_at DESC` ordering in the UI copy as "Recent scan first" (scan
+ * recency — never implying content-change tracking; AD-7 no-disguise).
  *
  * Accessibility (AD-21):
  * - The view is keyboard-reachable from the Inventory "Browse" button.
+ * - The filter `<select>` is inside a `<fieldset aria-label="Browse filters">`
+ *   with a `<label>`, keyboard-operable via `selectOption`.
  * - The result list is an `<ol>` so the screen-reader semantics mirror
  *   Search's.
  * - `aria-live="polite"` on the status region announces load / error / empty
@@ -21,7 +28,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement, type RefObject } from "react";
 import { readTesseraErrorMessage } from "../../api/errors";
 import { openOriginalLocation } from "../../api/open";
-import { browseMemories, type BrowseEmptyState, type SearchResult, type SourceQueryStatus } from "../../api/browse";
+import { browseMemories, PROVIDER_MEMORY_TYPES, type BrowseEmptyState, type ProviderMemoryType, type SearchResult, type SourceQueryStatus } from "../../api/browse";
 import { EmptyState } from "../../components/EmptyState";
 import { LoadMore } from "../../components/LoadMore";
 import { ResultCard } from "../../components/ResultCard";
@@ -60,21 +67,37 @@ type OpenState =
 export function Browse({ sourceId, providerLabel, nativeProject, onBack }: BrowseProps): ReactElement {
   const [state, setState] = useState<State>({ kind: "loading" });
   const [openState, setOpenState] = useState<OpenState>({ kind: "idle" });
+  /**
+   * Story 3.2 — the in-effect memory-type filter. Empty string == "All"
+   * (3.1's default scope); a non-empty value (one of
+   * `PROVIDER_MEMORY_TYPES`) narrows the browse WHERE with AND. Kept as a
+   * string (not `ProviderMemoryType | undefined`) so the `<select>`'s empty
+   * option is its natural zero value, mirroring Search's filter-state shape.
+   */
+  const [memoryType, setMemoryType] = useState<string>("");
   // Monotonic request id so an in-flight response that arrives after a newer
   // request is discarded (mirrors Search's pattern).
   const request = useRef(0);
   const openRequest = useRef(0);
   const alert = useRef<HTMLParagraphElement>(null);
 
-  // Page 1 fetch: re-run when the source id changes (the parent swaps
-  // `<Browse>` in for one source at a time, so this is effectively
-  // mount-bound).
+  // Story 3.2 — the typed filter value passed to the API. Resolved from the
+  // string state so the `<select>` can carry "" (no filter) naturally while
+  // the API carries `undefined` (mirrors Search's `toSearchFilters`).
+  const typedMemoryType: ProviderMemoryType | undefined =
+    memoryType === "" ? undefined : (memoryType as ProviderMemoryType);
+
+  // Page 1 fetch: re-run when the source id OR the memory_type filter changes.
+  // A filter change clears results + cursor (mirrors Search's `++request` +
+  // `idle` reset), so the next fetch is page 1 under the new filter
+  // combination — the cursor's bound memory_type would otherwise mismatch
+  // and surface `cursor_stale`.
   useEffect(() => {
     const id = ++request.current;
     ++openRequest.current;
     setOpenState({ kind: "idle" });
     setState({ kind: "loading" });
-    browseMemories(sourceId, undefined, BROWSE_PAGE_SIZE).then((page) => {
+    browseMemories(sourceId, typedMemoryType, undefined, BROWSE_PAGE_SIZE).then((page) => {
       if (id !== request.current) return;
       const sources = page.payload.sources ?? [];
       setState({
@@ -88,7 +111,7 @@ export function Browse({ sourceId, providerLabel, nativeProject, onBack }: Brows
       if (id !== request.current) return;
       setState({ kind: "error", message: readTesseraErrorMessage(error) });
     });
-  }, [sourceId]);
+  }, [sourceId, typedMemoryType]);
 
   // Move focus to the alert on error/stale so screen-reader users hear the
   // transition without losing their place in the list.
@@ -103,7 +126,7 @@ export function Browse({ sourceId, providerLabel, nativeProject, onBack }: Brows
     const id = ++request.current;
     const priorSources = state.sources;
     setState({ kind: "loading_more", results: state.results, cursor: state.cursor, sources: priorSources });
-    browseMemories(sourceId, state.cursor, BROWSE_PAGE_SIZE).then((page) => {
+    browseMemories(sourceId, typedMemoryType, state.cursor, BROWSE_PAGE_SIZE).then((page) => {
       if (id !== request.current) return;
       const nextSources = page.payload.sources ?? [];
       setState({
@@ -123,7 +146,7 @@ export function Browse({ sourceId, providerLabel, nativeProject, onBack }: Brows
         setState({ kind: "error", message: readTesseraErrorMessage(error), results: state.results, cursor: state.cursor, sources: priorSources });
       }
     });
-  }, [sourceId, state]);
+  }, [sourceId, typedMemoryType, state]);
 
   const openRecord = useCallback((recordId: string) => {
     const id = ++openRequest.current;
@@ -143,7 +166,7 @@ export function Browse({ sourceId, providerLabel, nativeProject, onBack }: Brows
   const restartFromFreshSnapshot = useCallback(() => {
     const id = ++request.current;
     setState({ kind: "loading" });
-    browseMemories(sourceId, undefined, BROWSE_PAGE_SIZE).then((page) => {
+    browseMemories(sourceId, typedMemoryType, undefined, BROWSE_PAGE_SIZE).then((page) => {
       if (id !== request.current) return;
       const sources = page.payload.sources ?? [];
       setState({
@@ -157,7 +180,7 @@ export function Browse({ sourceId, providerLabel, nativeProject, onBack }: Brows
       if (id !== request.current) return;
       setState({ kind: "error", message: readTesseraErrorMessage(error) });
     });
-  }, [sourceId]);
+  }, [sourceId, typedMemoryType]);
 
   const subheading = nativeProject
     ? `${providerLabel} · ${nativeProject}`
@@ -168,11 +191,56 @@ export function Browse({ sourceId, providerLabel, nativeProject, onBack }: Brows
       <h2>Browse memories</h2>
       <p aria-live="polite">{subheading}</p>
       <button type="button" onClick={onBack}>Back to inventory</button>
+      {renderFilterControls(memoryType, setMemoryType)}
+      {/*
+        Story 3.2 — surface the existing `observed_at DESC` ordering in the UI
+        copy as "Recent scan first". The label names SCAN recency explicitly
+        so it never implies content-change tracking (AD-7: never disguise
+        Derived-Index state as source-data state). It is a label only — there
+        is no new sort or data path. `observed_at` is set once per scan
+        (scan.rs:330) and is constant across a source's active generation, so
+        a time/date filter would be degenerate (always "all"); the readout is
+        the only honest way to communicate "recent".
+      */}
+      <p role="status" data-testid="browse-effective-order">Recent scan first</p>
       <div aria-live="polite">
         {renderOpenState(openState)}
         {renderState(state, loadMore, openRecord, restartFromFreshSnapshot, alert, openState.kind === "opening" ? openState.recordId : null)}
       </div>
     </section>
+  );
+}
+
+/**
+ * Story 3.2 — keyboard-reachable memory-type filter, mirroring Search 2.4's
+ * inline `<select>` pattern (consistency over extraction — Search's filter UI
+ * was intentionally kept inline per the 2.4 survey). The control carries a
+ * readable `<label>` and lives inside a `<fieldset aria-label="Browse
+ * filters">` so the keyboard-reachable contract is explicit. Options come
+ * from the shared `PROVIDER_MEMORY_TYPES` vocabulary so the two surfaces
+ * cannot drift.
+ *
+ * A filter change is the `setMemoryType` setter — the parent's
+ * `useEffect([sourceId, typedMemoryType])` re-fetches page 1 under the new
+ * filter, mirroring Search's `++request.current + idle reset` pattern.
+ */
+function renderFilterControls(
+  memoryType: string,
+  setMemoryType: (next: string) => void,
+): ReactElement {
+  return (
+    <fieldset aria-label="Browse filters">
+      <legend>Filter memories</legend>
+      <label htmlFor="browse-filter-type">Memory type</label>
+      <select
+        id="browse-filter-type"
+        value={memoryType}
+        onChange={(event) => setMemoryType(event.target.value)}
+      >
+        <option value="">All types</option>
+        {PROVIDER_MEMORY_TYPES.map((id) => <option key={id} value={id}>{id}</option>)}
+      </select>
+    </fieldset>
   );
 }
 
@@ -294,6 +362,11 @@ function hasErrorCode(error: unknown, code: string): boolean {
  * `source_unavailable`) so the copy can name each situation accurately — the
  * UI must never collapse them into a single "empty" (Boundaries: "Never
  * collapse Browse's three empty states into fewer").
+ *
+ * Story 3.2 reuses `no_indexable_memory` for a filter that narrows to zero:
+ * at the contract level a filter narrowing to zero is indistinguishable from
+ * a source with no records of any type (both are a zero-row first page on a
+ * scanned-OK source), so no fourth state is added (Design Notes).
  *
  * The copy intentionally mirrors Search's `source_not_indexed` /
  * `source_unavailable` phrasing for the overlapping cases so the user hears

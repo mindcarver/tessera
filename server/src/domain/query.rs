@@ -357,6 +357,14 @@ pub enum BrowseEmptyState {
 /// `SearchRequest`'s `cursor + limit` shape but drops the query and the
 /// cross-provider filters (Browse is query-less and single-source).
 ///
+/// Story 3.2 adds the ONE filter dimension that genuinely varies within a
+/// single source: `memory_type: Option<ProviderMemoryType>`. The other
+/// candidate dimensions (provider, native_project, observed_at) are constant
+/// within one source's active generation, so they remain Browse's heading
+/// context rather than filter controls (Design Notes). The vocabulary is
+/// Search 2.4's `ProviderMemoryType` reused verbatim, so the same wire strings
+/// narrow both surfaces.
+///
 /// Validation:
 /// - `source` must be a well-formed `src_<n>` handle (`to_rowid().is_some()`).
 ///   The confirmed-source check is enforced by the browse SQL's
@@ -367,11 +375,23 @@ pub enum BrowseEmptyState {
 /// - `limit` defaults to `DEFAULT_SEARCH_LIMIT` and stays within
 ///   `[1, MAX_SEARCH_LIMIT]` so a loopback request cannot force an unbounded
 ///   read.
+/// - `memory_type` is a typed enum, so the type system prevents an unknown
+///   variant at construction. The domain layer TRUSTS the construction
+///   boundary: callers MUST obtain the value via
+///   `ProviderMemoryType::parse_str` (the HTTP layer does this — see
+///   `parse_browse_query`) so an unknown wire string is rejected as a 400
+///   before reaching `new_with_memory_type`. `new_with_memory_type` itself
+///   does NOT re-validate the value (any `ProviderMemoryType` is accepted),
+///   so a non-HTTP caller that constructs a value out-of-band bypasses the
+///   vocabulary check. This mirrors `SearchRequest`'s arrangement; a future
+///   tightening (e.g. an `impl FromStr`) would close the gap, but is not
+///   required by the current contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowseRequest {
     source: SourceId,
     cursor: Option<String>,
     limit: usize,
+    memory_type: Option<ProviderMemoryType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,6 +403,19 @@ impl BrowseRequest {
         cursor: Option<String>,
         limit: Option<usize>,
     ) -> Result<Self, BrowseRequestError> {
+        Self::new_with_memory_type(source, cursor, limit, None)
+    }
+
+    /// Story 3.2 — construct a `BrowseRequest` carrying the single optional
+    /// in-source filter (`memory_type`). `None` restores 3.1's default scope;
+    /// `Some` narrows the browse WHERE with `AND m.provider_memory_type = ?`,
+    /// mirroring Search's predicate shape.
+    pub fn new_with_memory_type(
+        source: SourceId,
+        cursor: Option<String>,
+        limit: Option<usize>,
+        memory_type: Option<ProviderMemoryType>,
+    ) -> Result<Self, BrowseRequestError> {
         if source.to_rowid().is_none() {
             return Err(BrowseRequestError::Invalid);
         }
@@ -393,12 +426,14 @@ impl BrowseRequest {
         if !(1..=MAX_SEARCH_LIMIT).contains(&limit) {
             return Err(BrowseRequestError::Invalid);
         }
-        Ok(Self { source, cursor, limit })
+        Ok(Self { source, cursor, limit, memory_type })
     }
 
     pub fn source(&self) -> &SourceId { &self.source }
     pub fn cursor(&self) -> Option<&str> { self.cursor.as_deref() }
     pub fn limit(&self) -> usize { self.limit }
+    /// Story 3.2 — the in-effect memory-type filter, or `None` when unfiltered.
+    pub fn memory_type(&self) -> Option<ProviderMemoryType> { self.memory_type }
 }
 
 /// Browse's page-1 payload. Carries the same shape as `SearchPage` (results +
