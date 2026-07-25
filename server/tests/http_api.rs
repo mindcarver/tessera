@@ -385,6 +385,148 @@ fn inventory_and_rescan_routes_are_versioned_and_reject_unknown_sources() {
     assert!(!rejected.contains("/fixture"), "got:\n{rejected}");
 }
 
+/// Story 2.5 AC — `GET /api/sources/inventory` returns both providers' rows
+/// over HTTP for a mixed Codex + Claude Code fixture. Each row carries its own
+/// `provider`, `health_state`, and honest per-source `complete_record_count`.
+/// Pins the multi-provider panorama at the wire boundary: the inventory
+/// endpoint has been multi-provider at the row level since 2.1, and the 2.5
+/// panorama UI (grouping, summary header) depends on this wire-level
+/// guarantee. The `provider_not_scannable`-absent negative assertion lives in
+/// `rescan_claude_code_source_succeeds_and_activates_on_wire` (2.2 removed the
+/// vocabulary; this test does not re-introduce it).
+#[test]
+fn inventory_returns_both_providers_rows_over_http() {
+    let dir = tempfile::tempdir().expect("scratch app-data dir");
+    let state = tessera_lib::boot(dir.path()).expect("boot");
+    {
+        let conn = state.conn.lock().expect("connection lock");
+        // Source 1: Codex, healthy, indexed with two records.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (1, 'codex', 'agent_memory', 'confirmed', 'healthy', 'full', '/fixture-codex', 'fp-codex', NULL)",
+            [],
+        )
+        .expect("codex source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision, finished_at)
+             VALUES (1, 'gen_1', 'succeeded', 1, 'gen_1', 'fixture', 100)",
+            [],
+        )
+        .expect("codex scan run");
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')",
+            [],
+        )
+        .expect("codex active gen");
+        conn.execute(
+            "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+             VALUES ('rec_codex_a', 1, 'gen_1', 'codex', 'section', 'rec_codex_a', 'file:///codex#a', 'hash', 'v1', 'title a', 'body a', NULL, 'memory', 'full', 100, 'revision', 'file:///codex#L1-L2'),
+                    ('rec_codex_b', 1, 'gen_1', 'codex', 'section', 'rec_codex_b', 'file:///codex#b', 'hash', 'v1', 'title b', 'body b', NULL, 'memory', 'full', 101, 'revision', 'file:///codex#L3-L4')",
+            [],
+        )
+        .expect("codex records");
+        // Source 2: Claude Code, healthy, indexed with one record and a native project.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (2, 'claude_code', 'agent_memory', 'confirmed', 'healthy', 'full', '/fixture-claude', 'fp-claude', 'proj-claude')",
+            [],
+        )
+        .expect("claude source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision, finished_at)
+             VALUES (2, 'gen_2', 'succeeded', 1, 'gen_2', 'fixture', 200)",
+            [],
+        )
+        .expect("claude scan run");
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:2', 'gen_2')",
+            [],
+        )
+        .expect("claude active gen");
+        conn.execute(
+            "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+             VALUES ('rec_claude', 2, 'gen_2', 'claude_code', 'section', 'rec_claude', 'file:///claude#x', 'hash', 'v1', 'title c', 'body c', 'proj-claude', 'memory', 'full', 200, 'revision', 'file:///claude#L1-L2')",
+            [],
+        )
+        .expect("claude record");
+    }
+    let server = bind("127.0.0.1:0");
+    let port = server.server_addr().to_ip().expect("bound addr").port();
+    let state = Arc::new(state);
+    let server_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let _dir = dir;
+        serve_with(server, server_state, PathBuf::from("dist"), Some(port));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let response = raw_http(
+        port,
+        &format!(
+            "GET /api/sources/inventory HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    assert!(
+        response.contains("\"api_version\":\"1\""),
+        "versioned envelope on the wire: {response}",
+    );
+    let body = response.split("\r\n\r\n").nth(1).expect("inventory body");
+    let json: serde_json::Value = serde_json::from_str(body).expect("inventory json");
+    let rows = json["payload"].as_array().expect("inventory array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "both providers' rows return over HTTP: {rows:?}",
+    );
+
+    let codex = rows
+        .iter()
+        .find(|r| r["provider"].as_str() == Some("codex"))
+        .expect("codex row on the wire");
+    assert_eq!(codex["health_state"].as_str(), Some("healthy"));
+    assert_eq!(
+        codex["complete_record_count"].as_u64(),
+        Some(2),
+        "codex count is its own: {:?}",
+        codex["complete_record_count"],
+    );
+    assert!(
+        codex["native_project"].is_null(),
+        "codex native_project is null (global store): {:?}",
+        codex["native_project"],
+    );
+    assert_eq!(
+        codex["last_successful_scan"].as_u64(),
+        Some(100),
+        "codex last_successful_scan is the succeeded run's finished_at: {:?}",
+        codex["last_successful_scan"],
+    );
+
+    let claude = rows
+        .iter()
+        .find(|r| r["provider"].as_str() == Some("claude_code"))
+        .expect("claude row on the wire");
+    assert_eq!(claude["health_state"].as_str(), Some("healthy"));
+    assert_eq!(
+        claude["complete_record_count"].as_u64(),
+        Some(1),
+        "claude count is its own, independent of codex: {:?}",
+        claude["complete_record_count"],
+    );
+    assert_eq!(
+        claude["native_project"].as_str(),
+        Some("proj-claude"),
+        "claude native_project preserved verbatim",
+    );
+    assert_eq!(
+        claude["last_successful_scan"].as_u64(),
+        Some(200),
+        "claude last_successful_scan is the succeeded run's finished_at: {:?}",
+        claude["last_successful_scan"],
+    );
+}
+
 #[test]
 fn rescan_is_singleton_and_events_are_versioned_ordered_and_job_scoped() {
     let port = boot_rescan_server();
