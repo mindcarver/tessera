@@ -20,7 +20,8 @@
  *   Inventory. The App holds the active view in hand-rolled state (no router
  *   dependency): the `Sources` component notifies App via `onBrowse` when the
  *   user activates "Browse" on a confirmed source's card, and App swaps
- *   `<Browse>` in until the user activates "Back to inventory".
+ *   `<Browse>` in until the user activates the Breadcrumb's Sources segment
+ *   (Story 3.3 restated the `onBack` action as navigation).
  */
 
 import { useEffect, useState, type ReactElement } from "react";
@@ -41,7 +42,9 @@ type PingState =
  * Story 3.1 — hand-rolled view state (no router). The shell swaps between
  * the Source Inventory / Search default composition and the single-source
  * Browse view. Entered from the Inventory's "Browse" button (only rendered
- * for confirmed sources); exited via Browse's "Back to inventory".
+ * for confirmed sources); exited via Browse's Breadcrumb Sources segment
+ * (Story 3.3 — the back action surfaced as the breadcrumb's Sources segment;
+ * the prop stays `onBack`).
  *
  * `providerLabel` / `nativeProject` are passed in at swap time so the Browse
  * heading can name the source without re-fetching the inventory row from the
