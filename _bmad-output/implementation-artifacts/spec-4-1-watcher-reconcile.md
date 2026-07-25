@@ -6,7 +6,7 @@ status: 'done'
 review_loop_iteration: 0
 followup_review_recommended: true
 baseline_revision: '024bb333740e5f3166f86481430c816fa2e10df3'
-final_revision: '88177ed'
+final_revision: '9cdbc3d'
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/epic-4-context.md'
   - '{project-root}/_bmad-output/implementation-artifacts/spec-1-4-scan-pipeline.md'
