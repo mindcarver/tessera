@@ -3,26 +3,30 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::domain::ports::provider_adapter::ProviderMemoryType;
 use crate::domain::ports::query_store::{QueryStore, SearchCursorKey};
 use crate::domain::query::{
     SearchEmptyState, SearchPage, SearchRequest, SourceQueryStatus, SourceQueryStatusKind,
     MAX_CURSOR_BYTES,
 };
 use crate::domain::scan::ScanRunState;
-use crate::domain::source::{HealthState, SourceLifecycle};
+use crate::domain::source::{HealthState, SourceId, SourceLifecycle};
 use crate::index::scan_store::ScanStore;
 use crate::index::SourceRegistry;
 
 #[derive(Debug)]
 pub enum QueryError { BadRequest, CursorStale, Internal }
 
-/// Versioned cursor payload. Version 2 (Story 2.3) carries the full relevance
-/// sort key of the last record on the previous page so the next-page predicate
-/// can perform a correct "strictly-after" comparison across all four ORDER BY
-/// keys — a `record_id`-only cursor would silently skip records whose id sorts
-/// below the cursor but whose relevance rank is worse. The hex-encoded
-/// envelope format (`v2.<hex>`) is unchanged; only the JSON payload and the
-/// version byte change.
+/// Versioned cursor payload. Version 3 (Story 2.4) additionally binds the
+/// active cross-provider filters (`provider`, `memory_type`, `native_project`,
+/// `since`) so a filter change mid-pagination invalidates an in-flight cursor.
+/// Version 2 (Story 2.3) carried the full relevance sort key of the last record
+/// on the previous page so the next-page predicate can perform a correct
+/// "strictly-after" comparison across all four ORDER BY keys — a `record_id`-
+/// only cursor would silently skip records whose id sorts below the cursor but
+/// whose relevance rank is worse. The hex-encoded envelope format
+/// (`v3.<hex>`) is unchanged; only the JSON payload and the version byte
+/// change.
 #[derive(Debug, Serialize, Deserialize)]
 struct Cursor {
     version: u8,
@@ -32,14 +36,31 @@ struct Cursor {
     /// Relevance sort-key components (added in cursor v2). For a v1 cursor
     /// supplied by an older client, `search` rejects it as `CursorStale`
     /// (HTTP 409 `cursor_stale`) so the UI's existing recovery path re-issues
-    /// the first page under v2 — there is no persistent cursor storage, so
+    /// the first page under v3 — there is no persistent cursor storage, so
     /// this is transparent to the user.
     last_title_match: bool,
     last_observed_at: i64,
     last_coverage_full: bool,
+    /// Story 2.4 — active filters bound into the cursor (added in v3). For a
+    /// v2 cursor supplied by an older client, `search` rejects it as
+    /// `CursorStale` (mirroring the v1→v2 path). `memory_type` is stored as
+    /// the wire string (`ProviderMemoryType::as_str`) so a future variant
+    /// addition does not silently break cursor decode; round-tripped through
+    /// `ProviderMemoryType::parse_str` on the comparison path. `source` is the
+    /// `src_<n>` handle string (round-trips through `SourceId` on the comparison
+    /// path); it is NOT bound into the cursor as the reserved
+    /// `tessera_project` slot (Epic 5 TODO: when Tessera-Project projection
+    /// gains a real SQL predicate, bind `tessera_project` here too so a project
+    /// change invalidates an in-flight cursor — see encode_cursor/decode_cursor
+    /// and `cursor_filters_match`).
+    provider: Option<String>,
+    source: Option<String>,
+    memory_type: Option<String>,
+    native_project: Option<String>,
+    since: Option<i64>,
 }
 
-const CURSOR_VERSION: u8 = 2;
+const CURSOR_VERSION: u8 = 3;
 
 pub fn search(
     registry: &SourceRegistry<'_>,
@@ -50,14 +71,15 @@ pub fn search(
     let revision = store.current_index_revision().map_err(|_| QueryError::Internal)?;
     let cursor = match request.cursor() {
         Some(raw) => {
-            // A `v1.<hex>` cursor comes from a pre-2.3 client (record_id-only
-            // sort key). The relevance sort key changed in 2.3, so the index
-            // shape is incompatible — treat it as `CursorStale` (HTTP 409
-            // `cursor_stale`) rather than `BadRequest`. The existing UI
-            // recovery path for `cursor_stale` re-runs the first page, which is
-            // the correct outcome; a generic contract error would surface an
-            // opaque `bad_request` instead. v2 decode logic is unchanged below.
-            if raw.starts_with("v1.") {
+            // A `v1.<hex>` or `v2.<hex>` cursor comes from a pre-2.4 client
+            // (record_id-only / relevance-without-filters sort key). The
+            // cursor shape changed in 2.4 (filters bound in), so treat the
+            // older envelope as `CursorStale` (HTTP 409 `cursor_stale`) rather
+            // than `BadRequest`. The existing UI recovery path for
+            // `cursor_stale` re-runs the first page, which is the correct
+            // outcome; a generic contract error would surface an opaque
+            // `bad_request` instead. v3 decode logic is unchanged below.
+            if raw.starts_with("v1.") || raw.starts_with("v2.") {
                 return Err(QueryError::CursorStale);
             }
             let cursor = decode_cursor(raw).ok_or(QueryError::BadRequest)?;
@@ -65,6 +87,16 @@ pub fn search(
                 return Err(QueryError::BadRequest);
             }
             if cursor.revision != revision { return Err(QueryError::CursorStale); }
+            // Story 2.4 — a filter mismatch vs the request means the user
+            // changed a filter mid-pagination. The UI clears its local cursor
+            // on every filter change so this path is never hit in normal flow;
+            // a stale filtered cursor from an older client is rejected as
+            // `CursorStale` (per the I/O matrix) so the existing recovery path
+            // re-runs page 1 under the new filter set, rather than paging
+            // through a result set that no longer matches the request.
+            if !cursor_filters_match(&cursor, &request) {
+                return Err(QueryError::CursorStale);
+            }
             Some(cursor)
         }
         None => None,
@@ -89,6 +121,14 @@ pub fn search(
             last_title_match: last.title_match(),
             last_observed_at: last.observed_at(),
             last_coverage_full: last.coverage_level() == "full",
+            provider: request.provider().map(str::to_string),
+            source: request.source().map(|id| id.0.clone()),
+            memory_type: request.memory_type().map(ProviderMemoryType::as_str).map(str::to_string),
+            native_project: request.native_project().map(str::to_string),
+            since: request.since(),
+            // Epic 5 TODO: bind `tessera_project` once it has a SQL predicate
+            // (today it is accepted but ignored, so it does not invalidate the
+            // cursor). See the Cursor struct doc.
         }))
     } else { None };
     let sources = source_status_sidecar(registry, &store)?;
@@ -96,6 +136,29 @@ pub fn search(
         empty_state(registry, &store)?
     } else { None };
     Ok(SearchPage::new(results, next_cursor, empty_state, sources))
+}
+
+/// Compare the cursor's bound filters against the incoming request's filters.
+/// A mismatch means the user changed a filter mid-pagination: the cursor's
+/// result set no longer corresponds to the request, so the caller rejects it
+/// as `CursorStale` (Story 2.4 I/O matrix). `memory_type` is compared via the
+/// wire string so a cursor serialized before a future variant addition still
+/// round-trips correctly. `source` is compared via its normalized rowid
+/// (`to_rowid()`) rather than the raw handle string, because the SQL layer
+/// normalizes through `to_rowid()` — `src_2` and `src_02` both map to rowid 2
+/// and are equivalent, so a raw-string comparison would spuriously flag the
+/// cursor as stale (Story 2.4 pass-2). Both sides are validated well-formed
+/// (cursor at decode, request at construction), so each `to_rowid()` is
+/// `Some`; comparing `Option<Option<i64>>` still treats `None` (no source
+/// filter) as equal.
+fn cursor_filters_match(cursor: &Cursor, request: &SearchRequest) -> bool {
+    let cursor_source_rowid = cursor.source.as_ref().map(|s| SourceId(s.clone()).to_rowid());
+    let request_source_rowid = request.source().map(|id| id.to_rowid());
+    cursor.provider.as_deref() == request.provider()
+        && cursor_source_rowid == request_source_rowid
+        && cursor.native_project.as_deref() == request.native_project()
+        && cursor.since == request.since()
+        && cursor.memory_type.as_deref() == request.memory_type().map(ProviderMemoryType::as_str)
 }
 
 /// Build the FR-14 per-query availability sidecar: one row per **confirmed**
@@ -223,13 +286,13 @@ fn empty_state(
 fn encode_cursor(cursor: &Cursor) -> String {
     let json = serde_json::to_vec(cursor).expect("cursor DTO serialization is total");
     let mut encoded = String::with_capacity(3 + json.len() * 2);
-    encoded.push_str("v2.");
+    encoded.push_str("v3.");
     for byte in json { encoded.push_str(&format!("{byte:02x}")); }
     encoded
 }
 
 fn decode_cursor(raw: &str) -> Option<Cursor> {
-    let hex = raw.strip_prefix("v2.")?;
+    let hex = raw.strip_prefix("v3.")?;
     if hex.is_empty() || hex.len() % 2 != 0 || raw.len() > MAX_CURSOR_BYTES { return None; }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for pair in hex.as_bytes().chunks_exact(2) {
@@ -245,6 +308,32 @@ fn decode_cursor(raw: &str) -> Option<Cursor> {
         || cursor.revision.len() > 64
         || cursor.last_record_id.is_empty()
         || cursor.last_record_id.len() > 512
+    {
+        return None;
+    }
+    // Story 2.4 — bound-filter shape sanity (defense-in-depth, mirroring the
+    // request-time validation in `SearchRequest::new_with_filters`). A filter
+    // string is bounded at request time by `MAX_FILTER_BYTES`; a cursor that
+    // violates the same bound is rejected as malformed (the hex decode above
+    // already succeeded, so a length violation here means the cursor was
+    // tampered with or comes from a buggy client). Vocabulary/range checks that
+    // the request constructor performs are repeated here so a hand-edited
+    // cursor cannot smuggle an unknown value past the comparison path:
+    //   - `provider` must be a known provider id (`KNOWN_PROVIDER_IDS`),
+    //   - `memory_type` must round-trip through `ProviderMemoryType::parse_str`,
+    //   - `source` must be a well-formed `src_<n>` handle (`to_rowid().is_some()`),
+    //   - `since` must be in `[0, MAX_SINCE]`.
+    if cursor.provider.as_ref().is_some_and(|value| {
+        value.len() > crate::domain::query::MAX_FILTER_BYTES
+            || !crate::domain::query::KNOWN_PROVIDER_IDS.contains(&value.as_str())
+    })
+        || cursor.source.as_ref().is_some_and(|value| {
+            value.len() > crate::domain::query::MAX_FILTER_BYTES
+                || crate::domain::source::SourceId(value.clone()).to_rowid().is_none()
+        })
+        || cursor.native_project.as_ref().is_some_and(|value| value.len() > crate::domain::query::MAX_FILTER_BYTES)
+        || cursor.memory_type.as_ref().is_some_and(|value| ProviderMemoryType::parse_str(value).is_none())
+        || cursor.since.is_some_and(|value| !(0..=crate::domain::query::MAX_SINCE).contains(&value))
     {
         return None;
     }
@@ -264,16 +353,26 @@ mod tests {
             last_title_match: true,
             last_observed_at: 99,
             last_coverage_full: true,
+            provider: Some("codex".into()),
+            source: Some("src_2".into()),
+            memory_type: Some("memory".into()),
+            native_project: None,
+            since: Some(1_700_000_000),
         };
         let encoded = encode_cursor(&cursor);
         assert!(!encoded.contains("记忆"));
-        assert!(encoded.starts_with("v2."));
+        assert!(encoded.starts_with("v3."));
         let back = decode_cursor(&encoded).unwrap();
         assert_eq!(back.query, "记忆");
         assert_eq!(back.last_record_id, "rec_2");
         assert!(back.last_title_match);
         assert_eq!(back.last_observed_at, 99);
         assert!(back.last_coverage_full);
+        assert_eq!(back.provider.as_deref(), Some("codex"));
+        assert_eq!(back.source.as_deref(), Some("src_2"));
+        assert_eq!(back.memory_type.as_deref(), Some("memory"));
+        assert!(back.native_project.is_none());
+        assert_eq!(back.since, Some(1_700_000_000));
     }
 
     #[test]
@@ -319,6 +418,165 @@ mod tests {
         assert_eq!(
             derive_status(HealthState::Healthy, true, Some(ScanRunState::Failed)),
             SourceQueryStatusKind::Degraded
+        );
+    }
+
+    /// Patch 5 — equivalent `src_<n>` handles (`src_2` vs `src_02`) normalize to
+    /// the same rowid via `to_rowid()`, so a cursor bound to one and a request
+    /// carrying the other must NOT be flagged stale. The SQL layer normalizes
+    /// the same way, so they are the same predicate; a raw-string comparison
+    /// would spuriously trigger `CursorStale`.
+    #[test]
+    fn cursor_source_comparison_normalizes_equivalent_handles() {
+        let cursor = Cursor {
+            version: CURSOR_VERSION,
+            query: "q".into(),
+            revision: "rev".into(),
+            last_record_id: "rec_1".into(),
+            last_title_match: false,
+            last_observed_at: 0,
+            last_coverage_full: false,
+            provider: None,
+            source: Some("src_2".into()),
+            memory_type: None,
+            native_project: None,
+            since: None,
+        };
+        let equivalent = crate::domain::query::SearchRequest::new_with_filters(
+            "q".into(),
+            None,
+            Some(20),
+            crate::domain::query::SearchFilters {
+                source: Some(crate::domain::source::SourceId("src_02".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            cursor_filters_match(&cursor, &equivalent),
+            "src_2 (cursor) and src_02 (request) normalize to rowid 2 and must match"
+        );
+
+        // A genuinely different source still mismatches.
+        let other = crate::domain::query::SearchRequest::new_with_filters(
+            "q".into(),
+            None,
+            Some(20),
+            crate::domain::query::SearchFilters {
+                source: Some(crate::domain::source::SourceId("src_3".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !cursor_filters_match(&cursor, &other),
+            "src_2 vs src_3 must mismatch"
+        );
+
+        // Some vs None also mismatches (one side has a source predicate).
+        let none_request = crate::domain::query::SearchRequest::new_with_filters(
+            "q".into(),
+            None,
+            Some(20),
+            crate::domain::query::SearchFilters::default(),
+        )
+        .unwrap();
+        assert!(
+            !cursor_filters_match(&cursor, &none_request),
+            "Some(src_2) vs None source must mismatch"
+        );
+    }
+
+    /// Patch 10 — `decode_cursor` performs defense-in-depth validation on the
+    /// bound filters (mirroring `SearchRequest::new_with_filters`), so a
+    /// hand-edited / buggy cursor cannot smuggle an unknown value past the
+    /// comparison path. Each tampered body mutates exactly one bound-filter
+    /// field; `decode_cursor` must reject it as `None`.
+    #[test]
+    fn decode_cursor_rejects_tampered_bound_filters() {
+        // Hex-encode a JSON cursor body and wrap it in the v3 envelope. Building
+        // the cursor by hand (not via encode_cursor) lets us inject values that
+        // SearchRequest/encode_cursor would reject upstream.
+        fn envelope(json: &str) -> String {
+            let hex: String = json.bytes().map(|byte| format!("{byte:02x}")).collect();
+            format!("v3.{hex}")
+        }
+        // Build a cursor JSON body with the bound filters parameterized; every
+        // other field is a fixed valid baseline. `null` means "filter absent".
+        fn body(
+            provider: Option<&str>,
+            source: Option<&str>,
+            memory_type: Option<&str>,
+            since: Option<i64>,
+        ) -> String {
+            let str_field = |key: &str, value: Option<&str>| -> String {
+                match value {
+                    Some(v) => format!("\"{key}\":\"{v}\""),
+                    None => format!("\"{key}\":null"),
+                }
+            };
+            let since_field = match since {
+                Some(v) => format!("\"since\":{v}"),
+                None => "\"since\":null".to_string(),
+            };
+            format!(
+                r#"{{"version":3,"query":"q","revision":"rev","last_record_id":"rec_1","last_title_match":false,"last_observed_at":0,"last_coverage_full":false,{provider},{source},{memory_type},"native_project":null,{since}}}"#,
+                provider = str_field("provider", provider),
+                source = str_field("source", source),
+                memory_type = str_field("memory_type", memory_type),
+                since = since_field,
+            )
+        }
+
+        // Baseline: every bound filter absent → decodes cleanly. Guards against
+        // the rejection cases below passing due to a typo in the helper.
+        assert!(
+            decode_cursor(&envelope(&body(None, None, None, None))).is_some(),
+            "baseline cursor must decode"
+        );
+
+        // provider not in KNOWN_PROVIDER_IDS → rejected.
+        assert!(
+            decode_cursor(&envelope(&body(Some("bogus"), None, None, None))).is_none(),
+            "unknown provider must be rejected"
+        );
+        // since beyond MAX_SINCE → rejected.
+        assert!(
+            decode_cursor(&envelope(&body(None, None, None, Some(crate::domain::query::MAX_SINCE + 1)))).is_none(),
+            "since > MAX_SINCE must be rejected"
+        );
+        // source not a well-formed src_<n> handle → rejected.
+        assert!(
+            decode_cursor(&envelope(&body(None, Some("not-a-source"), None, None))).is_none(),
+            "malformed source handle must be rejected"
+        );
+        // Patch 9 — negative rowid (src_-5) is rejected by to_rowid now.
+        assert!(
+            decode_cursor(&envelope(&body(None, Some("src_-5"), None, None))).is_none(),
+            "src_-5 must be rejected"
+        );
+        // Patch 9 — zero rowid (src_0) is rejected by to_rowid now.
+        assert!(
+            decode_cursor(&envelope(&body(None, Some("src_0"), None, None))).is_none(),
+            "src_0 must be rejected"
+        );
+        // memory_type not in the ProviderMemoryType vocabulary → rejected.
+        assert!(
+            decode_cursor(&envelope(&body(None, None, Some("bogus_type"), None))).is_none(),
+            "unknown memory_type must be rejected"
+        );
+
+        // Equivalent source handles both decode (the rowid-normalized
+        // comparison is exercised by cursor_source_comparison_normalizes_*
+        // above); src_02 is well-formed and must be accepted.
+        assert!(
+            decode_cursor(&envelope(&body(None, Some("src_02"), None, None))).is_some(),
+            "src_02 is well-formed (rowid 2) and must decode"
+        );
+        // A known-good provider / memory_type / since combination decodes.
+        assert!(
+            decode_cursor(&envelope(&body(Some("codex"), Some("src_1"), Some("memory"), Some(0)))).is_some(),
+            "valid bound filters must decode"
         );
     }
 }

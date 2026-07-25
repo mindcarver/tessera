@@ -38,6 +38,7 @@
 use rusqlite::{params, Connection};
 
 use crate::domain::open::OpenTarget;
+use crate::domain::ports::provider_adapter::ProviderMemoryType;
 use crate::domain::ports::query_store::{QueryStore, SearchCursorKey};
 use crate::domain::query::{SearchRequest, SearchResult};
 use crate::domain::scan::{Generation, ScanRunState};
@@ -683,6 +684,18 @@ impl QueryStore for ScanStore<'_> {
         //   observed_at:        compared DESC, so "after" = strictly smaller
         //   coverage_rank:      0 when coverage='full' (sorts first), 1 otherwise
         //   record_id:          final ASC tiebreak
+        //
+        // Story 2.4 cross-provider filters append one conditional AND predicate
+        // each after the cursor predicate. The pattern mirrors the cursor
+        // predicate: a `present` flag (0/1) short-circuits the predicate to
+        // true when the filter is `None`, so a no-filter request runs the same
+        // SQL shape as before (the flag is the first operand of an `OR`, so
+        // SQLite stops evaluating at `0 = 0`). `tessera_project` is accepted
+        // on the DTO but produces NO predicate here (Design Notes — reserved,
+        // not implemented). `native_project = ?` honestly excludes rows whose
+        // `native_project` is NULL (Codex's global store): SQL `NULL = 'x'` is
+        // NULL, not true, so a NULL row never matches a project filter — the
+        // spec calls this the honest behavior, not a bug.
         let mut stmt = self.conn.prepare(
             "SELECT m.record_id, m.title, m.body, m.provider, m.source_id,
                     m.native_project, m.native_locator, m.display_locator,
@@ -706,12 +719,17 @@ impl QueryStore for ScanStore<'_> {
                        AND (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) = ?5
                        AND m.record_id > ?6)
                )
+               AND (?7 = 0 OR m.provider = ?8)
+               AND (?9 = 0 OR m.source_id = ?10)
+               AND (?11 = 0 OR m.provider_memory_type = ?12)
+               AND (?13 = 0 OR m.native_project = ?14)
+               AND (?15 = 0 OR m.observed_at >= ?16)
              ORDER BY
                (CASE WHEN instr(m.title, ?1) > 0 THEN 0 ELSE 1 END) ASC,
                m.observed_at DESC,
                (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) ASC,
                m.record_id ASC
-             LIMIT ?7",
+             LIMIT ?17",
         )?;
         let page_size = i64::try_from(request.limit() + 1).expect("search limit is bounded");
         let cursor_present: i64 = if after.is_some() { 1 } else { 0 };
@@ -725,6 +743,27 @@ impl QueryStore for ScanStore<'_> {
             None => 0,
         };
         let cursor_record_id: Option<&str> = after.map(|key| key.record_id.as_str());
+        // Story 2.4 filter bindings. Each `present` flag is 1 when the filter
+        // is `Some` (the OR evaluates the column predicate) and 0 when `None`
+        // (the OR short-circuits to true). The value is bound as `Option`,
+        // which rusqlite renders as NULL when `None`; the flag prevents the
+        // NULL from ever being compared.
+        let provider_present: i64 = request.provider().map_or(0, |_| 1);
+        let provider_value: Option<&str> = request.provider();
+        // Per-source filter (Spec Change Log 2026-07-25): narrows to one
+        // confirmed source's rowid. `m.source_id` is the registry rowid; the
+        // `SourceId` handle is translated to that rowid here. The confirmed-
+        // source check is the JOIN on `lifecycle_state` above, so a non-
+        // confirmed/non-existent id honestly yields no rows.
+        let source_present: i64 = request.source().map_or(0, |_| 1);
+        let source_value: Option<i64> = request.source().and_then(|id| id.to_rowid());
+        let memory_type_present: i64 = request.memory_type().map_or(0, |_| 1);
+        let memory_type_value: Option<&str> =
+            request.memory_type().map(ProviderMemoryType::as_str);
+        let native_project_present: i64 = request.native_project().map_or(0, |_| 1);
+        let native_project_value: Option<&str> = request.native_project();
+        let since_present: i64 = request.since().map_or(0, |_| 1);
+        let since_value: Option<i64> = request.since();
         let rows = stmt.query_map(
             params![
                 request.query(),
@@ -733,6 +772,16 @@ impl QueryStore for ScanStore<'_> {
                 cursor_observed_at,
                 cursor_coverage_rank,
                 cursor_record_id,
+                provider_present,
+                provider_value,
+                source_present,
+                source_value,
+                memory_type_present,
+                memory_type_value,
+                native_project_present,
+                native_project_value,
+                since_present,
+                since_value,
                 page_size,
             ],
             |row| {

@@ -289,3 +289,273 @@ test("renders Claude Code candidates with each claude_* discovery basis", async 
   // UI would render `<p role="alert">` with the api_contract message.
   await expect(candidateRegion.getByRole("alert")).toHaveCount(0);
 });
+
+/**
+ * Story 2.4 — keyboard-reachable filter controls (provider, memory-type)
+ * narrow the result set with AND, the effective-range readout states the
+ * active scope, and Clear-filters restores the full confirmed-source scope.
+ * The sidecar stays unfiltered so the readout names both providers after
+ * Clear even though the filtered query narrowed to one.
+ */
+test("filter controls narrow results by AND and Clear restores full scope", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  const codexResult = {
+    record_id: "rec-codex",
+    excerpt: "codex keyword memory",
+    provider: "codex",
+    source_id: "src_1",
+    native_project: null,
+    native_locator: "file:///codex#L1",
+    display_locator: "file:///codex#L1-L2",
+    observed_at: 1,
+    coverage_level: "full",
+    health_state: "healthy",
+  };
+  const claudeResult = {
+    record_id: "rec-claude",
+    excerpt: "claude keyword topic",
+    provider: "claude_code",
+    source_id: "src_2",
+    native_project: "proj-claude",
+    native_locator: "file:///claude#L1",
+    display_locator: "file:///claude#L1-L2",
+    observed_at: 2,
+    coverage_level: "full",
+    health_state: "healthy",
+  };
+  // Patch 8 — the mock ANDs (intersects) every active filter instead of
+  // overwriting, so a cross-provider combination like provider=codex +
+  // source=src_2 (a Claude source) correctly yields zero rows rather than
+  // masking the empty intersection. The test exercises the wire-level
+  // serialization (URLSearchParams) AND the UI's filter state in one pass.
+  // The sidecar always lists both confirmed sources (Story 2.4 Design Notes:
+  // sidecar stays unfiltered).
+  await page.route("**/api/search?*", async (route) => {
+    const url = new URL(route.request().url());
+    const provider = url.searchParams.get("provider");
+    const source = url.searchParams.get("source");
+    const memoryType = url.searchParams.get("memory_type");
+    let results = [codexResult, claudeResult];
+    if (provider === "codex") results = results.filter((r) => r.provider === "codex");
+    if (provider === "claude_code") results = results.filter((r) => r.provider === "claude_code");
+    // A memory_type filter alone (no provider) narrows across providers.
+    if (!provider && memoryType === "memory") results = results.filter((r) => r.record_id === "rec-codex");
+    // Per-source filter (Spec Change Log 2026-07-25) narrows to one source.
+    if (source === "src_1") results = results.filter((r) => r.source_id === "src_1");
+    if (source === "src_2") results = results.filter((r) => r.source_id === "src_2");
+    const sources = [
+      { source_id: "src_1", provider: "codex", native_project: null, status: "available" },
+      { source_id: "src_2", provider: "claude_code", native_project: "proj-claude", status: "available" },
+    ];
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: { results, next_cursor: null, empty_state: null, sources } }),
+    });
+  });
+  await page.goto("/");
+
+  const input = page.getByLabel("Keyword");
+  const searchRegion = page.getByRole("region", { name: "Memory search" });
+
+  // Baseline: no filters → both providers.
+  await input.fill("keyword");
+  await input.press("Enter");
+  await expect(searchRegion.getByRole("listitem")).toHaveCount(2);
+  // The effective-range readout names both confirmed providers after the
+  // first search populates the sidecar-derived provider list.
+  await expect(page.getByTestId("search-effective-range")).toContainText("Codex + Claude Code");
+
+  // Story 2.4 — the reserved Tessera-project slot is rendered DISABLED (not
+  // merely absent), per the spec Boundaries/I/O matrix/AC.
+  const tesseraSlot = page.getByLabel("Tessera project (reserved)");
+  await expect(tesseraSlot).toBeVisible();
+  await expect(tesseraSlot).toBeDisabled();
+
+  // Keyboard-set the provider filter. `selectOption` focuses the `<select>`
+  // and dispatches the change event — the keyboard-reachable contract.
+  const providerSelect = page.getByLabel("Provider");
+  await providerSelect.focus();
+  await providerSelect.selectOption("codex");
+  // Story 2.4 (Spec Change Log) — a filter change resets to idle, so the
+  // previous results actually CLEAR (not just the readout updating). Pin this
+  // with toHaveCount(0) so a regression that leaves stale results visible
+  // fails loudly.
+  await expect(searchRegion.getByRole("listitem")).toHaveCount(0);
+  // The readout updates immediately to reflect the new filter state.
+  await expect(page.getByTestId("search-effective-range")).toContainText("Codex");
+  await expect(page.getByTestId("search-effective-range")).not.toContainText("Claude Code");
+
+  // Keyboard-set the memory-type filter (AND combination).
+  const typeSelect = page.getByLabel("Memory type");
+  await typeSelect.focus();
+  await typeSelect.selectOption("memory");
+  await expect(page.getByTestId("search-effective-range")).toContainText("type=memory");
+
+  // Run the filtered search (the filter changes reset to idle; pressing
+  // Enter re-runs page 1 under the new filter combination).
+  await input.press("Enter");
+  // Narrowed to Codex memory only.
+  await expect(searchRegion.getByRole("listitem")).toHaveCount(1);
+  await expect(searchRegion.locator('[data-provider="codex"]')).toBeVisible();
+
+  // Story 2.4 (Spec Change Log 2026-07-25) — the per-source filter narrows to
+  // one source's records, distinct from the provider filter. Patch 3 scopes the
+  // Source <select> by the active provider, so a cross-provider source (src_2 =
+  // Claude) is only selectable when no provider filter is set. Clear the
+  // provider + memory filters first to stay on a reachable user path — with the
+  // patched AND mock, provider=codex + source=src_2 now correctly yields zero
+  // rows instead of overwriting to the Claude record.
+  const midClear = page.getByRole("button", { name: "Clear filters" });
+  await midClear.focus();
+  await midClear.press("Enter");
+  await expect(page.getByTestId("search-effective-range")).toContainText("Codex + Claude Code");
+
+  const sourceSelect = page.getByLabel("Source", { exact: true });
+  await sourceSelect.focus();
+  await sourceSelect.selectOption("src_2");
+  // Filter change clears results (idle reset) and the readout names the source.
+  await expect(searchRegion.getByRole("listitem")).toHaveCount(0);
+  await expect(page.getByTestId("search-effective-range")).toContainText("source=src_2");
+  await input.press("Enter");
+  // Narrowed to the Claude (src_2) record.
+  await expect(searchRegion.getByRole("listitem")).toHaveCount(1);
+  await expect(searchRegion.locator('[data-provider="claude_code"]')).toBeVisible();
+
+  // Clear filters — restores the full confirmed-source scope. The Clear
+  // button is keyboard-reachable.
+  const clearButton = page.getByRole("button", { name: "Clear filters" });
+  await expect(clearButton).toBeEnabled();
+  await clearButton.focus();
+  await clearButton.press("Enter");
+  // Readout reflects the cleared scope (both providers, no type).
+  await expect(page.getByTestId("search-effective-range")).toContainText("Codex + Claude Code");
+  await expect(page.getByTestId("search-effective-range")).not.toContainText("type=memory");
+
+  // Run the unfiltered search — full scope returns.
+  await input.press("Enter");
+  await expect(searchRegion.getByRole("listitem")).toHaveCount(2);
+  await expect(searchRegion.locator('[data-provider="codex"]')).toBeVisible();
+  await expect(searchRegion.locator('[data-provider="claude_code"]')).toBeVisible();
+});
+
+/**
+ * Story 2.4 (Spec Change Log) pass-2 — the `resolvedSinceRef` fix resolves the
+ * time preset to an absolute `since` ONCE on page 1 and reuses it for every
+ * "Load more" in the session. A per-page recompute would bind a different
+ * `since` into the cursor → `cursor_stale` → "Load more" breaks under a time
+ * preset. This test has no UI coverage until now: it captures the `since` wire
+ * param on the page-1 and page-2 requests and asserts they are equal, and that
+ * no `cursor_stale` alert surfaces.
+ */
+test("since stays stable across Load more under a time preset", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  // Capture the `since` param on every search request so the page-1 and page-2
+  // values can be compared.
+  const sinceValues: (string | null)[] = [];
+  const result = {
+    record_id: "mock-record",
+    excerpt: "mock excerpt",
+    provider: "codex",
+    source_id: "src_1",
+    native_project: null,
+    native_locator: "mock://semantic",
+    display_locator: "mock://display",
+    observed_at: 1,
+    coverage_level: "full",
+    health_state: "unknown",
+  };
+  await page.route("**/api/search?*", async (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    sinceValues.push(params.get("since"));
+    const cursor = params.get("cursor");
+    // Page 1 (no cursor) returns one result + a cursor; page 2 returns one
+    // more result and no cursor.
+    if (!cursor) {
+      return route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ api_version: "1", payload: { results: [result], next_cursor: "v3.page2", empty_state: null, sources: [] } }),
+      });
+    }
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: { results: [{ ...result, record_id: "mock-record-2" }], next_cursor: null, empty_state: null, sources: [] } }),
+    });
+  });
+  await page.goto("/");
+
+  // Select the "Last 7 days" time preset.
+  const timeSelect = page.getByLabel("Observed");
+  await timeSelect.focus();
+  await timeSelect.selectOption("7d");
+
+  // Submit (page 1) — resolves `since` once and binds it into resolvedSinceRef.
+  const input = page.getByLabel("Keyword");
+  await input.fill("keyword");
+  await input.press("Enter");
+  await expect(page.getByRole("button", { name: "Load more" })).toBeVisible();
+
+  // Load more (page 2) — reuses the session-stable `since`.
+  await page.getByRole("button", { name: "Load more" }).press("Enter");
+  await expect(page.getByRole("region", { name: "Memory search" }).getByRole("listitem")).toHaveCount(2);
+
+  // Exactly two search requests fired (page 1 + page 2), both carrying a
+  // non-null `since`, and the two values are EQUAL (the fix under test). A
+  // per-page recompute would make them differ by the elapsed time.
+  expect(sinceValues).toHaveLength(2);
+  expect(sinceValues[0]).not.toBeNull();
+  expect(sinceValues[0]).toBe(sinceValues[1]);
+
+  // No cursor_stale alert surfaced: the page-2 cursor's bound `since` matches
+  // the page-2 request's `since` (the fix), so pagination does not break under
+  // a time preset.
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+/**
+ * Story 2.4 pass-2 — the `emptyCopy` filter-aware branch names the active
+ * filters instead of blaming the keyword. With a filter active and zero
+ * results (`empty_state: "no_match"`), the copy must be the filter-aware
+ * variant and must NOT contain the keyword-blaming "No indexed memory matched
+ * this keyword.".
+ */
+test("filter-active empty state names active filters instead of blaming the keyword", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  // Zero results under the filter combination → empty_state: "no_match".
+  await page.route("**/api/search?*", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: { results: [], next_cursor: null, empty_state: "no_match", sources: [] } }),
+    }),
+  );
+  await page.goto("/");
+
+  // Set a provider filter so filtersActive is true at empty-state render time.
+  const providerSelect = page.getByLabel("Provider");
+  await providerSelect.focus();
+  await providerSelect.selectOption("codex");
+
+  const input = page.getByLabel("Keyword");
+  await input.fill("keyword");
+  await input.press("Enter");
+
+  // The copy is the filter-aware variant: it names the active filters.
+  const searchRegion = page.getByRole("region", { name: "Memory search" });
+  await expect(searchRegion).toContainText("No indexed memory matched within the active filters");
+  // It must NOT fall back to the keyword-blaming copy.
+  await expect(searchRegion).not.toContainText("No indexed memory matched this keyword.");
+});
