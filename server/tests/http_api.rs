@@ -292,6 +292,22 @@ fn search_wire_contract_serializes_provenance_and_rejects_invalid_input_safely()
         result.get("native_project").is_some(),
         "missing native_project: {result}"
     );
+    // Story 2.3: the FR-14 per-query sidecar is present on every page.
+    let sources = page["payload"]["sources"].as_array().expect("sources sidecar array");
+    assert!(!sources.is_empty(), "sidecar must list confirmed sources");
+    assert!(
+        sources.iter().all(|entry| {
+            entry["source_id"].is_string()
+                && entry["provider"].is_string()
+                && matches!(entry["status"].as_str(), Some("available") | Some("degraded") | Some("unavailable"))
+        }),
+        "sidecar entries must carry source_id/provider/status: {sources:?}"
+    );
+    // The single confirmed source in this fixture is healthy + indexed.
+    assert!(
+        sources.iter().any(|entry| entry["status"].as_str() == Some("available")),
+        "healthy source must be available in sidecar: {sources:?}"
+    );
     let cursor = page["payload"]["next_cursor"]
         .as_str()
         .expect("continuation cursor");
@@ -740,4 +756,86 @@ fn unknown_api_route_is_structured_404() {
     );
     assert!(response.starts_with("HTTP/1.1 404"), "got:\n{response}");
     assert!(response.contains("not_found"), "got:\n{response}");
+}
+
+/// Story 2.3 AC / FR-14 prototype over HTTP — with a healthy Codex source and
+/// a confirmed Claude Code source whose latest scan Failed (no active
+/// generation), a search for a shared keyword returns the healthy source's
+/// results, the sidecar flags the failed source `unavailable`, and the query
+/// does NOT fail (HTTP 200, no error envelope).
+#[test]
+fn search_sidecar_flags_mixed_availability_over_http() {
+    let dir = tempfile::tempdir().expect("scratch app-data dir");
+    let state = tessera_lib::boot(dir.path()).expect("boot");
+    {
+        let conn = state.conn.lock().expect("connection lock");
+        // Source 1: Codex, healthy, indexed with a matching record.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (1, 'codex', 'agent_memory', 'confirmed', 'healthy', 'full', '/fixture-codex', 'fp-codex', NULL)",
+            [],
+        )
+        .expect("codex source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (1, 'gen_1', 'succeeded', 1, 'gen_1', 'fixture')",
+            [],
+        )
+        .expect("codex scan run");
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')",
+            [],
+        )
+        .expect("codex active gen");
+        conn.execute(
+            "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+             VALUES ('rec_codex', 1, 'gen_1', 'codex', 'section', 'rec_codex', 'file:///fixture#x', 'hash', 'v1', 'keyword match', 'body', NULL, 'memory', 'full', 100, 'revision', 'file:///fixture#L1-L2')",
+            [],
+        )
+        .expect("codex record");
+        // Source 2: Claude Code, confirmed but Failed scan, no active generation.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (2, 'claude_code', 'agent_memory', 'confirmed', 'error', 'full', '/fixture-claude', 'fp-claude', 'proj-claude')",
+            [],
+        )
+        .expect("claude source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision, error_code)
+             VALUES (2, 'gen_2', 'failed', 1, 'gen_2', 'fixture', 'enumeration_failed')",
+            [],
+        )
+        .expect("claude failed run");
+    }
+    let server = bind("127.0.0.1:0");
+    let port = server.server_addr().to_ip().expect("bound addr").port();
+    let state = Arc::new(state);
+    let server_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let _dir = dir;
+        serve_with(server, server_state, PathBuf::from("dist"), Some(port));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let response = raw_http(
+        port,
+        &format!("GET /api/search?q=keyword&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "query must not fail when one source is down: {response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("search body");
+    let page: serde_json::Value = serde_json::from_str(body).expect("search JSON");
+    // The healthy source's results return.
+    let results = page["payload"]["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1, "healthy source results must return: {results:?}");
+    assert_eq!(results[0]["provider"].as_str(), Some("codex"));
+    // The sidecar lists both sources with the correct statuses.
+    let sources = page["payload"]["sources"].as_array().expect("sources sidecar");
+    assert_eq!(sources.len(), 2, "sidecar must list both confirmed sources: {sources:?}");
+    let codex = sources.iter().find(|s| s["provider"].as_str() == Some("codex")).expect("codex in sidecar");
+    assert_eq!(codex["status"].as_str(), Some("available"));
+    let claude = sources.iter().find(|s| s["provider"].as_str() == Some("claude_code")).expect("claude in sidecar");
+    assert_eq!(claude["status"].as_str(), Some("unavailable"), "failed source must be flagged: {claude:?}");
+    assert_eq!(claude["native_project"].as_str(), Some("proj-claude"));
+    // No empty_state — the query succeeded partially.
+    assert!(page["payload"]["empty_state"].is_null(), "partial unavailability must not produce an empty_state");
 }

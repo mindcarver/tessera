@@ -76,7 +76,7 @@ test("keyboard search renders provenance, empty states, pagination, and safe API
   });
   await page.route("**/api/search?*", async (route) => {
     const q = new URL(route.request().url()).searchParams.get("q");
-    const payload = (empty_state: string | null, results: unknown[] = [], next_cursor: string | null = null) => ({ api_version: "1", payload: { results, next_cursor, empty_state } });
+    const payload = (empty_state: string | null, results: unknown[] = [], next_cursor: string | null = null) => ({ api_version: "1", payload: { results, next_cursor, empty_state, sources: [] } });
     const result = { record_id: "mock-record", excerpt: "mock excerpt", provider: "codex", source_id: "src_1", native_project: null, native_locator: "mock://semantic", display_locator: "mock://display", observed_at: 1, coverage_level: "full", health_state: "unknown" };
     if (q?.trim() === "") return route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ code: "bad_request", message: "The request did not match Tessera's search contract.", source_id: null, phase: "search" }) });
     if (q === "stale-page") {
@@ -140,6 +140,76 @@ test("keyboard search renders provenance, empty states, pagination, and safe API
   await input.fill("   ");
   await input.press("Enter");
   await expect(page.getByRole("alert")).toHaveText("The request did not match Tessera's search contract.");
+});
+
+/**
+ * Story 2.3 — multi-provider search renders provider badges (Codex + Claude
+ * Code) so the two providers' memories are visually comparable, and the FR-14
+ * partial-unavailability banner renders when the sidecar carries a non-
+ * `available` source. Keeps the existing keyboard-reachability contract.
+ */
+test("multi-provider search renders provider badges and partial-unavailability banner", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  const codexResult = {
+    record_id: "rec-codex",
+    excerpt: "codex keyword memory",
+    provider: "codex",
+    source_id: "src_1",
+    native_project: null,
+    native_locator: "file:///codex#L1",
+    display_locator: "file:///codex#L1-L2",
+    observed_at: 1,
+    coverage_level: "full",
+    health_state: "healthy",
+  };
+  const claudeResult = {
+    record_id: "rec-claude",
+    excerpt: "claude keyword memory",
+    provider: "claude_code",
+    source_id: "src_2",
+    native_project: "proj-claude",
+    native_locator: "file:///claude#L1",
+    display_locator: "file:///claude#L1-L2",
+    observed_at: 2,
+    coverage_level: "full",
+    health_state: "healthy",
+  };
+  await page.route("**/api/search?*", async (route) => {
+    const sources = [
+      { source_id: "src_1", provider: "codex", native_project: null, status: "available" },
+      { source_id: "src_2", provider: "claude_code", native_project: "proj-claude", status: "unavailable" },
+    ];
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: { results: [codexResult, claudeResult], next_cursor: null, empty_state: null, sources } }),
+    });
+  });
+  await page.goto("/");
+
+  const input = page.getByLabel("Keyword");
+  await input.fill("keyword");
+  await input.press("Enter");
+
+  // Both provider badges render so the cards are comparable at a glance.
+  // Assert via the stable `data-provider` attribute, NOT `getByText("Codex")`,
+  // which would match the mock excerpt ("codex keyword memory") via case-
+  // insensitive substring instead of the badge — a badge regression would
+  // silently pass. Pinning the attribute makes a real badge removal fail.
+  await expect(page.locator('[data-provider="codex"]')).toBeVisible();
+  await expect(page.locator('[data-provider="claude_code"]')).toBeVisible();
+
+  // The partial-unavailability banner surfaces the degraded/unavailable source.
+  const banner = page.getByTestId("search-source-status");
+  await expect(banner).toBeVisible();
+  await expect(banner).toContainText("claude_code");
+
+  // The unavailable source's results are NOT suppressed — both records render.
+  await expect(page.getByRole("region", { name: "Memory search" }).getByRole("listitem")).toHaveCount(2);
 });
 
 /**

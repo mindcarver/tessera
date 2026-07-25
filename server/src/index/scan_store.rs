@@ -38,7 +38,7 @@
 use rusqlite::{params, Connection};
 
 use crate::domain::open::OpenTarget;
-use crate::domain::ports::query_store::QueryStore;
+use crate::domain::ports::query_store::{QueryStore, SearchCursorKey};
 use crate::domain::query::{SearchRequest, SearchResult};
 use crate::domain::scan::{Generation, ScanRunState};
 use crate::domain::source::{HealthState, SourceId};
@@ -658,14 +658,31 @@ impl<'a> ScanStore<'a> {
 }
 
 impl QueryStore for ScanStore<'_> {
-    /// Search the current confirmed/active scope on every page. `instr`
-    /// deliberately performs literal substring matching: no FTS grammar is
-    /// parsed and two-character CJK terms remain searchable.
+    /// Search the current confirmed/active scope on every page, ordered by the
+    /// Story 2.3 relevance key: **title-match first, then most-recently-
+    /// observed, then `coverage_level='full'`, then `record_id` as a stable
+    /// tiebreak** — a pure-SQL `ORDER BY` computed from columns already
+    /// selected (no FTS5 / `bm25` / schema change; spec Block If).
+    ///
+    /// `instr` deliberately performs literal substring matching: no FTS grammar
+    /// is parsed and two-character CJK terms remain searchable. The cursor
+    /// predicate mirrors the ORDER BY exactly (see [`SearchCursorKey`]) so
+    /// pagination is stable across relevance tiers — a `record_id`-only cursor
+    /// would silently drop records whose id sorts below the cursor but whose
+    /// relevance rank is worse.
     fn search_records(
         &self,
         request: &SearchRequest,
-        after_record_id: Option<&str>,
+        after: Option<&SearchCursorKey>,
     ) -> rusqlite::Result<Vec<SearchResult>> {
+        // The cursor predicate is a lexicographic "strictly-after" comparison
+        // over the SAME four keys the ORDER BY uses, with each rank encoded so
+        // ASC comparison yields the correct "comes later" verdict even for the
+        // DESC `observed_at` and the boolean match/coverage flags:
+        //   title_match_rank:   0 when title matches (sorts first), 1 otherwise
+        //   observed_at:        compared DESC, so "after" = strictly smaller
+        //   coverage_rank:      0 when coverage='full' (sorts first), 1 otherwise
+        //   record_id:          final ASC tiebreak
         let mut stmt = self.conn.prepare(
             "SELECT m.record_id, m.title, m.body, m.provider, m.source_id,
                     m.native_project, m.native_locator, m.display_locator,
@@ -676,28 +693,69 @@ impl QueryStore for ScanStore<'_> {
                                        AND active.value = m.generation
              WHERE s.lifecycle_state = 'confirmed'
                AND instr(m.title || char(10) || m.body, ?1) > 0
-               AND (?2 IS NULL OR m.record_id > ?2)
-             ORDER BY m.record_id ASC
-             LIMIT ?3",
+               AND (
+                   ?2 = 0
+                   OR (CASE WHEN instr(m.title, ?1) > 0 THEN 0 ELSE 1 END) > ?3
+                   OR ((CASE WHEN instr(m.title, ?1) > 0 THEN 0 ELSE 1 END) = ?3
+                       AND m.observed_at < ?4)
+                   OR ((CASE WHEN instr(m.title, ?1) > 0 THEN 0 ELSE 1 END) = ?3
+                       AND m.observed_at = ?4
+                       AND (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) > ?5)
+                   OR ((CASE WHEN instr(m.title, ?1) > 0 THEN 0 ELSE 1 END) = ?3
+                       AND m.observed_at = ?4
+                       AND (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) = ?5
+                       AND m.record_id > ?6)
+               )
+             ORDER BY
+               (CASE WHEN instr(m.title, ?1) > 0 THEN 0 ELSE 1 END) ASC,
+               m.observed_at DESC,
+               (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) ASC,
+               m.record_id ASC
+             LIMIT ?7",
         )?;
         let page_size = i64::try_from(request.limit() + 1).expect("search limit is bounded");
+        let cursor_present: i64 = if after.is_some() { 1 } else { 0 };
+        let cursor_title_rank: i64 = match after {
+            Some(key) => i64::from(!key.title_match),
+            None => 0,
+        };
+        let cursor_observed_at: i64 = after.map(|key| key.observed_at).unwrap_or(0);
+        let cursor_coverage_rank: i64 = match after {
+            Some(key) => i64::from(!key.coverage_full),
+            None => 0,
+        };
+        let cursor_record_id: Option<&str> = after.map(|key| key.record_id.as_str());
         let rows = stmt.query_map(
-            params![request.query(), after_record_id, page_size],
+            params![
+                request.query(),
+                cursor_present,
+                cursor_title_rank,
+                cursor_observed_at,
+                cursor_coverage_rank,
+                cursor_record_id,
+                page_size,
+            ],
             |row| {
                 let health: String = row.get(10)?;
                 let health_state =
                     HealthState::parse_str(&health).ok_or(rusqlite::Error::InvalidQuery)?;
+                let title: String = row.get(1)?;
+                let body: String = row.get(2)?;
+                let observed_at: i64 = row.get(8)?;
+                let coverage_level: String = row.get(9)?;
+                let title_match = title.contains(request.query());
                 Ok(SearchResult::new(
                     row.get(0)?,
-                    excerpt(&row.get::<_, String>(1)?, &row.get::<_, String>(2)?),
+                    excerpt(&title, &body),
                     row.get(3)?,
                     SourceId::from_rowid(row.get(4)?),
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
+                    observed_at,
+                    coverage_level,
                     health_state,
+                    title_match,
                 ))
             },
         )?;

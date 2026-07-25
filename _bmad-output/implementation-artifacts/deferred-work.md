@@ -105,3 +105,12 @@ Tauri 移除、传输改为 loopback-only HTTP（tiny_http）后，上述条目�
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-2-claude-parse-index.md`
   summary: The Phase 0 perf gate (`server/tests/performance_baseline.rs::phase_zero_baseline_gate_measures_and_enforces_the_approved_fixture`) uses tight, machine-calibrated thresholds (cold_scan ≤ 12ms on a 6ms baseline, etc.) that can false-fail under parallel `cargo test` load or on slower/dev machines — making the "no perf regression" claim clock-dependent.
   evidence: Pre-existing test infra (Story 1.9), NOT introduced or modified by 2.2. On a reviewer machine it failed 3/3 in isolation (21–42ms vs 12ms); under parallel load it flakes. The clock-independent "no Codex behavioral regression" is already proven by `codex_canonicalization` (parser-output pin) and the cross-coexistence dispatch test. Harden by widening the threshold to absorb runner variance (e.g. 5–10× baseline), marking the gate advisory, pinning it to a reference CI runner with its own baseline, and/or adding a Codex record_id/body golden-master snapshot for clock-independent behavioral regression.
+
+## Deferred from: code review of spec-2-3-cross-agent-search (2026-07-25)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-cross-agent-search.md`
+  summary: `instr(m.title, ?)` is computed ~5× per row across the relevance ORDER BY and its matching cursor predicate (no CTE/subquery factorization) — a minor per-row cost on the search path.
+  evidence: Correctness is unaffected (the lens flagged it as a perf note, not a defect); the perf gate (itself deferred, see the 2.2 entry above) would not isolate this micro-regression. Fold the title-match into a single projected column via a subquery/CTE when a future search-quality story re-touches the search SQL.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-cross-agent-search.md`
+  summary: The "no external model / remote search" AC (NFR-2) holds by inspection (no network call sites on the search path) but has no automated regression fence.
+  evidence: 2.3 adds zero outbound calls (verified by import inspection); the AC is satisfied today. A future search-quality story (e.g. an external ranking/embedding service) could silently violate it. Fence optionally with a static/import-boundary check that the search module pulls no HTTP client.
