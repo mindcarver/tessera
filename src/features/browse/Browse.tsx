@@ -1,28 +1,40 @@
 /**
- * Tessera — query-less Browse view (Story 3.1 + Story 3.2).
+ * Tessera — query-less Browse view (Story 3.1 + Story 3.2 + Story 3.3).
  *
  * The no-query browse entry surface: enter from a Source Inventory card,
  * fetch `browseMemories(sourceId, memoryType?, cursor?, limit?)`, render the
  * shared `ResultCard` list + `EmptyState` + `LoadMore`, with `aria-live`
- * status and a "Back to inventory" button. Browse reuses Search's result-card
- * / Provenance / Coverage / Health / EmptyState / pagination components
- * verbatim (Epic 3 Boundaries: "reuse, do not re-implement").
+ * status. Browse reuses Search's result-card / Provenance / Coverage / Health
+ * / EmptyState / pagination components verbatim (Epic 3 Boundaries: "reuse,
+ * do not re-implement").
  *
  * Story 3.2 adds the one in-source filter dimension that genuinely varies
  * within a single source (`memory_type`), and surfaces the existing
  * `observed_at DESC` ordering in the UI copy as "Recent scan first" (scan
  * recency — never implying content-change tracking; AD-7 no-disguise).
  *
+ * Story 3.3 makes the Provider → Native Project hierarchy explicit as a
+ * keyboard-reachable Breadcrumb at the top of the view (`Sources › <Provider>
+ * › <Native Project | Global memory>`), where the Sources segment IS the back
+ * affordance (one back action, not two), and consolidates the scattered
+ * status readouts (3.2's "Recent scan first" + the current source's Source
+ * Health from the existing sidecar) into one structured hierarchy-status
+ * view. Pure front-end — no server contract change, no new data path.
+ *
  * Accessibility (AD-21):
  * - The view is keyboard-reachable from the Inventory "Browse" button.
+ * - The Breadcrumb's Sources segment is a `<button type="button">` (Tab-
+ *   reachable; Enter/Space activates `onBack`) and is the first focusable
+ *   element so a keyboard user can leave the view without tabbing through
+ *   results. It auto-focuses on Browse entry so that contract is observable.
  * - The filter `<select>` is inside a `<fieldset aria-label="Browse filters">`
- *   with a `<label>`, keyboard-operable via `selectOption`.
+ *   with a `<label>`; the native `<select>` is keyboard-operable by default.
  * - The result list is an `<ol>` so the screen-reader semantics mirror
  *   Search's.
- * - `aria-live="polite"` on the status region announces load / error / empty
- *   transitions without moving focus.
- * - The "Back to inventory" button is the first focusable element so a
- *   keyboard user can leave the view without tabbing through results.
+ * - The dynamic Source Health line lives inside the existing `aria-live`
+ *   region so health transitions are spoken without moving focus; the static
+ *   "Recent scan first" label lives OUTSIDE any `aria-live` ancestor so it is
+ *   never re-announced.
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactElement, type RefObject } from "react";
@@ -80,6 +92,11 @@ export function Browse({ sourceId, providerLabel, nativeProject, onBack }: Brows
   const request = useRef(0);
   const openRequest = useRef(0);
   const alert = useRef<HTMLParagraphElement>(null);
+  // Story 3.3 (review PATCH 7) — the Breadcrumb's Sources segment is the first
+  // focusable element and is auto-focused on Browse entry so a keyboard user
+  // can leave the view without tabbing through results (preserves 3.1's
+  // "first focusable = back" contract, now asserted in the a11y test).
+  const sourcesButton = useRef<HTMLButtonElement>(null);
 
   // Story 3.2 — the typed filter value passed to the API. Resolved from the
   // string state so the `<select>` can carry "" (no filter) naturally while
@@ -120,6 +137,12 @@ export function Browse({ sourceId, providerLabel, nativeProject, onBack }: Brows
       alert.current?.focus();
     }
   }, [state]);
+
+  // Story 3.3 (review PATCH 7) — focus the Sources segment on Browse entry so
+  // the "first focusable = back" contract is observable, not just structural.
+  useEffect(() => {
+    sourcesButton.current?.focus();
+  }, []);
 
   const loadMore = useCallback(() => {
     if (state.kind !== "ready" || !state.cursor) return;
@@ -182,32 +205,166 @@ export function Browse({ sourceId, providerLabel, nativeProject, onBack }: Brows
     });
   }, [sourceId, typedMemoryType]);
 
-  const subheading = nativeProject
-    ? `${providerLabel} · ${nativeProject}`
-    : providerLabel;
+  // Story 3.3 — the structure-status view needs the current source's Source
+  // Health from the existing sidecar (no new fetch). PATCH 2/3: gate on STATE,
+  // not on the truthiness of `state.sources`, so the health line never
+  // mislabels a terminal state as "Loading…" (AD-7 no-disguise):
+  // - `loading` is the only truly pending state → no sidecar yet ("Loading…").
+  // - `error` may carry a partial sidecar (or none); either way the request
+  //   has terminated, so the browsed source's health is "unknown" (NOT
+  //   "Loading…").
+  // - `loading_more` / `stale` / `ready` carry a sidecar; if the browsed
+  //   `sourceId` is absent from it, that is a server-side omission, also
+  //   "unknown" (never a fabricated status).
+  //
+  // `sidecarPending === true` means "no sidecar yet" (the loading state). A
+  // present `sidecarSources` means "sidecar arrived"; the browsed-source
+  // lookup follows.
+  const sidecarPending = state.kind === "loading";
+  const sidecarSources: SourceQueryStatus[] | undefined =
+    sidecarPending ? undefined
+      : state.kind === "error" ? (state.sources ?? [])
+        : state.sources;
+  // PATCH 10 — `.find()` returns the first match. The wire contract does not
+  // guarantee `source_id` is unique within `sources`; a duplicate is a
+  // server-side bug the UI tolerates by taking the first occurrence (the
+  // status values are per-source, so duplicates carry the same status in
+  // practice). Documented here so a future maintainer does not assume
+  // uniqueness.
+  const currentSourceStatus = sidecarSources?.find((s) => s.source_id === sourceId);
 
   return (
     <section aria-label="Memory browse" role="region">
       <h2>Browse memories</h2>
-      <p aria-live="polite">{subheading}</p>
-      <button type="button" onClick={onBack}>Back to inventory</button>
+      {renderBreadcrumb(providerLabel, nativeProject, onBack, sourcesButton)}
       {renderFilterControls(memoryType, setMemoryType)}
       {/*
-        Story 3.2 — surface the existing `observed_at DESC` ordering in the UI
-        copy as "Recent scan first". The label names SCAN recency explicitly
-        so it never implies content-change tracking (AD-7: never disguise
-        Derived-Index state as source-data state). It is a label only — there
-        is no new sort or data path. `observed_at` is set once per scan
-        (scan.rs:330) and is constant across a source's active generation, so
-        a time/date filter would be degenerate (always "all"); the readout is
-        the only honest way to communicate "recent".
+        PATCH 11 — the STATIC "Recent scan first" label lives OUTSIDE any
+        `aria-live` ancestor. `role="status"` / `aria-live` re-announces on
+        every React re-render that touches the subtree; a static label must
+        never be re-announced (it would interrupt the user mid-list on every
+        filter / pagination transition). The DYNAMIC health line stays inside
+        the `<div aria-live="polite">` below so sidecar arrival / health
+        changes are spoken without moving focus.
       */}
-      <p role="status" data-testid="browse-effective-order">Recent scan first</p>
+      {renderOrderReadout()}
       <div aria-live="polite">
+        {renderHealthReadout(currentSourceStatus, sidecarPending)}
         {renderOpenState(openState)}
         {renderState(state, loadMore, openRecord, restartFromFreshSnapshot, alert, openState.kind === "opening" ? openState.recordId : null)}
       </div>
     </section>
+  );
+}
+
+/**
+ * Story 3.3 — the keyboard-reachable Breadcrumb that makes the cross-view
+ * drill-down path (Inventory provider group → single-source Browse) explicit.
+ * Three segments inside a `<nav aria-label="Breadcrumb">` + `<ol>`:
+ *
+ * - **Sources** — a `<button type="button">` that IS the existing `onBack`
+ *   action, surfaced as the breadcrumb's Sources segment (one back action,
+ *   not two). It is the first focusable element and auto-focuses on Browse
+ *   entry so a keyboard user can leave the view without tabbing through
+ *   results (preserves 3.1's "first focusable = back" contract). PATCH 8:
+ *   a visible `←` back cue prefixes the label so sighted users recognize
+ *   the exit path; the glyph is `aria-hidden` so the accessible name stays
+ *   "Sources" (name-based selectors keep working).
+ * - **Provider** — a presentational `<span>` (no separate click target). The
+ *   Inventory's own provider grouping already IS the provider layer, so a
+ *   second click target here would be redundant chrome.
+ * - **Native Project | "Global memory"** — the leaf, `aria-current="location"`
+ *   (PATCH 4: this is the current in-app drill-down location, not a page
+ *   among pages; "location" is the honest `aria-current` token). Honest
+ *   about Codex's global store: a falsy `nativeProject` (Codex's adapter
+ *   hard-codes `native_project: None`, `server/src/adapters/codex.rs`) renders
+ *   "Global memory" (never a fake project name, never "All projects"); a
+ *   Claude source renders its `native_project` string verbatim (no reverse-
+ *   mapping to a repo path — that is Epic 5 federation, explicitly out of
+ *   scope per epic-3-context.md:45).
+ *
+ * The Tessera-Project segment is reserved for Epic 5 and is NOT built here.
+ */
+function renderBreadcrumb(
+  providerLabel: string,
+  nativeProject: string | null,
+  onBack: () => void,
+  sourcesButtonRef: RefObject<HTMLButtonElement | null>,
+): ReactElement {
+  // PATCH 1 — treat ALL falsy native_project as global (the prop type is
+  // `string | null` and the validator accepts `""`; `??` only catches
+  // null/undefined, so an empty string would render a blank leaf). The
+  // decision is made here (not in the parent) so the parent stays a pure
+  // pass-through of the wire value.
+  const leafLabel = nativeProject || "Global memory";
+  // PATCH 13 — guard an empty-string providerLabel so the middle segment
+  // never renders blank ("Sources › › <leaf>"). App.tsx resolves the label
+  // via providerDisplayName (which always returns a non-empty string for the
+  // known providers and falls back to the raw id), but an unknown future
+  // caller could pass "" — the inline fallback keeps the hierarchy legible.
+  const providerText = providerLabel || "(unknown provider)";
+  return (
+    <nav aria-label="Breadcrumb">
+      <ol>
+        <li>
+          <button type="button" onClick={onBack} ref={sourcesButtonRef}>
+            {/* PATCH 8 — visible back cue for sighted users; aria-hidden so the
+                accessible name stays "Sources" (name-based selectors survive). */}
+            <span aria-hidden="true">← </span>Sources
+          </button>
+        </li>
+        {/* PATCH 5 — no aria-hidden here (the default is false; an explicit
+            value is dead code that suggests an abandoned decision to hide the
+            Provider segment). */}
+        <li><span>{providerText}</span></li>
+        <li><span aria-current="location">{leafLabel}</span></li>
+      </ol>
+    </nav>
+  );
+}
+
+/**
+ * Story 3.2 — the STATIC "Recent scan first" ordering readout. PATCH 11: this
+ * label lives OUTSIDE any `aria-live` ancestor (the caller renders it before
+ * the `<div aria-live="polite">`), so React re-renders never re-announce it.
+ * It is a label naming SCAN recency — never content-change tracking (AD-7:
+ * never disguise Derived-Index state as source-data state). No new sort or
+ * data path. `observed_at` is set once per scan (scan.rs:330) and is constant
+ * across a source's active generation, so a time/date filter would be
+ * degenerate (always "all"); the readout is the only honest way to
+ * communicate "recent".
+ */
+function renderOrderReadout(): ReactElement {
+  return <p data-testid="browse-effective-order">Recent scan first</p>;
+}
+
+/**
+ * Story 3.3 — the DYNAMIC Source Health readout for the browsed source,
+ * derived from the existing `sources` sidecar filtered by `sourceId` (no new
+ * fetch). Lives inside the `<div aria-live="polite">` so health transitions
+ * (sidecar arrival, status change between pages) are spoken without moving
+ * focus. PATCH 2/3: the label is state-gated so a terminal state is never
+ * mislabeled as "Loading…":
+ *
+ * - `sidecarPending === true` (loading, no sidecar yet) → "Loading…".
+ * - sidecar arrived but the browsed source is absent, OR the request errored
+ *   → "unknown" (never a fabricated status; AD-7 no-disguise).
+ * - sidecar arrived with the browsed source → its `status` verbatim.
+ *
+ * No `role="status"` on this `<p>` (PATCH 11): the outer `aria-live` already
+ * covers the announcement; a second live region would double-announce.
+ */
+function renderHealthReadout(
+  currentSourceStatus: SourceQueryStatus | undefined,
+  sidecarPending: boolean,
+): ReactElement {
+  const healthLabel = sidecarPending
+    ? "Loading…"
+    : (currentSourceStatus?.status ?? "unknown");
+  return (
+    <p>
+      <span data-testid="browse-source-health">Source health: {healthLabel}</span>
+    </p>
   );
 }
 
@@ -330,7 +487,15 @@ function renderResults(
   return (
     <>
       <p>{results.length} memor{results.length === 1 ? "y" : "ies"}.</p>
-      <ol>
+      {/*
+        Story 3.3 — the results `<ol>` carries an `aria-label` so it is
+        distinguishable from the Breadcrumb's `<ol>` (two lists now coexist in
+        the browse region). PATCH 9: the label is "Browse results", NOT
+        "Browse memories" (the `<h2>` already exposes that name in the same
+        region; duplicating it would make SR users hear it twice and make
+        by-name navigation ambiguous).
+      */}
+      <ol aria-label="Browse results">
         {results.map((result) => (
           <ResultCard
             key={result.record_id}

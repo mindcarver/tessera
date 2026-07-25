@@ -865,13 +865,19 @@ test("keyboard browse enters from inventory paginates and renders three empty st
   await expect(loadMore).toBeVisible();
   await loadMore.focus();
   await page.keyboard.press("Enter");
-  await expect(browseRegion.getByRole("listitem")).toHaveCount(2);
+  // Story 3.3 — scope to the results list (`aria-label="Browse results"`)
+  // so the Breadcrumb's `<ol>` items are not counted. Two records after Load
+  // more.
+  await expect(browseRegion.getByRole("list", { name: "Browse results" }).getByRole("listitem")).toHaveCount(2);
 
-  // Back to inventory is keyboard-reachable (first focusable in the Browse
-  // view).
-  const backButton = browseRegion.getByRole("button", { name: "Back to inventory" });
-  await expect(backButton).toBeVisible();
-  await backButton.focus();
+  // Story 3.3 — the standalone "Back to inventory" button was replaced by the
+  // Breadcrumb's Sources segment (one back action, not two). The Sources
+  // segment is the first focusable element in Browse and IS the `onBack`
+  // action, so the keyboard back contract is preserved.
+  const breadcrumb = browseRegion.getByRole("navigation", { name: "Breadcrumb" });
+  const sourcesButton = breadcrumb.getByRole("button", { name: "Sources" });
+  await expect(sourcesButton).toBeVisible();
+  await sourcesButton.focus();
   await page.keyboard.press("Enter");
   // The Inventory region is visible again.
   await expect(page.getByRole("region", { name: "Source inventory" })).toBeVisible();
@@ -903,10 +909,13 @@ test("keyboard browse enters from inventory paginates and renders three empty st
     await expect(page.getByRole("region", { name: "Memory browse" })).toBeVisible();
     await expect(page.getByText(expectedText)).toBeVisible();
     // No results render alongside the empty state — the three states describe
-    // the browsed source's initial zero-result page.
-    await expect(page.getByRole("region", { name: "Memory browse" }).getByRole("listitem")).toHaveCount(0);
-    // Back to inventory to reset for the next iteration (or finish).
-    await page.getByRole("button", { name: "Back to inventory" }).press("Enter");
+    // the browsed source's initial zero-result page. Story 3.3: scope to the
+    // results list so the Breadcrumb's items are not counted; under an empty
+    // state the results `<ol>` does not render at all (count 0).
+    await expect(page.getByRole("region", { name: "Memory browse" }).getByRole("list", { name: "Browse results" })).toHaveCount(0);
+    // Story 3.3 — back to inventory via the Breadcrumb Sources segment to
+    // reset for the next iteration (or finish).
+    await page.getByRole("navigation", { name: "Breadcrumb" }).getByRole("button", { name: "Sources" }).press("Enter");
   }
 
   // Smoke: at least the page-1 browse call fired during the test.
@@ -1138,7 +1147,9 @@ test("browse memory-type filter is keyboard-reachable and narrows results", asyn
 
   // Baseline: no filter → one record on page 1 (mock returns the first of
   // three under limit=1). The Provenance fields render (shared ResultCard).
-  await expect(browseRegion.getByRole("listitem")).toHaveCount(1);
+  // Story 3.3 — scope to the results list so the Breadcrumb's items are not
+  // counted.
+  await expect(browseRegion.getByRole("list", { name: "Browse results" }).getByRole("listitem")).toHaveCount(1);
   await expect(browseRegion.getByText("Provider").first()).toBeVisible();
   await expect(browseRegion.getByText("Semantic location").first()).toBeVisible();
   await expect(browseRegion.getByText("Source health").first()).toBeVisible();
@@ -1156,7 +1167,9 @@ test("browse memory-type filter is keyboard-reachable and narrows results", asyn
   // Filter change → page-1 re-fetch under the new filter → narrowed to the
   // one topic_memory record.
   await expect(browseRegion.getByText("topic excerpt")).toBeVisible();
-  await expect(browseRegion.getByRole("listitem")).toHaveCount(1);
+  // Story 3.3 — scope to the results list so the Breadcrumb's items are not
+  // counted.
+  await expect(browseRegion.getByRole("list", { name: "Browse results" }).getByRole("listitem")).toHaveCount(1);
 
   // The wire-level serialization was exercised: at least one browse request
   // carried memory_type=topic_memory.
@@ -1173,9 +1186,202 @@ test("browse memory-type filter is keyboard-reachable and narrows results", asyn
     await expect(browseRegion.getByRole("button", { name: "Load more" })).toHaveCount(0);
   }
 
-  // Back to inventory is still keyboard-reachable.
-  const backButton = browseRegion.getByRole("button", { name: "Back to inventory" });
-  await backButton.focus();
+  // Story 3.3 — back to inventory is via the Breadcrumb's Sources segment
+  // (the standalone button was removed; the Sources segment IS `onBack`).
+  const breadcrumb = browseRegion.getByRole("navigation", { name: "Breadcrumb" });
+  const sourcesButton = breadcrumb.getByRole("button", { name: "Sources" });
+  await sourcesButton.focus();
   await page.keyboard.press("Enter");
   await expect(page.getByRole("region", { name: "Source inventory" })).toBeVisible();
+});
+
+/**
+ * Story 3.3 — the Browse Breadcrumb makes the Provider → Native Project
+ * hierarchy explicit and is keyboard-reachable (AD-21 acceptance artifact).
+ *
+ * The Breadcrumb (`<nav aria-label="Breadcrumb">` + `<ol>`) has three
+ * segments: Sources (keyboard-reachable `<button>` → `onBack`, auto-focused on
+ * entry), Provider (presentational `<span>`), and the Native Project / "Global
+ * memory" leaf (`aria-current="location"` — an in-app drill-down location, not
+ * a site-nav page). The leaf is honest about Codex's global store
+ * (`native_project == null` → "Global memory", never a fake project) vs a
+ * Claude source's per-project scope (`native_project` string verbatim, no
+ * reverse-mapping to a repo path — Epic 5 federation).
+ *
+ * The hierarchy-status region surfaces 3.2's "Recent scan first" readout
+ * (static, outside any `aria-live` ancestor) and the browsed source's Source
+ * Health (dynamic, inside the `aria-live` region, derived from the existing
+ * `sources` sidecar filtered by `sourceId` — no new fetch).
+ *
+ * The test covers the two leaf branches the AC calls out (Codex global vs
+ * Claude project), asserts the three segments, `aria-current="location"` on
+ * the leaf, that the Sources segment is auto-focused on entry and is the
+ * keyboard-reachable back affordance, and that the health readout surfaces the
+ * browsed source's status (including the Codex branch's `degraded` so a
+ * regression that hardcodes "available" fails loudly).
+ */
+test("browse breadcrumb surfaces provider and native-project hierarchy and is keyboard-reachable", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  // Two confirmed sources so the test can exercise both leaf branches without
+  // a reload: a Codex global source (native_project: null) and a Claude
+  // per-project source (native_project: "proj-claude").
+  const inventory = [
+    {
+      source_id: "src_codex",
+      provider: "codex",
+      lifecycle_state: "confirmed",
+      root: "/fixture/codex",
+      native_project: null,
+      coverage_level: "full",
+      health_state: "healthy",
+      last_successful_scan: 100,
+      complete_record_count: 1,
+      latest_error: null,
+    },
+    {
+      source_id: "src_claude",
+      provider: "claude_code",
+      lifecycle_state: "confirmed",
+      root: "/fixture/claude",
+      native_project: "proj-claude",
+      coverage_level: "full",
+      health_state: "healthy",
+      last_successful_scan: 200,
+      complete_record_count: 1,
+      latest_error: null,
+    },
+  ];
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: inventory }) }),
+  );
+  // Browse mock keyed by `source`. Each branch returns one record + a sidecar
+  // that carries the browsed source's own Source Health (so the structure-
+  // status view can filter on `sourceId` and surface it without a new fetch).
+  // The Codex branch carries `degraded` so the readout is non-default and a
+  // regression that hard-codes "available" fails loudly.
+  await page.route("**/api/browse?*", async (route) => {
+    const source = new URL(route.request().url()).searchParams.get("source");
+    if (source === "src_codex") {
+      return route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          api_version: "1",
+          payload: {
+            results: [{
+              record_id: "rec-codex",
+              excerpt: "codex memory",
+              provider: "codex",
+              source_id: "src_codex",
+              native_project: null,
+              native_locator: "file:///codex#L1",
+              display_locator: "file:///codex#L1-L2",
+              observed_at: 1,
+              coverage_level: "full",
+              health_state: "healthy",
+            }],
+            next_cursor: null,
+            empty_state: null,
+            sources: [{ source_id: "src_codex", provider: "codex", native_project: null, status: "degraded" }],
+          },
+        }),
+      });
+    }
+    // src_claude (per-project).
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: {
+          results: [{
+            record_id: "rec-claude",
+            excerpt: "claude memory",
+            provider: "claude_code",
+            source_id: "src_claude",
+            native_project: "proj-claude",
+            native_locator: "file:///claude#L1",
+            display_locator: "file:///claude#L1-L2",
+            observed_at: 2,
+            coverage_level: "full",
+            health_state: "healthy",
+          }],
+          next_cursor: null,
+          empty_state: null,
+          sources: [{ source_id: "src_claude", provider: "claude_code", native_project: "proj-claude", status: "available" }],
+        },
+      }),
+    });
+  });
+
+  await page.goto("/");
+  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
+
+  // --- Codex branch: native_project == null → leaf says "Global memory". ---
+  const codexBrowse = inventoryRegion.locator('[data-provider="codex"]').getByRole("button", { name: "Browse", exact: true });
+  await codexBrowse.focus();
+  await page.keyboard.press("Enter");
+  let browseRegion = page.getByRole("region", { name: "Memory browse" });
+  await expect(browseRegion).toBeVisible();
+
+  let breadcrumb = browseRegion.getByRole("navigation", { name: "Breadcrumb" });
+  // Three segments render (Sources button, Provider span, leaf span).
+  await expect(breadcrumb.getByRole("listitem")).toHaveCount(3);
+  // The leaf is honest about Codex's global store — never a fake project name,
+  // never "All projects".
+  await expect(breadcrumb.getByText("Global memory")).toBeVisible();
+  // The Provider segment carries the display name.
+  await expect(breadcrumb.getByText("Codex")).toBeVisible();
+  // The leaf carries `aria-current="location"` (in-app drill-down location,
+  // not a site-nav page).
+  await expect(breadcrumb.locator("[aria-current='location']")).toHaveText("Global memory");
+
+  // PATCH 7 — the Sources segment is auto-focused on Browse entry so the
+  // "first focusable = back" contract is observable (a keyboard user can leave
+  // the view without tabbing through results). Asserted here, on the very first
+  // Browse entry, before any manual focus() call would mask a regression.
+  const sourcesButton = breadcrumb.getByRole("button", { name: "Sources" });
+  await expect(sourcesButton).toBeFocused();
+
+  // PATCH 6 — the Codex branch's sidecar carries `degraded`, so the health
+  // readout must surface that exact status. Asserting it here proves the
+  // readout is not hard-coded "available" (the comment in the mock advertises
+  // this guard; without this assertion a hardcoded status would pass silently).
+  await expect(browseRegion.getByTestId("browse-source-health")).toContainText("degraded");
+
+  // The Sources segment IS `onBack` (keyboard-reachable). Activating it
+  // returns to the Inventory.
+  await sourcesButton.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("region", { name: "Source inventory" })).toBeVisible();
+
+  // --- Claude branch: native_project = "proj-claude" → leaf shows it verbatim. ---
+  const claudeBrowse = inventoryRegion.locator('[data-provider="claude_code"]').getByRole("button", { name: "Browse", exact: true });
+  await claudeBrowse.focus();
+  await page.keyboard.press("Enter");
+  browseRegion = page.getByRole("region", { name: "Memory browse" });
+  await expect(browseRegion).toBeVisible();
+
+  breadcrumb = browseRegion.getByRole("navigation", { name: "Breadcrumb" });
+  await expect(breadcrumb.getByRole("listitem")).toHaveCount(3);
+  // The Claude leaf shows the native_project string verbatim — no reverse-
+  // mapping to a repo path (that is Epic 5 federation, out of scope).
+  await expect(breadcrumb.getByText("proj-claude")).toBeVisible();
+  await expect(breadcrumb.getByText("Claude Code")).toBeVisible();
+  await expect(breadcrumb.locator("[aria-current='location']")).toHaveText("proj-claude");
+
+  // --- Hierarchy-status readouts: "Recent scan first" + Source Health. ---
+  // PATCH 11 split the single structure-status container into two independent
+  // readouts: the STATIC "Recent scan first" label (outside any `aria-live`
+  // ancestor so it is never re-announced) and the DYNAMIC Source Health line
+  // (inside the `aria-live` region). Both still live in the browse region.
+  // 3.2's "Recent scan first" readout is preserved (AD-7: scan recency, never
+  // content-change tracking).
+  await expect(browseRegion.getByTestId("browse-effective-order")).toContainText("Recent scan first");
+  // The current source's Source Health is derived from the existing sidecar
+  // filtered by `sourceId` (no new fetch). The Claude branch's sidecar
+  // carries `available`, so the readout surfaces that exact status — and NOT
+  // the Codex branch's `degraded` (proves the filter is per-sourceId).
+  await expect(browseRegion.getByTestId("browse-source-health")).toContainText("available");
+  await expect(browseRegion.getByTestId("browse-source-health")).not.toContainText("degraded");
 });
