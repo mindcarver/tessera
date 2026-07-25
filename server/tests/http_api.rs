@@ -608,19 +608,19 @@ fn claude_code_candidate_confirms_over_wire_with_native_project() {
     assert_eq!(first_id, second_id, "re-confirm returns the same source_id");
 }
 
-/// Story 2.1 AC — a rescan of a confirmed Claude Code source surfaces the
-/// provider-aware safe message on EVERY surface: the rescan SSE terminal
-/// event, the inventory `latest_error`, AND the persisted
-/// `scan_runs.error_code`. The Codex parser is never applied; the previous
-/// index is unchanged (it never existed for this source). The message text
-/// (not just non-emptiness) is asserted so a regression that reroutes the
-/// outcome to the generic `internal` / "Rescan failed" path fails loudly.
+/// Story 2.2 AC — a rescan of a confirmed Claude Code source SUCCEEDS over
+/// HTTP: the SSE terminal event is `succeeded` (NOT `failed`), the generation
+/// activates, and the inventory reflects a healthy source with no
+/// `latest_error`. Replaces the 2.1 test that pinned the now-removed
+/// `provider_not_scannable` outcome. The query service returning the indexed
+/// records is covered by `source_registry.rs` and the contract suite.
 #[test]
-fn rescan_claude_code_source_returns_safe_scan_failed_on_wire() {
+fn rescan_claude_code_source_succeeds_and_activates_on_wire() {
     let source_root = tempfile::tempdir().expect("source root");
     let memory = source_root.path().join("memory");
     std::fs::create_dir_all(&memory).expect("claude memory dir");
     std::fs::write(memory.join("MEMORY.md"), "# memory\nbody").expect("write memory");
+    std::fs::write(memory.join("topic.md"), "# topic\ntopic body").expect("write topic");
     let port = boot_test_server();
     let confirm_body = serde_json::json!({
         "candidate": {
@@ -662,15 +662,9 @@ fn rescan_claude_code_source_returns_safe_scan_failed_on_wire() {
     .expect("rescan json");
     let job_id = payload["payload"]["job_id"].as_str().expect("job id");
 
-    // Drain SSE until the terminal event surfaces the provider-not-scannable
-    // outcome. The Codex parser is never applied, so no Claude body crosses
-    // the wire.
-    //
-    // Story 2.1 pass-2 review fix — the poll budget was 40 × 25 ms (~1 s),
-    // which is tight on a loaded CI runner where the rescan worker thread
-    // may be scheduled later than that. Raise to 200 × 25 ms (~5 s) while
-    // keeping the terminal-event break logic so a fast worker still exits
-    // early.
+    // Drain SSE until the terminal event surfaces. Story 2.2: the rescan
+    // SUCCEEDS (Claude is scannable). Poll budget is 200 × 25 ms (~5 s) to
+    // tolerate a loaded CI runner scheduling the rescan worker thread late.
     let mut final_state = String::new();
     let mut final_message = String::new();
     for _ in 0..200 {
@@ -697,25 +691,17 @@ fn rescan_claude_code_source_returns_safe_scan_failed_on_wire() {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    assert_eq!(final_state, "failed", "claude rescan must fail safely");
-    // Story 2.1 review fix — assert the PROVIDER-AWARE text, not just
-    // non-emptiness. A regression that reroutes this to the generic
-    // "Rescan failed. The previous index is unchanged." path would pass a
-    // !is_empty() check; this assertion catches it.
-    assert!(
-        final_message.contains("not available yet"),
-        "expected provider-aware message, got: {final_message:?}"
+    assert_eq!(
+        final_state, "succeeded",
+        "claude rescan must succeed (Claude is scannable in 2.2); message: {final_message:?}"
     );
     assert!(
-        !final_message.contains("previous index is unchanged"),
-        "must NOT fall back to the generic scan-failed message: {final_message:?}"
+        !final_message.contains("not available yet"),
+        "the removed provider_not_scannable message must NOT appear: {final_message:?}"
     );
 
-    // Surface #2: the inventory `latest_error` must carry the same
-    // provider-aware text — it is derived from `scan_runs.error_code` via
-    // `safe_error_reason`, so this asserts both the persisted error_code is
-    // `provider_not_scannable` (NOT `internal`) and that the inventory shows
-    // the honest expected-2.1 outcome.
+    // Inventory: the Claude row is healthy with a non-zero record count and
+    // no `latest_error` (a succeeded scan clears the error surface).
     let inventory = raw_http(
         port,
         &format!("GET /api/sources/inventory HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
@@ -731,12 +717,15 @@ fn rescan_claude_code_source_returns_safe_scan_failed_on_wire() {
         .iter()
         .find(|row| row["source_id"].as_str() == Some(source_id))
         .expect("claude source row in inventory");
-    let latest_error = claude_row["latest_error"]
-        .as_str()
-        .expect("latest_error present");
+    assert_eq!(claude_row["health_state"].as_str(), Some("healthy"));
+    let record_count = claude_row["complete_record_count"]
+        .as_u64()
+        .expect("record count");
+    assert!(record_count > 0, "claude row has indexed records");
     assert!(
-        latest_error.contains("not available yet"),
-        "inventory latest_error must carry the provider-aware text, got: {latest_error:?}"
+        claude_row.get("latest_error").map(|v| v.is_null()).unwrap_or(true),
+        "healthy claude row has no latest_error: {:?}",
+        claude_row["latest_error"]
     );
 }
 

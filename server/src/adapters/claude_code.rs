@@ -89,27 +89,43 @@
 //! directly and exercise the adapter's own code. `discover()` is three steps
 //! of glue: read env → `discover_with_env`.
 //!
-//! ## Scanning is deferred to Story 2.2 (and hard-fails loudly until then)
+//! ## Story 2.2 — enumeration + read-only indexing
 //!
-//! Enumeration of Claude Code memory files is Story 2.2. The application
-//! layer guards any scan attempt on a `claude_code` source
-//! (`ScanError::ProviderNotScannable`) so the Codex parser is never applied
-//! to Claude files. [`ProviderAdapter::enumerate_file_units`] and
-//! [`ProviderAdapter::enumerate_artifacts`] therefore return `Err` for
-//! `claude_code`: returning empty `Ok` would let a misrouted scan (e.g. a
-//! future change that bypasses the guard) commit an empty generation as a
-//! false-positive success. The hard-fail turns a guard bypass into a loud
-//! `EnumerationFailed` instead.
+//! [`ProviderAdapter::enumerate_file_units`] and
+//! [`ProviderAdapter::enumerate_artifacts`] parse a confirmed Claude `memory/`
+//! dir into canonical records by walking the **Supported Artifact Matrix**
+//! (A-18) for Claude Code:
+//! - Index **every direct-child `*.md`** of the confirmed `memory/` dir
+//!   (`MEMORY.md` + topic Markdown). **No recursion, no subdirectory walking**
+//!   (verified real layout: flat, `.md`-only, no subdirs).
+//! - `MEMORY.md` is tagged [`ProviderMemoryType::Memory`] (the auto-managed
+//!   index); every other direct-child `*.md` is tagged
+//!   [`ProviderMemoryType::TopicMemory`] (a distinct topic type for honest
+//!   2.3/2.4 filtering).
+//! - `CLAUDE.md` and `AGENTS.md` are **rejected by name** as
+//!   `unsupported_artifact` diagnostics — they are human instruction files,
+//!   not memory. Non-`*.md` files and subdirectories are likewise rejected as
+//!   `unsupported_artifact` diagnostics; never indexed, never recursed.
+//! - The same realpath containment (symlink-escape) check Codex uses is
+//!   applied: a `*.md` child whose realpath escapes the canonical root is
+//!   skipped.
+//!
+//! Parsing reuses the shared, generic Markdown parser
+//! ([`crate::adapters::markdown::canonicalize_markdown`]) — the same parser
+//! Codex uses. Only the persisted `parser_version` tag differs
+//! (`claude-markdown/v1`). Claude records flow through Epic 1's atomic
+//! generational pipeline unchanged.
 
 use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::domain::ports::provider_adapter::{
-    ArtifactEnumeration, CandidateSource, CoverageLevel, DiscoveryBasis, EnumerateError, FileUnit,
-    ProviderAdapter,
+    ArtifactDiagnostic, ArtifactEnumeration, CandidateSource, CoverageLevel, DiscoveryBasis,
+    EnumerateError, FileUnit, ProviderAdapter, ProviderMemoryType, SupportedArtifact,
 };
 
-/// Claude Code Provider adapter (Story 2.1 discovery slice).
+/// Claude Code Provider adapter (Story 2.1 discovery slice; Story 2.2 adds
+/// the enumeration + parsing slice).
 ///
 /// Unit struct — the slice is stateless. The adapter reads provider files
 /// but never writes them (NFR-1 zero-write); discovery checks directory
@@ -117,20 +133,34 @@ use crate::domain::ports::provider_adapter::{
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeCodeAdapter;
 
-const PROVIDER_ID: &str = "claude_code";
+impl ClaudeCodeAdapter {
+    /// Canonical provider id for Claude Code.
+    pub const PROVIDER_ID: &'static str = "claude_code";
+
+    /// Parser-version contract for the Claude Code Markdown parser. Claude's
+    /// `MEMORY.md` and topic `*.md` reuse the shared generic Markdown parser
+    /// (the same `canonicalize_markdown` Codex uses); a distinct version tag
+    /// lets a future Claude-specific grammar bump trigger a reparse without
+    /// touching Codex identity.
+    pub const PARSER_VERSION: &'static str = "claude-markdown/v1";
+}
+
+const PROVIDER_ID: &str = ClaudeCodeAdapter::PROVIDER_ID;
 
 impl ProviderAdapter for ClaudeCodeAdapter {
     fn provider_id(&self) -> &'static str {
-        PROVIDER_ID
+        Self::PROVIDER_ID
     }
 
     fn coverage_level(&self) -> CoverageLevel {
         // Claude Code's `projects/*/memory/` is a local directory tree that
-        // the adapter will be able to enumerate in full once Story 2.2 lands.
-        // Declaring `Full` here is honest capability disclosure (AD-3 / AD-18)
-        // of the provider surface; it does not bypass 2.2. The trait only
-        // grows the discovery slice in 2.1.
+        // the adapter fully enumerates as of Story 2.2 (flat `*.md` only, no
+        // recursion). `Full` is honest capability disclosure (AD-3 / AD-18).
         CoverageLevel::Full
+    }
+
+    fn parser_version(&self) -> &'static str {
+        Self::PARSER_VERSION
     }
 
     fn discover(&self) -> Vec<CandidateSource> {
@@ -144,20 +174,17 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         self.discover_with_env(claude_config_dir.as_deref(), home.as_deref())
     }
 
-    fn enumerate_file_units(&self, _root: &Path) -> Result<Vec<FileUnit>, EnumerateError> {
-        // Story 2.2 lands Claude-specific enumeration. For 2.1, scanning is
-        // guarded at the application layer (ScanError::ProviderNotScannable)
-        // so this method is never reached in production. Returning `Err`
-        // (NEVER empty `Ok`) ensures that if the guard is ever bypassed, a
-        // misrouted scan fails loudly as `EnumerationFailed` instead of
-        // committing an empty generation as a false-positive success — see
-        // the module doc "Scanning is deferred to Story 2.2".
-        Err(EnumerateError::Unreadable)
+    fn enumerate_file_units(&self, root: &Path) -> Result<Vec<FileUnit>, EnumerateError> {
+        Ok(self
+            .enumerate_artifacts(root)?
+            .supported
+            .into_iter()
+            .map(|artifact| artifact.file)
+            .collect())
     }
 
-    fn enumerate_artifacts(&self, _root: &Path) -> Result<ArtifactEnumeration, EnumerateError> {
-        // Same 2.2 boundary + hard-fail rationale as `enumerate_file_units`.
-        Err(EnumerateError::Unreadable)
+    fn enumerate_artifacts(&self, root: &Path) -> Result<ArtifactEnumeration, EnumerateError> {
+        enumerate_claude_artifacts(root)
     }
 }
 
@@ -252,6 +279,162 @@ impl ClaudeCodeAdapter {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// Story 2.2 — enumeration (Supported Artifact Matrix for Claude Code)
+// ---------------------------------------------------------------------------
+
+/// The auto-managed index filename. Always tagged [`ProviderMemoryType::Memory`].
+const MEMORY_INDEX_FILE: &str = "MEMORY.md";
+
+/// Human-authored instruction files rejected by name (never indexed). These
+/// are not Claude auto-memory — they are guidance Claude reads, not memory it
+/// writes. Indexed rejection (a diagnostic, not a silent skip) keeps the
+/// count honest and surfaces the boundary in 2.3/2.4.
+const REJECTED_INSTRUCTION_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
+
+/// Enumerate the direct-child `*.md` of a confirmed Claude `memory/` dir.
+///
+/// Boundary (A-18, mirrors Codex's discipline):
+/// - **Direct children only.** No recursion, no subdirectory walking. The
+///   real Claude layout is flat `*.md` (verified on 18 real dirs); a manually
+///   added subdirectory is out of the matrix and surfaces as a diagnostic.
+/// - **`*.md` only.** `MEMORY.md` → [`ProviderMemoryType::Memory`]; every
+///   other direct-child `*.md` → [`ProviderMemoryType::TopicMemory`].
+/// - **`CLAUDE.md` / `AGENTS.md`** are rejected by name as
+///   `unsupported_artifact` diagnostics — human instruction files, not memory.
+/// - **Non-`*.md` files and subdirectories** become `unsupported_artifact`
+///   diagnostics; never indexed, never recursed.
+/// - **Symlink escape** (a `*.md` child whose realpath is outside the
+///   canonical root) is skipped via the same realpath containment check Codex
+///   uses.
+///
+/// The result is sorted by `relative_path` and **deduplicated** by
+/// `relative_path` so the announced record count always equals the actual row
+/// count (same "计数诚实" rule as Codex). An empty dir is a legitimate `Ok`
+/// with zero supported artifacts (spec I/O matrix — empty directory scan
+/// succeeds).
+fn enumerate_claude_artifacts(root: &Path) -> Result<ArtifactEnumeration, EnumerateError> {
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|_| EnumerateError::RootUnresolvable)?;
+    let entries = std::fs::read_dir(&canonical_root).map_err(|_| EnumerateError::Unreadable)?;
+    let mut supported = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|_| EnumerateError::Unreadable)?;
+        let lexical_path = entry.path();
+        let observed = crate::adapters::markdown::safe_relative_path(&canonical_root, &lexical_path);
+        let name_utf8 = entry.file_name();
+        let Some(name) = name_utf8.to_str() else {
+            // Non-UTF-8 entry: percent-encode the observed lexical path into a
+            // diagnostic (mirrors Codex). Never indexed.
+            diagnostics.push(ArtifactDiagnostic {
+                kind: "unsupported_artifact",
+                observed_path: observed,
+            });
+            continue;
+        };
+        // Reject human instruction files by name regardless of extension —
+        // they are not Claude auto-memory. The comparison is case-insensitive
+        // so a `claude.md`/`agents.md` on a case-insensitive filesystem
+        // (macOS APFS) is still rejected rather than leaking instructions into
+        // the index.
+        if REJECTED_INSTRUCTION_FILES
+            .iter()
+            .any(|rejected| rejected.eq_ignore_ascii_case(name))
+        {
+            diagnostics.push(ArtifactDiagnostic {
+                kind: "unsupported_artifact",
+                observed_path: observed,
+            });
+            continue;
+        }
+        // In-matrix names (`*.md`) must resolve to a readable file. Mirrors
+        // Codex: an in-matrix name that resolves to the wrong type (e.g.
+        // `MEMORY.md` as a directory) is a TERMINAL failure — a supported
+        // memory cannot disappear from a successful generation. Non-`*.md`
+        // names (including subdirectories) are out of the matrix and surface
+        // as `unsupported_artifact` diagnostics.
+        if is_markdown(name) {
+            if let Some(artifact) = resolve_supported_claude_artifact(&canonical_root, &lexical_path)?
+            {
+                supported.push(artifact);
+            }
+        } else {
+            diagnostics.push(ArtifactDiagnostic {
+                kind: "unsupported_artifact",
+                observed_path: observed,
+            });
+        }
+    }
+
+    supported.sort_by(|a, b| a.file.relative_path.cmp(&b.file.relative_path));
+    supported.dedup_by(|a, b| a.file.relative_path == b.file.relative_path);
+    diagnostics.sort();
+    diagnostics.dedup();
+    Ok(ArtifactEnumeration {
+        supported,
+        diagnostics,
+    })
+}
+
+/// Resolve an in-matrix `*.md` child into a supported artifact after
+/// realpath containment + metadata validation. Returns `Ok(None)` for a
+/// proven root escape (silently excluded — mirrors Codex); returns `Err` for
+/// an unresolvable in-matrix file (terminal — a supported memory cannot
+/// disappear from a successful generation).
+fn resolve_supported_claude_artifact(
+    canonical_root: &Path,
+    lexical_path: &Path,
+) -> Result<Option<SupportedArtifact>, EnumerateError> {
+    let real = match std::fs::canonicalize(lexical_path) {
+        Ok(path) => path,
+        Err(_) => return Err(EnumerateError::AllowlistedArtifactUnresolvable),
+    };
+    let Ok(relative) = real.strip_prefix(canonical_root) else {
+        // Symlink escape: realpath is outside the confirmed root. Skip.
+        return Ok(None);
+    };
+    let metadata =
+        std::fs::metadata(&real).map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?;
+    if !metadata.is_file() {
+        return Err(EnumerateError::AllowlistedArtifactUnresolvable);
+    }
+    let relative_path = relative
+        .to_str()
+        .ok_or(EnumerateError::AllowlistedArtifactUnresolvable)?
+        .to_string();
+    let mtime = metadata
+        .modified()
+        .map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?
+        .as_nanos() as i64;
+    // Case-insensitive so a `memory.md` (e.g. on a case-insensitive FS) still
+    // tags as the auto-managed `Memory` index type rather than `TopicMemory`.
+    let memory_type = if relative_path.eq_ignore_ascii_case(MEMORY_INDEX_FILE) {
+        ProviderMemoryType::Memory
+    } else {
+        ProviderMemoryType::TopicMemory
+    };
+    Ok(Some(SupportedArtifact {
+        file: FileUnit {
+            relative_path,
+            absolute_path: real,
+            size: metadata.len(),
+            mtime,
+        },
+        memory_type,
+    }))
+}
+
+/// A name is markdown iff it has a `.md` extension (case-sensitive on the
+/// documented Claude layout). Direct-child `*.md` are the only in-matrix
+/// files for Claude Code (A-18).
+fn is_markdown(name: &str) -> bool {
+    name.ends_with(".md")
 }
 
 /// Pure path resolver for Claude Code's `<config_dir>/` directory (the
@@ -482,5 +665,185 @@ mod tests {
         assert_eq!(&line[idx..], "// trailing");
         // No comment at all.
         assert_eq!(find_line_comment_index("\"a/b/c\""), None);
+    }
+
+    // --- Story 2.2: enumerate_artifacts boundary (A-18) --------------------
+
+    /// Direct-child `*.md` index; `MEMORY.md` → Memory, other `*.md` →
+    /// TopicMemory. `CLAUDE.md`/`AGENTS.md`/non-`.md`/subdir become
+    /// `unsupported_artifact` diagnostics.
+    #[test]
+    fn enumerate_indexes_direct_child_md_and_classifies_roles() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("MEMORY.md"), "# memory\nbody").expect("write memory");
+        std::fs::write(root.join("topic-a.md"), "# topic A\nbody").expect("write topic a");
+        std::fs::write(root.join("topic-b.md"), "# topic B\nbody").expect("write topic b");
+        // Rejected by name.
+        std::fs::write(root.join("CLAUDE.md"), "rules").expect("write claude");
+        std::fs::write(root.join("AGENTS.md"), "rules").expect("write agents");
+        // Non-markdown.
+        std::fs::write(root.join("notes.txt"), "notes").expect("write txt");
+        std::fs::write(root.join("data.json"), "{}").expect("write json");
+        // Subdirectory (must NOT be recursed).
+        std::fs::create_dir_all(root.join("subdir")).expect("mkdir subdir");
+        std::fs::write(root.join("subdir").join("nested.md"), "nested").expect("write nested");
+
+        let adapter = ClaudeCodeAdapter;
+        let observation = adapter.enumerate_artifacts(root).expect("enumerate ok");
+
+        // Supported: MEMORY.md + 2 topic files.
+        assert_eq!(observation.supported.len(), 3, "exactly the 3 direct-child .md");
+        let mut sorted: Vec<(&str, ProviderMemoryType)> = observation
+            .supported
+            .iter()
+            .map(|a| (a.file.relative_path.as_str(), a.memory_type))
+            .collect();
+        sorted.sort_by_key(|(p, _)| *p);
+        assert_eq!(
+            sorted,
+            vec![
+                ("MEMORY.md", ProviderMemoryType::Memory),
+                ("topic-a.md", ProviderMemoryType::TopicMemory),
+                ("topic-b.md", ProviderMemoryType::TopicMemory),
+            ]
+        );
+
+        // Diagnostics: CLAUDE.md, AGENTS.md, notes.txt, data.json, subdir.
+        // (subdir/nested.md is NOT a diagnostic — the subdir itself is the
+        // boundary; recursion is never attempted.)
+        let mut diag_paths: Vec<&str> =
+            observation.diagnostics.iter().map(|d| d.observed_path.as_str()).collect();
+        diag_paths.sort();
+        assert_eq!(
+            diag_paths,
+            vec!["AGENTS.md", "CLAUDE.md", "data.json", "notes.txt", "subdir"],
+            "all non-matrix direct children surface as diagnostics"
+        );
+        for d in &observation.diagnostics {
+            assert_eq!(d.kind, "unsupported_artifact");
+        }
+    }
+
+    /// Case-insensitive filesystem discipline (macOS APFS is case-insensitive):
+    /// lowercase `claude.md`/`agents.md` MUST still be rejected as instruction
+    /// files (never indexed — no instruction leak), and lowercase `memory.md`
+    /// MUST still tag as the `Memory` index type (not `TopicMemory`). The
+    /// rejecter and the index role tag both compare case-insensitively.
+    #[test]
+    fn enumerate_reject_lowercase_instruction_files_and_tags_lowercase_memory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        // Lowercase instruction files — must be rejected by name, not indexed.
+        std::fs::write(root.join("claude.md"), "rules").expect("write claude.md");
+        std::fs::write(root.join("agents.md"), "rules").expect("write agents.md");
+        // Lowercase index file — must tag as Memory (the auto-managed index).
+        std::fs::write(root.join("memory.md"), "# memory\nbody").expect("write memory.md");
+        // A regular topic file for contrast (tags as TopicMemory).
+        std::fs::write(root.join("topic.md"), "# topic\nbody").expect("write topic");
+
+        let adapter = ClaudeCodeAdapter;
+        let observation = adapter.enumerate_artifacts(root).expect("enumerate ok");
+
+        // Supported: lowercase `memory.md` (Memory) + `topic.md` (TopicMemory).
+        let mut supported: Vec<(&str, ProviderMemoryType)> = observation
+            .supported
+            .iter()
+            .map(|a| (a.file.relative_path.as_str(), a.memory_type))
+            .collect();
+        supported.sort_by_key(|(p, _)| *p);
+        assert_eq!(
+            supported,
+            vec![
+                ("memory.md", ProviderMemoryType::Memory),
+                ("topic.md", ProviderMemoryType::TopicMemory),
+            ],
+            "lowercase memory.md tags as Memory; instruction files rejected"
+        );
+
+        // Lowercase instruction files surface as diagnostics, never indexed.
+        let mut diag_paths: Vec<&str> =
+            observation.diagnostics.iter().map(|d| d.observed_path.as_str()).collect();
+        diag_paths.sort();
+        assert_eq!(
+            diag_paths,
+            vec!["agents.md", "claude.md"],
+            "lowercase instruction files rejected as unsupported_artifact"
+        );
+        for d in &observation.diagnostics {
+            assert_eq!(d.kind, "unsupported_artifact");
+        }
+    }
+
+    /// Empty `memory/` dir → zero supported + zero diagnostics (spec I/O
+    /// matrix — empty directory scan is a complete success).
+    #[test]
+    fn enumerate_empty_directory_succeeds_with_zero_artifacts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let adapter = ClaudeCodeAdapter;
+        let observation = adapter.enumerate_artifacts(tmp.path()).expect("enumerate ok");
+        assert!(observation.supported.is_empty());
+        assert!(observation.diagnostics.is_empty());
+    }
+
+    /// Enumeration of a missing root → `RootUnresolvable`.
+    #[test]
+    fn enumerate_fails_for_missing_root() {
+        let bogus = Path::new("/this/does/not/exist/tessera-2-2-claude-enum");
+        let adapter = ClaudeCodeAdapter;
+        assert!(matches!(
+            adapter.enumerate_artifacts(bogus),
+            Err(EnumerateError::RootUnresolvable)
+        ));
+    }
+
+    /// `MEMORY.md` as a directory (not a file) is a terminal failure for that
+    /// in-matrix artifact — a supported memory cannot disappear from a
+    /// successful generation.
+    #[test]
+    fn enumerate_recognized_index_as_dir_fails_loudly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("MEMORY.md")).expect("mkdir MEMORY.md");
+        let adapter = ClaudeCodeAdapter;
+        assert!(matches!(
+            adapter.enumerate_artifacts(root),
+            Err(EnumerateError::AllowlistedArtifactUnresolvable)
+        ));
+    }
+
+    /// A symlinked `*.md` whose realpath escapes the canonical root is
+    /// skipped (AD-4 / spec Block If — symlink escape). Mirrors the Codex
+    /// boundary discipline.
+    #[cfg(unix)]
+    #[test]
+    fn enumerate_skips_symlink_escape() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("memory");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::fs::write(root.join("MEMORY.md"), "# memory\n").expect("write memory");
+        std::fs::write(outside.join("secret.md"), "secret").expect("write secret");
+        std::os::unix::fs::symlink(outside.join("secret.md"), root.join("topic-leak.md"))
+            .expect("symlink");
+
+        let adapter = ClaudeCodeAdapter;
+        let observation = adapter.enumerate_artifacts(&root).expect("enumerate ok");
+        let rels: Vec<&str> = observation
+            .supported
+            .iter()
+            .map(|a| a.file.relative_path.as_str())
+            .collect();
+        assert_eq!(rels, vec!["MEMORY.md"], "escaping symlink skipped");
+    }
+
+    /// Parser version is `claude-markdown/v1` — the single source of truth
+    /// for the persisted parser version tag.
+    #[test]
+    fn adapter_declares_claude_markdown_v1_parser_version() {
+        let adapter = ClaudeCodeAdapter;
+        assert_eq!(adapter.parser_version(), "claude-markdown/v1");
+        assert_eq!(ClaudeCodeAdapter::PARSER_VERSION, "claude-markdown/v1");
     }
 }

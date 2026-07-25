@@ -1,0 +1,5 @@
+{
+  "_note": "Rejecter fixture: non-*.md direct child of memory/. Must surface as an unsupported_artifact diagnostic, never indexed.",
+  "kind": "session",
+  "data": []
+}

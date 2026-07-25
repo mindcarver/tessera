@@ -691,62 +691,96 @@ fn confirm_claude_code_candidate_does_not_mutate_source_files_nfr1() {
     }
 }
 
-/// Story 2.1 AC — confirming a Claude Code source, then triggering a scan,
-/// yields a structured `ScanError::ProviderNotScannable` (Claude parsing is
-/// 2.2). The Codex parser is never applied to Claude files; the Source's
-/// health stays `unknown` (a Claude Source is legitimately unscannable in
-/// 2.1, not degraded).
+/// Story 2.2 AC — confirming a Claude Code source, then triggering a scan,
+/// produces canonical records with `provider="claude_code"` and
+/// `parser_version="claude-markdown/v1"`; the generation activates and the
+/// records are returnable by the query service. Replaces the 2.1
+/// `ProviderNotScannable`-pinned test (the guard is gone; Claude is
+/// scannable).
 #[test]
-fn scan_claude_code_source_returns_provider_not_scannable_without_health_change() {
-    use tessera_lib::domain::scan::ScanError;
+fn scan_claude_code_source_activates_generation_with_claude_markdown_v1() {
     use tessera_lib::domain::source::HealthState;
     use tessera_lib::index::scan_store::ScanStore;
 
     let tmp = tempdir().expect("tempdir");
     let memory = make_claude_memory(tmp.path(), "proj");
     fs::write(memory.join("MEMORY.md"), "# memory\n\nbody").expect("write memory");
+    fs::write(memory.join("topic.md"), "# topic\n\ntopic body").expect("write topic");
 
     let conn = fresh_db();
     let registry = SourceRegistry::new(&conn);
-    let source =
-        application::confirm_source(&registry, &claude_candidate_for(&memory, "proj"))
-            .expect("confirm claude");
+    let source = application::confirm_source(&registry, &claude_candidate_for(&memory, "proj"))
+        .expect("confirm claude");
 
-    let err = application::scan_source(&registry, &conn, &source.source_id)
-        .expect_err("claude scan must not proceed in 2.1");
+    let outcome = application::scan_source(&registry, &conn, &source.source_id)
+        .expect("claude scan succeeds");
+    assert_eq!(outcome.source_id, source.source_id);
+    assert!(outcome.records_indexed > 0, "claude records indexed");
     assert!(
-        matches!(err, ScanError::ProviderNotScannable),
-        "expected ProviderNotScannable, got {err:?}"
+        outcome.generation.0.starts_with("gen_"),
+        "generation activated: {:?}",
+        outcome.generation
     );
 
-    // Health must remain `unknown` — the guard fires before any
-    // health-write path.
+    // Health is `healthy` after a successful scan.
     let row = registry.get(&source.source_id).expect("db ok").expect("row");
-    assert_eq!(row.health_state, HealthState::Unknown);
+    assert_eq!(row.health_state, HealthState::Healthy);
 
-    // No scan_runs row was created either — the guard fires before begin_run.
+    // The persisted records carry the Claude provider + parser tag. There
+    // must be NO codex-tagged rows for this source.
     let source_rowid = ScanStore::source_rowid(&source.source_id).expect("rowid");
-    let run_count: i64 = conn
+    let claude_rows: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM scan_runs WHERE source_id = ?1",
+            "SELECT COUNT(*) FROM memory_records \
+             WHERE source_id = ?1 AND provider = 'claude_code' \
+             AND parser_version = 'claude-markdown/v1'",
+            rusqlite::params![source_rowid],
+            |row| row.get(0),
+        )
+        .expect("count claude rows");
+    assert_eq!(
+        claude_rows,
+        outcome.records_indexed as i64,
+        "all indexed rows are claude_code + claude-markdown/v1"
+    );
+    let codex_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_records \
+             WHERE source_id = ?1 AND parser_version = 'codex-markdown/v1'",
             rusqlite::params![source_rowid],
             |row| row.get(0),
         )
         .unwrap_or(0);
-    assert_eq!(run_count, 0, "no run row was created for the guarded scan");
+    assert_eq!(codex_rows, 0, "no codex-tagged rows for a claude source");
+
+    // The topic file got the `topic_memory` role and MEMORY.md got `memory`.
+    let memory_row: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_records \
+             WHERE source_id = ?1 AND provider_memory_type = 'memory'",
+            rusqlite::params![source_rowid],
+            |row| row.get(0),
+        )
+        .expect("count memory rows");
+    let topic_row: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_records \
+             WHERE source_id = ?1 AND provider_memory_type = 'topic_memory'",
+            rusqlite::params![source_rowid],
+            |row| row.get(0),
+        )
+        .expect("count topic rows");
+    assert!(memory_row > 0, "MEMORY.md indexed as memory role");
+    assert!(topic_row > 0, "topic *.md indexed as topic_memory role");
 }
 
-/// Story 2.1 review fix — the RESCAN path (`scan_reserved_source`) marks the
-/// reserved run row with the dedicated `error_code='provider_not_scannable'`
-/// vocabulary value, NOT the `internal` catch-all. This is the persisted
-/// surface of the spec AC "every surface … shows the provider-aware safe
-/// message — never a generic `internal` code": the SSE terminal event and
-/// inventory `latest_error` are both derived from this persisted code, so a
-/// wrong value here propagates everywhere.
+/// Story 2.2 AC — the RESCAN path (`scan_reserved_source`) activates a Claude
+/// generation and marks the run `succeeded` (NOT failed with a removed
+/// `provider_not_scannable` code). Replaces the 2.1 rescan test that pinned
+/// the now-deleted placeholder error code.
 #[test]
-fn rescan_claude_code_source_persists_provider_not_scannable_error_code() {
-    use tessera_lib::domain::scan::{Generation, ScanError};
-    use tessera_lib::domain::source::HealthState;
+fn rescan_claude_code_source_activates_generation_via_reserved_path() {
+    use tessera_lib::domain::scan::{Generation, ScanRunState};
     use tessera_lib::index::scan_store::ScanStore;
 
     let tmp = tempdir().expect("tempdir");
@@ -755,25 +789,20 @@ fn rescan_claude_code_source_persists_provider_not_scannable_error_code() {
 
     let conn = fresh_db();
     let registry = SourceRegistry::new(&conn);
-    let source =
-        application::confirm_source(&registry, &claude_candidate_for(&memory, "proj"))
-            .expect("confirm claude");
+    let source = application::confirm_source(&registry, &claude_candidate_for(&memory, "proj"))
+        .expect("confirm claude");
 
     // Mirror what the rescan HTTP handler does: begin_run BEFORE dispatch so
-    // the run row exists, then drive the reserved scan path that the worker
-    // thread uses. The guard inside `scan_reserved_source` marks the row
-    // failed with the error_code under test.
+    // the run row exists, then drive the reserved scan path the worker thread
+    // uses.
     let source_rowid = ScanStore::source_rowid(&source.source_id).expect("rowid");
     let store = ScanStore::new(&conn);
     let (scan_id, fencing_token, _placeholder_generation) = store
         .begin_run(source_rowid, "pending")
         .expect("begin_run for reserved claude scan");
-    // `Generation::from_rowid` is `pub(crate)`, so build the same opaque
-    // handle via the public tuple constructor. The production path always
-    // uses `from_rowid`; this mirrors its `gen_<rowid>` shape exactly.
     let generation = Generation(format!("gen_{scan_id}"));
 
-    let err = application::scan_reserved_source(
+    let outcome = application::scan_reserved_source(
         &registry,
         &conn,
         &source.source_id,
@@ -781,30 +810,49 @@ fn rescan_claude_code_source_persists_provider_not_scannable_error_code() {
         fencing_token,
         generation,
     )
-    .expect_err("reserved claude scan must fail");
-    assert!(matches!(err, ScanError::ProviderNotScannable));
+    .expect("reserved claude scan succeeds");
+    assert!(outcome.records_indexed > 0);
 
-    // The persisted `error_code` is the dedicated vocabulary value — NOT
-    // `internal`. This is the load-bearing assertion for "every surface
-    // shows the provider-aware message": inventory `latest_error` is derived
-    // from this value via `safe_error_reason`, and a wrong code here would
-    // make the inventory read "Tessera could not complete the last rescan."
-    let persisted_code: String = conn
+    // The persisted run row is `succeeded` — NOT `failed` with any error
+    // code (the 2.1 `provider_not_scannable` vocabulary is removed).
+    let (state, error_code): (String, Option<String>) = conn
         .query_row(
-            "SELECT error_code FROM scan_runs WHERE id = ?1",
+            "SELECT state, error_code FROM scan_runs WHERE id = ?1",
             rusqlite::params![scan_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("scan_runs row readable");
-    assert_eq!(
-        persisted_code, "provider_not_scannable",
-        "rescan must persist provider_not_scannable, NOT internal"
+    assert_eq!(state, ScanRunState::Succeeded.as_str());
+    assert!(
+        error_code.is_none(),
+        "succeeded run has no error_code, got: {error_code:?}"
     );
+}
 
-    // Health must remain `unknown` — a Claude Source being unscannable in
-    // 2.1 is expected, not degraded.
-    let row = registry.get(&source.source_id).expect("db ok").expect("row");
-    assert_eq!(row.health_state, HealthState::Unknown);
+/// Story 2.2 AC — scanning a Claude source does NOT mutate any source file
+/// (NFR-1 zero-write). Snapshots the tree before scan and asserts zero drift.
+#[test]
+fn scan_claude_code_source_does_not_mutate_source_files_nfr1() {
+    let tmp = tempdir().expect("tempdir");
+    let memory = make_claude_memory(tmp.path(), "proj");
+    fs::write(memory.join("MEMORY.md"), "# memory\n\nbody").expect("write memory");
+    fs::write(memory.join("topic.md"), "# topic\n\nbody").expect("write topic");
+
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_source(&registry, &claude_candidate_for(&memory, "proj"))
+        .expect("confirm claude");
+
+    let before = snapshot_tree(&memory);
+    let _ = application::scan_source(&registry, &conn, &source.source_id).expect("scan ok");
+    let after = snapshot_tree(&memory);
+    assert_eq!(before.len(), after.len(), "same file count");
+    for (b, a) in before.iter().zip(after.iter()) {
+        assert_eq!(b.0, a.0, "path");
+        assert_eq!(b.1, a.1, "mtime unchanged (NFR-1)");
+        assert_eq!(b.2, a.2, "size unchanged (NFR-1)");
+        assert_eq!(b.3, a.3, "content unchanged (NFR-1)");
+    }
 }
 
 /// Story 2.1 pass-2 review fix — disable-by-`source_id` must work for a
