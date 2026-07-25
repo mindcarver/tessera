@@ -453,6 +453,31 @@ impl<'a> ScanStore<'a> {
         Ok(changed == 1)
     }
 
+    /// True iff at least one run for `source_rowid` is in a non-terminal state
+    /// (`queued`/`running`/`staging`/`committing`). Used by the reconcile
+    /// reservation path ([`crate::application::reserve_run`]) to enforce the
+    /// AD-5/16/28/32 "single fenced owner per source" invariant: when an
+    /// in-flight run exists, a new reservation returns `AlreadyRunning` instead
+    /// of allocating a second owner. This is the chokepoint both the HTTP
+    /// rescan path and the watcher reconcile path pass through, so a runaway
+    /// owner (e.g. a long-running rescan) blocks new reconciles for the same
+    /// source until it finishes — exactly the single-owner contract.
+    pub fn has_in_flight_run(&self, source_rowid: i64) -> rusqlite::Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM scan_runs
+             WHERE source_id = ?1 AND state IN (?2, ?3, ?4, ?5)",
+            params![
+                source_rowid,
+                ScanRunState::Queued.as_str(),
+                ScanRunState::Running.as_str(),
+                ScanRunState::Staging.as_str(),
+                ScanRunState::Committing.as_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Cancel this exact reserved run. Job cancellation must never target a
     /// later rescan for the same Source, even if a stale UI action arrives.
     pub fn cancel_run(&self, scan_id: i64, source_rowid: i64) -> rusqlite::Result<bool> {

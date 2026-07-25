@@ -11,20 +11,32 @@
 //!   Source metadata only: it does NOT read chat/transcript/body content
 //!   (NFR-5), does NOT persist, does NOT canonicalize, and does NOT allocate
 //!   `source_id` (AD-4 — those land in Story 1.3).
-//! - Stories 1.4–1.6 append `enumerate` / `search` / `watch` /
-//!   `stable_native_ids` to this same trait as their slices land. The trait is
-//!   grown incrementally; it is intentionally NOT given speculative method
-//!   stubs for un-shipped slices (Phase 0 doc, "trait 增量生长").
+//! - Stories 1.4–1.6 append `enumerate` / `search` / `stable_native_ids` to
+//!   this same trait as their slices land. The trait is grown incrementally; it
+//!   is intentionally NOT given speculative method stubs for un-shipped slices
+//!   (Phase 0 doc, "trait 增量生长").
 //!
 //! Locked names (from the architecture spine):
 //! - `discover` — produces Candidate Source metadata; never reads chat body.
 //! - `enumerate` — full canonical enumeration of an already-confirmed Source.
 //! - `search` — search-only / search-assisted provider queries.
-//! - `watch` — produce debounced dirty hints (AD-8: watchers are hints only).
 //! - `stable_native_ids` — declare whether the provider emits stable native
 //!   unit ids; falls back to file-level unit when unstable (AD-30).
 //! - `coverage_level` — declare `full | search_only | existence_only |
 //!   unsupported`; partial results never become complete index truth (AD-18).
+//!
+//! ## Watching lives in `application::reconcile`, NOT on this trait
+//!
+//! The architecture spine once listed `watch` ("produce debounced dirty hints"
+//! — AD-8) as a future trait method. Story 4.1 deliberately places watching in
+//! [`application::reconcile`](crate::application::reconcile) instead, keyed off
+//! the confirmed Source's canonical root path. Every provider Tessera supports
+//! today (Codex, Claude Code) is filesystem-root-based, so a `ProviderAdapter::
+//! watch` method would couple every future adapter to a filesystem model it
+//! may not have. Root-path-based watching at the application layer is
+//! adapter-agnostic and matches how `begin_run` / `run_pipeline` already key
+//! off `source_id`. Do NOT re-add a `watch` method to this trait without
+//! re-deciding that placement (see spec-4-1-watcher-reconcile Design Notes).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -322,8 +334,11 @@ impl std::error::Error for EnumerateError {}
 ///
 /// Story 1.2 ships the *discovery slice* only: `provider_id` (Phase 0),
 /// `coverage_level`, and `discover`. The remaining architecture-spine methods
-/// (`enumerate`, `search`, `watch`, `stable_native_ids`) are appended in
-/// Stories 1.4–1.6 as their slices land — see the module doc.
+/// (`enumerate`, `search`, `stable_native_ids`) are appended in Stories
+/// 1.4–1.6 as their slices land — see the module doc. The spine's `watch`
+/// slice is intentionally NOT on this trait: watching is root-path-based and
+/// lives in [`application::reconcile`](crate::application::reconcile) (Story
+/// 4.1 — see the module doc).
 ///
 /// `discover` is infallible by design (Design Notes): it returns `Vec`, not
 /// `Result`. Discovery only calls `Path::exists()` (itself infallible — a stat

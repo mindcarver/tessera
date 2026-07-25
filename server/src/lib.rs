@@ -49,6 +49,13 @@ use rusqlite::Connection;
 /// this state to every connection thread (tiny_http is one-thread-per-
 /// connection), so handlers see the same `Mutex<Connection>` the Tauri-managed
 /// state previously provided.
+///
+/// Story 4.1 adds the optional reconcile supervisor handle. The supervisor
+/// itself borrows the shared `Arc<IndexState>`, so it is installed AFTER the
+/// `Arc` is constructed (via [`boot_with_reconcile`] / [`install_reconcile`])
+/// and stored under a `Mutex<Option<…>>` so its lifetime is bound to the state.
+/// Dropping the `Arc<IndexState>` drops the supervisor, whose `Drop` stops the
+/// watcher threads cleanly.
 #[derive(Debug)]
 pub struct IndexState {
     pub conn: Mutex<Connection>,
@@ -56,6 +63,12 @@ pub struct IndexState {
     /// fence remains in `scan_runs`.
     pub rescan_jobs: Mutex<HashMap<String, RescanJob>>,
     pub db_path: PathBuf,
+    /// Story 4.1 — watcher/reconcile supervisor. `None` until
+    /// [`install_reconcile`] wires it in (or permanently `None` in tests that
+    /// do not exercise watcher/reconcile). Stored under a `Mutex` so it can be
+    /// installed after the `Arc<IndexState>` exists, since the supervisor
+    /// borrows that `Arc` for its whole lifetime.
+    pub reconcile_supervisor: Mutex<Option<application::ReconcileSupervisor>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -135,5 +148,57 @@ pub fn boot(data_dir: &Path) -> std::io::Result<IndexState> {
         conn: Mutex::new(conn),
         rescan_jobs: Mutex::new(HashMap::new()),
         db_path,
+        // Story 4.1 — the supervisor is installed AFTER the `Arc<IndexState>`
+        // exists (the supervisor borrows the Arc for its whole lifetime). It
+        // stays `None` until [`install_reconcile`] / [`boot_with_reconcile`]
+        // wires it in.
+        reconcile_supervisor: Mutex::new(None),
     })
+}
+
+/// Boot the index AND start the reconcile supervisor (Story 4.1). This is the
+/// production entry point: `boot()` opens the DB and runs recovery; this wraps
+/// the state in `Arc`, starts the supervisor (which starts watchers for every
+/// confirmed source and kicks off the periodic reconcile loop), stores the
+/// supervisor handle inside the Arc, and returns the Arc.
+///
+/// Equivalent to `boot()` + `Arc::new()` + [`install_reconcile`]; provided as
+/// one call so the binary does not forget to install the supervisor.
+///
+/// A supervisor start failure is log-and-continue: the index is still usable
+/// (manual rescan still works); periodic reconcile simply does not run. This
+/// mirrors the spec I/O matrix row "Boot with confirmed sources" →
+/// "Log-and-continue if a watcher fails to start".
+pub fn boot_with_reconcile(
+    data_dir: &Path,
+    config: application::ReconcileConfig,
+) -> std::io::Result<std::sync::Arc<IndexState>> {
+    let state = std::sync::Arc::new(boot(data_dir)?);
+    if let Err(e) = install_reconcile(&state, config) {
+        eprintln!("tessera: reconcile supervisor failed to start (continuing without): {e:?}");
+    }
+    Ok(state)
+}
+
+/// Install (or replace) the reconcile supervisor on an existing
+/// `Arc<IndexState>`. The supervisor borrows the Arc for its whole lifetime,
+/// so it must be installed AFTER the Arc is constructed. Stored under the
+/// state's `Mutex<Option<…>>`; dropping the Arc drops the supervisor, whose
+/// `Drop` stops the watcher threads cleanly.
+///
+/// Returns `Err` if the supervisor could not start (e.g. the notify backend
+/// failed to initialize). On `Err`, no supervisor is installed; the caller
+/// may continue without reconcile (manual rescan still works).
+pub fn install_reconcile(
+    state: &std::sync::Arc<IndexState>,
+    config: application::ReconcileConfig,
+) -> std::io::Result<()> {
+    let supervisor = application::ReconcileSupervisor::start(std::sync::Arc::clone(state), config)?;
+    let mut slot = state
+        .reconcile_supervisor
+        .lock()
+        .map_err(|_| std::io::Error::other("reconcile_supervisor mutex poisoned"))?;
+    // Replacing a prior supervisor drops it, stopping its watcher threads.
+    *slot = Some(supervisor);
+    Ok(())
 }
