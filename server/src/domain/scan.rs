@@ -144,6 +144,23 @@ pub struct ScanStatus {
 /// A server-derived Source Inventory row. `complete_record_count` is absent
 /// unless the provider declares full coverage; a missing value is never a
 /// disguised zero.
+///
+/// Story 4.2 adds two additive fields alongside the existing `latest_error`
+/// (kept verbatim, independently derived):
+/// - `cause: Option<HealthCause>` — the structured cause persisted on the
+///   `source_registry` row (path_missing / permission_denied /
+///   format_unsupported / scan_failed). `None` means healthy/never-probed.
+/// - `stale: bool` — derived at read time as
+///   `(health_state in {degraded, error}) AND active_generation IS NOT NULL`.
+///   Means "an older successful generation is still serving results while the
+///   source currently fails to refresh it". A degraded source with NO active
+///   generation is `unavailable`, not stale (already modeled by
+///   `SourceQueryStatusKind::Unavailable`).
+///
+/// `cause` and `latest_error` are INDEPENDENT fields answering different
+/// questions (see spec-4-2 Design Notes): `latest_error` = "what happened to
+/// the most recent run" (kept derivation from `scan_runs.error_code`); `cause`
+/// = "why is the source's health degraded" (persisted on the source row).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceInventory {
     pub source_id: SourceId,
@@ -156,6 +173,13 @@ pub struct SourceInventory {
     pub last_successful_scan: Option<i64>,
     pub complete_record_count: Option<u64>,
     pub latest_error: Option<String>,
+    /// Story 4.2 — structured cause persisted on the source row. Surfaced
+    /// only here (the inventory endpoint is the health surface), not on the
+    /// bare-Source wire. `None` for a healthy or never-probed source.
+    pub cause: Option<crate::domain::source::HealthCause>,
+    /// Story 4.2 — derived at read time:
+    /// `(health in {degraded, error}) AND active_generation IS NOT NULL`.
+    pub stale: bool,
 }
 
 /// Application-layer scan error. Each variant maps onto a stable IPC error

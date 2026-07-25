@@ -3,7 +3,7 @@ use rusqlite::{params, Connection};
 use tessera_lib::application;
 use tessera_lib::domain::scan::ScanRunState;
 use tessera_lib::domain::query::SearchRequest;
-use tessera_lib::domain::source::{HealthState, SourceId};
+use tessera_lib::domain::source::{HealthCause, HealthState, SourceId};
 use tessera_lib::index::scan_store::ScanStore;
 use tessera_lib::index::{migrations, SourceRegistry};
 
@@ -56,7 +56,11 @@ fn health_updates_do_not_change_confirmation() {
     conn.execute("INSERT INTO source_registry (provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project) VALUES ('codex', 'agent_memory', 'confirmed', 'unknown', 'full', '/safe/root', 'one', NULL)", []).expect("source");
     let registry = SourceRegistry::new(&conn);
     let source = registry
-        .set_health(&SourceId("src_1".into()), HealthState::Degraded)
+        .set_health_and_cause(
+            &SourceId("src_1".into()),
+            HealthState::Degraded,
+            HealthCause::None,
+        )
         .expect("health update")
         .expect("source");
     assert_eq!(
@@ -173,7 +177,18 @@ fn root_validation_failure_has_a_safe_inventory_reason_without_erasing_success()
     let item = application::list_inventory(&registry, &conn).expect("inventory").remove(0);
     assert_eq!(item.health_state, HealthState::Degraded);
     assert_eq!(item.complete_record_count, Some(1));
+    // Story 4.2 — `latest_error` is INDEPENDENT of `cause` and keeps its
+    // existing derivation (the Degraded fallback). This is one of the pinned
+    // strings the spec calls out at inventory.rs:176; the cause field below
+    // is additive.
     assert_eq!(item.latest_error.as_deref(), Some("Tessera could not access this source."));
+    // Story 4.2 — root-deleted classifies as `path_missing` (ErrorKind::NotFound
+    // at canonicalize). The active generation is still queryable, so stale=true.
+    assert_eq!(item.cause, Some(HealthCause::PathMissing));
+    assert!(item.stale, "degraded source with an active generation is stale");
+    // last_success_at is still derived (not duplicated on the source row) and
+    // survives the failure.
+    assert!(item.last_successful_scan.is_some(), "last_success_at survives the failure");
 }
 
 /// Story 2.5 AC — the inventory lists every confirmed source regardless of
@@ -287,6 +302,20 @@ fn inventory_one_source_down_does_not_affect_others() {
         Some("Tessera could not read this source."),
         "failed latest run surfaces its safe reason",
     );
+    // Story 4.2 — a row with `health_state='error'` from a hand-written
+    // fixture has no persisted health_cause (column is NULL for pre-4.2 rows
+    // or this fixture). The cause reads back as None (no cause classified).
+    // Source 1 has NO active generation (only source 2 has one), so even
+    // though it is degraded/error, it is `unavailable`, NOT `stale`.
+    assert_eq!(
+        codex.cause,
+        None,
+        "no cause classified for a hand-written error row with no persisted health_cause",
+    );
+    assert!(
+        !codex.stale,
+        "error source with NO active generation is unavailable, not stale",
+    );
 
     // Source 2: healthy, its own count + last-successful-scan intact —
     // unaffected by source 1's failure (per-source isolation at the inventory
@@ -309,5 +338,296 @@ fn inventory_one_source_down_does_not_affect_others() {
     assert!(
         claude.latest_error.is_none(),
         "healthy source carries no latest_error",
+    );
+    // Story 4.2 — a healthy source reports cause=null, stale=false.
+    assert_eq!(claude.cause, None, "healthy source has no cause");
+    assert!(!claude.stale, "healthy source is not stale");
+}
+
+// ===========================================================================
+// Story 4.2 — structured health-cause taxonomy + stale marker
+// ===========================================================================
+//
+// The following tests pin the AC at the inventory projection:
+// - per-category cause classification (path_missing / permission_denied /
+//   format_unsupported / scan_failed) — driven through the real scan path so
+//   the cause is classified at the I/O boundary and persisted on the source
+//   row, then surfaced via `list_inventory`.
+// - the stale-vs-unavailable distinction: a degraded source WITH an active
+//   generation is stale; a degraded source with NO active generation is
+//   unavailable (stale=false).
+// - the recovered-source-clears-cause invariant: a successful rescan after a
+//   failure writes `(Healthy, None)` and `stale=false`.
+
+/// Helper: set up a confirmed + successfully-scanned Codex source with one
+/// record, returning the connection, the tempdir (keeping the root alive), and
+/// the source's id. The active generation is established before the caller
+/// induces a failure, so a subsequent failure must leave it stale-but-
+/// queryable. Callers construct their own `SourceRegistry` view over the
+/// returned connection.
+fn confirmed_scanned_source_with_active_generation(
+) -> (Connection, tempfile::TempDir, SourceId) {
+    let temp = tempfile::tempdir().expect("source root");
+    let root = temp.path().join("memories");
+    std::fs::create_dir(&root).expect("root");
+    std::fs::write(root.join("MEMORY.md"), "# memory\nbody").expect("fixture");
+    let mut conn = Connection::open_in_memory().expect("in-memory db");
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .expect("foreign keys");
+    migrations::apply(&mut conn).expect("migrations");
+    let source = {
+        let registry = SourceRegistry::new(&conn);
+        let source = application::confirm_source(
+            &registry,
+            &tessera_lib::domain::CandidateSource {
+                provider: "codex".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                basis: tessera_lib::domain::DiscoveryBasis::CodexHomeEnv,
+                coverage_level: tessera_lib::domain::CoverageLevel::Full,
+                native_project: None,
+            },
+        )
+        .expect("confirm");
+        application::scan_source(&registry, &conn, &source.source_id).expect("initial success");
+        source.source_id
+    };
+    (conn, temp, source)
+}
+
+/// AC: a confirmed source whose root is deleted surfaces
+/// `cause=path_missing`, `stale=true`, and `last_success_at` survives.
+#[test]
+fn inventory_surfaces_path_missing_cause_when_root_deleted() {
+    let (conn, temp, source_id) = confirmed_scanned_source_with_active_generation();
+    let root = temp.path().join("memories");
+    let registry = SourceRegistry::new(&conn);
+    std::fs::remove_dir_all(&root).expect("remove root");
+    assert!(matches!(
+        application::scan_source(&registry, &conn, &source_id),
+        Err(tessera_lib::domain::scan::ScanError::RootInvalid)
+    ));
+    let item = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .remove(0);
+    assert_eq!(item.health_state, HealthState::Degraded);
+    assert_eq!(item.cause, Some(HealthCause::PathMissing));
+    assert!(item.stale, "degraded + active generation = stale");
+    assert!(
+        item.last_successful_scan.is_some(),
+        "last_success_at survives the root-deleted failure (NFR-9)"
+    );
+    assert_eq!(item.complete_record_count, Some(1));
+}
+
+/// AC: a confirmed source whose root permission is revoked surfaces
+/// `cause=permission_denied` (distinct from `path_missing`), `stale=true`.
+/// The canonicalize site classifies PermissionDenied → permission_denied via
+/// `io::Error::kind()`.
+#[cfg(unix)]
+#[test]
+fn inventory_surfaces_permission_denied_cause_distinct_from_path_missing() {
+    let (conn, temp, source_id) = confirmed_scanned_source_with_active_generation();
+    let root = temp.path().join("memories");
+    let registry = SourceRegistry::new(&conn);
+    // Revoke read + execute on the root so read_dir fails with
+    // PermissionDenied. (canonicalize and is_dir may still succeed on macOS
+    // for the owner — the failure surfaces at the adapter's read_dir site,
+    // which classifies as DirPermissionDenied → EnumerationFailed →
+    // permission_denied.)
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000))
+        .expect("revoke permissions");
+    let scan_result = application::scan_source(&registry, &conn, &source_id);
+    // Restore permissions so the tempdir cleanup can remove the directory.
+    let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755));
+    // The scan must fail (the precise variant depends on where the OS first
+    // surfaces the permission error — canonicalize on some kernels, read_dir
+    // on others). What matters for the AC is that the cause is classified
+    // `permission_denied`, NOT `path_missing`.
+    assert!(
+        scan_result.is_err(),
+        "permission-revoked root must fail the scan (got {scan_result:?})"
+    );
+    let item = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .remove(0);
+    assert_eq!(item.health_state, HealthState::Degraded);
+    assert_eq!(
+        item.cause,
+        Some(HealthCause::PermissionDenied),
+        "PermissionDenied io kind must classify as permission_denied, NOT path_missing"
+    );
+    assert!(item.stale);
+}
+
+/// AC: an allowlisted Markdown source that fails to canonicalize/parse
+/// surfaces `cause=format_unsupported`. Driven through a scripted adapter is
+/// not possible here (the inventory test uses the real codex adapter), so we
+/// pin the projection by writing the cause directly through
+/// `set_health_and_cause` — this is the load-bearing write surface the scan
+/// layer calls, and pinning its projection is what the inventory AC requires.
+#[test]
+fn inventory_surfaces_format_unsupported_cause_for_parse_failure() {
+    let (conn, _temp, source_id) = confirmed_scanned_source_with_active_generation();
+    let registry = SourceRegistry::new(&conn);
+    // Simulate the parse-failed health write (the scan layer would call
+    // set_health_and_cause(id, Degraded, FormatUnsupported) on ParseFailed).
+    registry
+        .set_health_and_cause(&source_id, HealthState::Degraded, HealthCause::FormatUnsupported)
+        .expect("health+cause write");
+    let item = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .remove(0);
+    assert_eq!(item.health_state, HealthState::Degraded);
+    assert_eq!(item.cause, Some(HealthCause::FormatUnsupported));
+    assert!(
+        item.stale,
+        "degraded + active generation = stale (the prior success is still queryable)"
+    );
+}
+
+/// AC: a dirty-after-validation / generic scan failure surfaces
+/// `cause=scan_failed` (the catch-all that is NOT path/perm/format).
+#[test]
+fn inventory_surfaces_scan_failed_cause_for_generic_failure() {
+    let (conn, _temp, source_id) = confirmed_scanned_source_with_active_generation();
+    let registry = SourceRegistry::new(&conn);
+    registry
+        .set_health_and_cause(&source_id, HealthState::Error, HealthCause::ScanFailed)
+        .expect("health+cause write");
+    let item = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .remove(0);
+    assert_eq!(item.health_state, HealthState::Error);
+    assert_eq!(item.cause, Some(HealthCause::ScanFailed));
+    assert!(item.stale);
+}
+
+/// AC: a degraded source with NO active generation is `unavailable`, NOT
+/// `stale`. `stale` requires an active generation (an older success still
+/// serving results).
+#[test]
+fn inventory_degraded_source_without_active_generation_is_unavailable_not_stale() {
+    let conn = db();
+    // Source: degraded, no active generation (first scan failed before any
+    // success). health_cause is persisted to model the failed-first-scan case.
+    conn.execute(
+        "INSERT INTO source_registry (provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project, health_cause)
+         VALUES ('codex', 'agent_memory', 'confirmed', 'degraded', 'full', '/failed', 'fp-failed', NULL, 'path_missing')",
+        [],
+    )
+    .expect("source row");
+    let registry = SourceRegistry::new(&conn);
+    let item = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .remove(0);
+    assert_eq!(item.health_state, HealthState::Degraded);
+    assert_eq!(item.cause, Some(HealthCause::PathMissing));
+    assert!(
+        !item.stale,
+        "degraded with NO active generation is unavailable, not stale"
+    );
+}
+
+/// AC: a successful rescan after a failure clears the cause (writes
+/// `(Healthy, None)`) and `stale=false`. `last_success_at` advances.
+///
+/// On Unix, the failure is induced by revoking the root's read permission
+/// (which leaves the directory's filesystem identity unchanged, so the
+/// subsequent recovery does NOT trip the RootIdentityChanged fence). On
+/// non-Unix we cannot revoke permission portably, so the test is gated to
+/// Unix — the recovered-clears-cause invariant is platform-independent, but
+/// the fixture that induces a recoverable failure without changing identity
+/// relies on chmod.
+#[cfg(unix)]
+#[test]
+fn inventory_successful_rescan_after_failure_clears_cause() {
+    use std::os::unix::fs::PermissionsExt;
+    let (conn, temp, source_id) = confirmed_scanned_source_with_active_generation();
+    let root = temp.path().join("memories");
+    let registry = SourceRegistry::new(&conn);
+    // Induce a recoverable failure: revoke read permission on the root (the
+    // dir identity is unchanged, so recovery will pass the identity fence).
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000))
+        .expect("revoke permissions");
+    assert!(
+        application::scan_source(&registry, &conn, &source_id).is_err(),
+        "permission-revoked root must fail the scan"
+    );
+    let after_failure = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .remove(0);
+    assert_eq!(after_failure.cause, Some(HealthCause::PermissionDenied));
+    assert!(after_failure.stale);
+    let last_success_before = after_failure.last_successful_scan;
+
+    // Recover: restore permission, rescan (succeeds), assert cause is cleared.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+        .expect("restore permissions");
+    application::scan_source(&registry, &conn, &source_id).expect("recovery scan succeeds");
+
+    let after_recovery = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .remove(0);
+    assert_eq!(after_recovery.health_state, HealthState::Healthy);
+    assert_eq!(
+        after_recovery.cause,
+        None,
+        "a recovered source shows no stale cause (cleared on success)"
+    );
+    assert!(!after_recovery.stale);
+    assert!(
+        after_recovery.last_successful_scan >= last_success_before,
+        "last_success_at did not regress"
+    );
+}
+
+/// AC: `cause` and `latest_error` are INDEPENDENT. A cancelled rescan sets
+/// `latest_error="The last rescan was cancelled."` but leaves the previously
+/// persisted cause unchanged (cancel is not a health transition). Pins the
+/// spec's binding constraint that `latest_error`'s derivation stays untouched
+/// (the pinned strings at inventory.rs:43,111,176,287 stay green).
+#[test]
+fn inventory_cancel_does_not_clear_previously_persisted_cause() {
+    let (conn, _temp, source_id) = confirmed_scanned_source_with_active_generation();
+    let registry = SourceRegistry::new(&conn);
+    // Persist a cause as if a prior failure had set it.
+    registry
+        .set_health_and_cause(&source_id, HealthState::Degraded, HealthCause::PathMissing)
+        .expect("persist cause");
+    // Now simulate a cancellation: write a failed run with error_code
+    // 'cancelled'. The cancel path does NOT call set_health_and_cause (cancel
+    // is not a health transition), so the previously-persisted cause survives.
+    let store = ScanStore::new(&conn);
+    let rowid = source_id.to_rowid().expect("rowid");
+    let (_scan_id, _token, _gen) = store.begin_run(rowid, "pending").expect("begin");
+    // Flip the latest run to failed-with-cancelled so latest_error derives the
+    // cancelled string.
+    let latest_run_id: i64 = conn
+        .query_row(
+            "SELECT id FROM scan_runs WHERE source_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![rowid],
+            |row| row.get(0),
+        )
+        .expect("latest run id");
+    store
+        .fail_run(latest_run_id, "cancelled")
+        .expect("fail_run cancelled");
+
+    let item = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .remove(0);
+    // latest_error carries the cancelled string (its derivation is unchanged).
+    assert_eq!(
+        item.latest_error.as_deref(),
+        Some("The last rescan was cancelled."),
+        "latest_error keeps its existing derivation (pinned string)"
+    );
+    // The previously-persisted cause survives the cancel (cancel is not a
+    // health transition — cause is independent of latest_error).
+    assert_eq!(
+        item.cause,
+        Some(HealthCause::PathMissing),
+        "cancel does not clear a previously-persisted cause"
     );
 }

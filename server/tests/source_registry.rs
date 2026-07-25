@@ -115,7 +115,10 @@ fn migration_v1_source_registry_applies_and_sets_current_schema_version() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(v, "5", "schema_version must be 5 after Story 1.8 migration");
+    assert_eq!(
+        v, "6",
+        "schema_version must be 6 after Story 4.2 v5_source_health_cause migration"
+    );
 
     // The table + unique index exist.
     let table: i64 = conn

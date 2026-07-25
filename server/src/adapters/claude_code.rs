@@ -317,13 +317,14 @@ const REJECTED_INSTRUCTION_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
 /// succeeds).
 fn enumerate_claude_artifacts(root: &Path) -> Result<ArtifactEnumeration, EnumerateError> {
     let canonical_root =
-        std::fs::canonicalize(root).map_err(|_| EnumerateError::RootUnresolvable)?;
-    let entries = std::fs::read_dir(&canonical_root).map_err(|_| EnumerateError::Unreadable)?;
+        std::fs::canonicalize(root).map_err(EnumerateError::from_root_io_error)?;
+    let entries =
+        std::fs::read_dir(&canonical_root).map_err(EnumerateError::from_dir_io_error)?;
     let mut supported = Vec::new();
     let mut diagnostics = Vec::new();
 
     for entry in entries {
-        let entry = entry.map_err(|_| EnumerateError::Unreadable)?;
+        let entry = entry.map_err(EnumerateError::from_dir_io_error)?;
         let lexical_path = entry.path();
         let observed = crate::adapters::markdown::safe_relative_path(&canonical_root, &lexical_path);
         let name_utf8 = entry.file_name();
@@ -786,14 +787,16 @@ mod tests {
         assert!(observation.diagnostics.is_empty());
     }
 
-    /// Enumeration of a missing root → `RootUnresolvable`.
+    /// Enumeration of a missing root → `RootMissing` (Story 4.2: the root
+    /// variants are split by io kind, and `NotFound` at canonicalize yields
+    /// `RootMissing`).
     #[test]
     fn enumerate_fails_for_missing_root() {
         let bogus = Path::new("/this/does/not/exist/tessera-2-2-claude-enum");
         let adapter = ClaudeCodeAdapter;
         assert!(matches!(
             adapter.enumerate_artifacts(bogus),
-            Err(EnumerateError::RootUnresolvable)
+            Err(EnumerateError::RootMissing)
         ));
     }
 

@@ -457,7 +457,9 @@ fn migrations_apply_canonical_records_and_rescan_cancellation_schema() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(v, "5");
+    // Story 4.2 bumped the schema_version baseline 5→6 with the
+    // v5_source_health_cause migration (adds source_registry.health_cause).
+    assert_eq!(v, "6");
 
     for table in ["scan_runs", "memory_records", "scan_diagnostics"] {
         let n: i64 = conn
@@ -696,6 +698,33 @@ fn dirty_after_validation_never_activates_and_preserves_previous() {
     let store = ScanStore::new(&conn);
     let active_count = store.count_active_records(source_rowid).expect("count");
     assert_eq!(active_count, 1, "previous generation record still visible");
+
+    // Story 4.2 — DirtyAfterValidation classifies as `scan_failed` (the
+    // catch-all for dirty_after_validation, commit_cas loss, internal). The
+    // active generation is preserved, so the source is stale. Pins the
+    // classifier mapping at the real-driver boundary (the scripted DriftAdapter
+    // exercises the actual commit-time revalidation path). Note: DirtyAfterValidation
+    // maps to HealthState::Error (not Degraded) per `health_for_scan_error` —
+    // it is an internal-shaped failure, not a path/perm/format failure.
+    let inv = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .into_iter()
+        .find(|item| item.source_id == source.source_id)
+        .expect("inventory row");
+    assert_eq!(
+        inv.health_state,
+        tessera_lib::domain::source::HealthState::Error,
+        "DirtyAfterValidation maps to Error (internal-shaped), not Degraded",
+    );
+    assert_eq!(
+        inv.cause,
+        Some(tessera_lib::domain::source::HealthCause::ScanFailed),
+        "DirtyAfterValidation classifies as scan_failed",
+    );
+    assert!(
+        inv.stale,
+        "error-state source with an active generation is stale",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,6 +1071,28 @@ fn scan_with_deleted_root_returns_root_invalid_preserves_active() {
     // Prior active generation is preserved.
     let active = active_generation_str(&conn, source_rowid);
     assert_eq!(active.as_deref(), Some(first.generation.0.as_str()));
+
+    // Story 4.2 — root-deleted classifies as path_missing (ErrorKind::NotFound
+    // at canonicalize). The source row carries the persisted cause, and the
+    // active generation makes the source stale.
+    let inventory = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .into_iter()
+        .find(|item| item.source_id == source.source_id)
+        .expect("inventory row");
+    assert_eq!(
+        inventory.health_state,
+        tessera_lib::domain::source::HealthState::Degraded
+    );
+    assert_eq!(
+        inventory.cause,
+        Some(tessera_lib::domain::source::HealthCause::PathMissing),
+        "deleted root classifies as path_missing",
+    );
+    assert!(
+        inventory.stale,
+        "degraded source with an active generation is stale",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1312,6 +1363,27 @@ fn mid_scan_file_read_failure_preserves_previous_generation() {
         "previous generation records remain fully visible"
     );
 
+    // Story 4.2 — `read_verified`'s mid-scan `ReadFailed` defaults to
+    // `scan_failed` (the spec's Design Note residual-risk #3 documents that
+    // the io kind is intentionally not threaded out of the helper, so the
+    // cause falls into the scan_failed catch-all rather than being refined to
+    // permission_denied). Pinning the chosen default here means a future
+    // refactor cannot silently change it without a test failure.
+    let inv = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .into_iter()
+        .find(|item| item.source_id == source.source_id)
+        .expect("inventory row");
+    assert_eq!(
+        inv.cause,
+        Some(tessera_lib::domain::source::HealthCause::ScanFailed),
+        "read_verified's ReadFailed defaults to scan_failed (io kind not threaded)",
+    );
+    assert!(
+        inv.stale,
+        "degraded source with an active generation is stale",
+    );
+
     // --- Cleanup: restore permissions BEFORE the tempdir drops so removal
     // never fails on a 0o000 file.
     fs::set_permissions(&failing, fs::Permissions::from_mode(0o644)).expect("chmod 644 restore");
@@ -1353,6 +1425,29 @@ fn first_enumeration_failure_marks_run_failed_with_enumeration_code() {
 
     // No generation was activated.
     assert_eq!(active_generation_str(&conn, source_rowid), None);
+
+    // Story 4.2 — FailingEnumAdapter returns EnumerateError::Unreadable, which
+    // classifies as scan_failed (the catch-all for non-path/non-perm io kinds
+    // at a dir site). The source has NO active generation (the first scan
+    // failed before any success), so it is `unavailable`, NOT `stale`.
+    let inventory = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .into_iter()
+        .find(|item| item.source_id == source.source_id)
+        .expect("inventory row");
+    assert_eq!(
+        inventory.health_state,
+        tessera_lib::domain::source::HealthState::Degraded
+    );
+    assert_eq!(
+        inventory.cause,
+        Some(tessera_lib::domain::source::HealthCause::ScanFailed),
+        "FailingEnumAdapter's Unreadable classifies as scan_failed",
+    );
+    assert!(
+        !inventory.stale,
+        "degraded source with NO active generation is unavailable, not stale",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +1918,31 @@ fn malformed_allowlisted_source_fails_safely_without_replacing_active_generation
     let (state, error_code) = latest_run_state(&conn, source_rowid);
     assert_eq!(state, "failed");
     assert_eq!(error_code.as_deref(), Some("parse_failed"));
+
+    // Story 4.2 — the real parse-failure path classifies as `format_unsupported`
+    // and the source is stale (the prior active generation is preserved).
+    // Pins the classifier mapping at the real I/O boundary, not just the
+    // projection (the inventory_surfaces_format_unsupported test only writes
+    // the cause directly and would pass even if the scan layer attached the
+    // wrong cause).
+    let inv = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .into_iter()
+        .find(|item| item.source_id == source.source_id)
+        .expect("inventory row");
+    assert_eq!(
+        inv.health_state,
+        tessera_lib::domain::source::HealthState::Degraded
+    );
+    assert_eq!(
+        inv.cause,
+        Some(tessera_lib::domain::source::HealthCause::FormatUnsupported),
+        "ParseFailed must classify as format_unsupported via the real scan path",
+    );
+    assert!(
+        inv.stale,
+        "degraded source with an active generation is stale",
+    );
 }
 
 #[test]
@@ -2005,6 +2125,30 @@ fn replaced_root_requires_reconfirmation_and_preserves_active_generation() {
         "the prior active generation stays visible"
     );
     assert_eq!(count_rows(&conn, "scan_runs"), 1, "no new run was started");
+
+    // Story 4.2 — RootIdentityChanged (a fingerprint mismatch, no io error in
+    // hand) classifies as `path_missing` (the spec's Boundaries name the base
+    // mapping RootInvalid/RootIdentityChanged → PathMissing, refined by io
+    // kind only when an io error is available). The active generation is
+    // preserved, so the source is stale.
+    let inv = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .into_iter()
+        .find(|item| item.source_id == source.source_id)
+        .expect("inventory row");
+    assert_eq!(
+        inv.health_state,
+        tessera_lib::domain::source::HealthState::Degraded
+    );
+    assert_eq!(
+        inv.cause,
+        Some(tessera_lib::domain::source::HealthCause::PathMissing),
+        "RootIdentityChanged classifies as path_missing (no io hint)",
+    );
+    assert!(
+        inv.stale,
+        "degraded source with an active generation is stale",
+    );
 }
 
 /// A first empty scan is valid, but an empty re-scan must not replace a useful
@@ -2091,5 +2235,76 @@ fn retargeted_file_after_enumeration_fails_before_reading_outside_target() {
             "failed".to_string(),
             Some("dirty_after_validation".to_string())
         )
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Story 4.2 — set_health_and_cause on each failure path; cancel does not
+// clear a previously-persisted cause (cancel is not a health transition).
+// ---------------------------------------------------------------------------
+
+/// Story 4.2 AC — a cancelled rescan does NOT call `set_health_and_cause`, so
+/// a previously-persisted cause survives the cancel. `latest_error` carries
+/// the cancelled string (its derivation is unchanged), but `cause` and `stale`
+/// reflect the prior failure, not the cancel. This pins the spec's binding
+/// constraint that `cause` and `latest_error` are INDEPENDENT.
+#[test]
+fn cancel_does_not_clear_previously_persisted_cause() {
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    fs::write(memories.join("MEMORY.md"), "v1\n").expect("w");
+
+    let conn = fresh_db();
+    let source = confirm(&conn, &memories);
+    let registry = SourceRegistry::new(&conn);
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+
+    // Establish an active generation.
+    application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+
+    // Persist a cause as if a prior failure had set it (e.g. a previous
+    // rescan had failed with path_missing before this cancel).
+    use tessera_lib::domain::source::{HealthCause, HealthState};
+    registry
+        .set_health_and_cause(&source.source_id, HealthState::Degraded, HealthCause::PathMissing)
+        .expect("persist cause");
+
+    // Reserve a run, cancel it immediately, then drive the reserved scan
+    // (which surfaces Cancelled without calling set_health_and_cause).
+    let store = ScanStore::new(&conn);
+    let (scan_id, token, generation) = store.begin_run(source_rowid, "pending").expect("reserve");
+    assert!(store.cancel_run(scan_id, source_rowid).expect("cancel reserved run"));
+    let err = application::scan_reserved_source(
+        &registry,
+        &conn,
+        &source.source_id,
+        scan_id,
+        token,
+        generation,
+    )
+    .expect_err("cancelled run never scans");
+    assert!(matches!(err, ScanError::Cancelled));
+
+    // Inventory: latest_error carries the cancelled string (its derivation is
+    // unchanged — pinned string), but the previously-persisted cause survives
+    // the cancel and stale reflects the Degraded health + active generation.
+    let inventory = application::list_inventory(&registry, &conn)
+        .expect("inventory")
+        .into_iter()
+        .find(|item| item.source_id == source.source_id)
+        .expect("inventory row");
+    assert_eq!(
+        inventory.latest_error.as_deref(),
+        Some("The last rescan was cancelled."),
+        "latest_error keeps its existing derivation (pinned string)"
+    );
+    assert_eq!(
+        inventory.cause,
+        Some(HealthCause::PathMissing),
+        "cancel does not clear a previously-persisted cause",
+    );
+    assert!(
+        inventory.stale,
+        "Degraded + active generation stays stale across a cancel",
     );
 }

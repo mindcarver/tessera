@@ -239,15 +239,21 @@ pub const CODEX_MARKDOWN_PARSER_VERSION: &str = "codex-markdown/v1";
 /// Enumerate allowlisted Codex artifacts and lexical unknowns. A known
 /// artifact that cannot be resolved or inspected is terminal; only a proven
 /// root escape or resolved-role mismatch is silently excluded.
+///
+/// Story 4.2: every canonicalize/read_dir/metadata failure site classifies
+/// the io error by `kind()` via [`EnumerateError::from_root_io_error`] /
+/// [`EnumerateError::from_dir_io_error`] so the four health-cause categories
+/// (path missing / permission denied / format unsupported / scan failed) are
+/// genuinely distinguishable at the I/O boundary, not guessed from strings.
 fn enumerate_codex_artifacts(root: &Path) -> Result<ArtifactEnumeration, EnumerateError> {
-    let canonical_root =
-        std::fs::canonicalize(root).map_err(|_| EnumerateError::RootUnresolvable)?;
-    let entries = std::fs::read_dir(&canonical_root).map_err(|_| EnumerateError::Unreadable)?;
+    let canonical_root = std::fs::canonicalize(root).map_err(EnumerateError::from_root_io_error)?;
+    let entries =
+        std::fs::read_dir(&canonical_root).map_err(EnumerateError::from_dir_io_error)?;
     let mut supported = Vec::new();
     let mut diagnostics = Vec::new();
 
     for entry in entries {
-        let entry = entry.map_err(|_| EnumerateError::Unreadable)?;
+        let entry = entry.map_err(EnumerateError::from_dir_io_error)?;
         let lexical_path = entry.path();
         let name = entry.file_name();
         let name_utf8 = name.to_str();
@@ -263,22 +269,24 @@ fn enumerate_codex_artifacts(root: &Path) -> Result<ArtifactEnumeration, Enumera
             Some(ROLLOUT_SUMMARIES_DIR) => {
                 let real_dir = match std::fs::canonicalize(&lexical_path) {
                     Ok(path) => path,
-                    Err(_) => return Err(EnumerateError::AllowlistedArtifactUnresolvable),
+                    // `rollout_summaries/` is a directory inside the root, so
+                    // its io kind feeds the dir classifier (Story 4.2).
+                    Err(err) => return Err(EnumerateError::from_dir_io_error(err)),
                 };
                 if !real_dir.starts_with(&canonical_root)
                     || real_dir.strip_prefix(&canonical_root).ok()
                         != Some(Path::new(ROLLOUT_SUMMARIES_DIR))
                     || !std::fs::metadata(&real_dir)
-                        .map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?
+                        .map_err(EnumerateError::from_dir_io_error)?
                         .is_dir()
                 {
                     continue;
                 }
                 let rollout_entries = std::fs::read_dir(&real_dir)
-                    .map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?;
+                    .map_err(EnumerateError::from_dir_io_error)?;
                 for rollout_entry in rollout_entries {
-                    let rollout_entry = rollout_entry
-                        .map_err(|_| EnumerateError::AllowlistedArtifactUnresolvable)?;
+                    let rollout_entry =
+                        rollout_entry.map_err(EnumerateError::from_dir_io_error)?;
                     let rollout_path = rollout_entry.path();
                     let observed = safe_relative_path(&canonical_root, &rollout_path);
                     let is_markdown = rollout_entry

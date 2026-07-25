@@ -38,7 +38,7 @@ use crate::domain::scan::{
     SourceInventory,
 };
 use crate::domain::source::{
-    build_fingerprint, HealthState, SourceId, SourceLifecycle, ROOT_KIND_DIR,
+    build_fingerprint, HealthCause, HealthState, SourceId, SourceLifecycle, ROOT_KIND_DIR,
 };
 use crate::domain::{CoverageLevel, ProviderAdapter, SupportedArtifact};
 use crate::index::scan_store::{ScanStore, StagedDiagnostic, StagedRecord};
@@ -117,7 +117,11 @@ pub fn scan_reserved_source(
             // confirm already rejects unknown providers, so reaching this arm
             // means the registry and dispatch tables disagree.
             let _ = ScanStore::new(conn).fail_run(scan_id, ScanError::Internal.error_code());
-            let _ = registry.set_health(source_id, HealthState::Error);
+            let _ = registry.set_health_and_cause(
+                source_id,
+                HealthState::Error,
+                HealthCause::ScanFailed,
+            );
             return Err(ScanError::Internal);
         }
     };
@@ -170,11 +174,18 @@ pub fn scan_source_with(
 
     // Re-validate the root (AD-4/NFR-5/6). A deleted / non-dir root fails the
     // scan BEFORE begin_run (no run row — root validation precedes ownership);
-    // any prior active generation is preserved.
+    // any prior active generation is preserved. Story 4.2: the canonicalize
+    // io error kind is captured here (the only site with the io error in hand
+    // before mapping to `ScanError`) so the cause can be classified by
+    // `io::Error::kind()` — NotFound → path_missing, PermissionDenied →
+    // permission_denied, anything else → scan_failed. This is the single most
+    // important failure mode (root gone), and it writes NO scan_runs row, so
+    // the cause MUST be persisted on the source row to be recoverable.
     let root = match policy::canonicalize_root(Path::new(&source.normalized_root_path)) {
         Ok(root) => root,
-        Err(_) => {
-            let _ = registry.set_health(source_id, HealthState::Degraded);
+        Err(err) => {
+            let cause = health_cause_for_scan_error(&ScanError::RootInvalid, Some(err.kind()));
+            let _ = registry.set_health_and_cause(source_id, HealthState::Degraded, cause);
             return Err(ScanError::RootInvalid);
         }
     };
@@ -187,8 +198,16 @@ pub fn scan_source_with(
     if current_fingerprint != source.fingerprint {
         // The source's path now resolves to a different filesystem object.
         // Require an explicit re-confirmation instead of silently scanning a
-        // replacement directory under the old Source identity.
-        let _ = registry.set_health(source_id, HealthState::Degraded);
+        // replacement directory under the old Source identity. Story 4.2: a
+        // root-identity change is a path-shape failure (the canonicalize
+        // succeeded, but the identity check failed), so the cause falls into
+        // the scan_failed catch-all (it is not a missing/permission/format
+        // failure — the root is there, it just is not the same one).
+        let _ = registry.set_health_and_cause(
+            source_id,
+            HealthState::Degraded,
+            health_cause_for_scan_error(&ScanError::RootIdentityChanged, None),
+        );
         return Err(ScanError::RootIdentityChanged);
     }
 
@@ -216,10 +235,16 @@ pub fn scan_source_with(
         Ok(o) => {
             // Activation already committed; a health-write failure must not
             // falsely report that the previous generation remains active.
-            let _ = registry.set_health(source_id, HealthState::Healthy);
+            // Story 4.2: success clears the cause (writes `(Healthy, None)`)
+            // so a recovered source shows no stale cause.
+            let _ = registry.set_health_and_cause(
+                source_id,
+                HealthState::Healthy,
+                HealthCause::None,
+            );
             Ok(o)
         }
-        Err(e) => {
+        Err((e, cause)) => {
             // A lost CAS is NOT re-marked: the run is no longer owned by this
             // holder (left in `committing` for boot recovery). Every other
             // failure marks the run failed with its error category from the
@@ -229,7 +254,13 @@ pub fn scan_source_with(
             }
             if !matches!(e, ScanError::Cancelled) {
                 let health = health_for_scan_error(&e);
-                let _ = registry.set_health(source_id, health);
+                // Story 4.2: the cause travels from the I/O boundary (set
+                // inside run_pipeline via `cause_from_enumerate_error` /
+                // `health_cause_for_scan_error`). Cancel does not clear a
+                // previously-persisted cause (cancel is not a health
+                // transition), so this arm is skipped on Cancel — the cause
+                // persists from the prior failure.
+                let _ = registry.set_health_and_cause(source_id, health, cause);
             }
             Err(e)
         }
@@ -255,32 +286,85 @@ fn scan_reserved_source_with(
     ensure_not_cancelled(&store, scan_id)?;
     let root = match policy::canonicalize_root(Path::new(&source.normalized_root_path)) {
         Ok(root) => root,
-        Err(_) => return reserved_failure(registry, &store, source_id, scan_id, ScanError::RootInvalid, "root_invalid"),
+        Err(err) => {
+            let cause = health_cause_for_scan_error(&ScanError::RootInvalid, Some(err.kind()));
+            return reserved_failure(
+                registry,
+                &store,
+                source_id,
+                scan_id,
+                ScanError::RootInvalid,
+                "root_invalid",
+                cause,
+            );
+        }
     };
-    if build_fingerprint(&source.provider, ROOT_KIND_DIR, &root.normalized_path, root.identity) != source.fingerprint {
-        return reserved_failure(registry, &store, source_id, scan_id, ScanError::RootIdentityChanged, "root_identity_changed");
+    if build_fingerprint(&source.provider, ROOT_KIND_DIR, &root.normalized_path, root.identity)
+        != source.fingerprint
+    {
+        let cause = health_cause_for_scan_error(&ScanError::RootIdentityChanged, None);
+        return reserved_failure(
+            registry,
+            &store,
+            source_id,
+            scan_id,
+            ScanError::RootIdentityChanged,
+            "root_identity_changed",
+            cause,
+        );
     }
-    match run_pipeline(adapter, &store, &root.normalized_path, &source, source_rowid, scan_id, fencing_token, &generation) {
-        Ok(outcome) => { let _ = registry.set_health(source_id, HealthState::Healthy); Ok(outcome) }
-        Err(error) => {
-            if !matches!(error, ScanError::CommitCasFailed) { let _ = store.fail_run(scan_id, error.error_code()); }
-            if !matches!(error, ScanError::Cancelled) { let _ = registry.set_health(source_id, health_for_scan_error(&error)); }
+    match run_pipeline(
+        adapter,
+        &store,
+        &root.normalized_path,
+        &source,
+        source_rowid,
+        scan_id,
+        fencing_token,
+        &generation,
+    ) {
+        Ok(outcome) => {
+            // Story 4.2: success clears the cause.
+            let _ = registry
+                .set_health_and_cause(source_id, HealthState::Healthy, HealthCause::None);
+            Ok(outcome)
+        }
+        Err((error, cause)) => {
+            if !matches!(error, ScanError::CommitCasFailed) {
+                let _ = store.fail_run(scan_id, error.error_code());
+            }
+            if !matches!(error, ScanError::Cancelled) {
+                let _ = registry
+                    .set_health_and_cause(source_id, health_for_scan_error(&error), cause);
+            }
             Err(error)
         }
     }
 }
 
 fn reserved_failure(
-    registry: &SourceRegistry<'_>, store: &ScanStore<'_>, source_id: &SourceId,
-    scan_id: i64, error: ScanError, error_code: &str,
+    registry: &SourceRegistry<'_>,
+    store: &ScanStore<'_>,
+    source_id: &SourceId,
+    scan_id: i64,
+    error: ScanError,
+    error_code: &str,
+    cause: HealthCause,
 ) -> Result<ScanOutcome, ScanError> {
     let _ = store.fail_run(scan_id, error_code);
-    let _ = registry.set_health(source_id, HealthState::Degraded);
+    let _ = registry.set_health_and_cause(source_id, HealthState::Degraded, cause);
     Err(error)
 }
 
 /// The staged body of the scan, split out so the caller can apply the
 /// fail-run-on-error policy uniformly.
+///
+/// Story 4.2: on error, returns `(ScanError, HealthCause)` so the structured
+/// cause classified at the I/O boundary (by `EnumerateError` variant / io kind)
+/// travels with the error to the caller's `set_health_and_cause` site. The
+/// cause is `HealthCause::None` for `Cancelled` (cancel is not a health
+/// transition — the caller does not call `set_health_and_cause` on cancel
+/// anyway).
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline(
     adapter: &dyn ProviderAdapter,
@@ -291,37 +375,53 @@ fn run_pipeline(
     scan_id: i64,
     fencing_token: i64,
     generation: &Generation,
-) -> Result<ScanOutcome, ScanError> {
+) -> Result<ScanOutcome, (ScanError, HealthCause)> {
+    // Story 4.2 — helper that lifts a plain `Result<_, ScanError>` into this
+    // function's `(ScanError, HealthCause)` error channel by attaching the
+    // default cause for that variant. Used at every site that does not have
+    // an io kind in hand (the io-kind-aware sites — adapter enumeration and
+    // `read_verified` — attach their own cause inline).
+    let lift = |e: ScanError| {
+        let cause = health_cause_for_scan_error(&e, None);
+        (e, cause)
+    };
+
     // running → staging.
-    advance(scan_store, scan_id, ScanRunState::Running)?;
-    ensure_not_cancelled(scan_store, scan_id)?;
+    advance(scan_store, scan_id, ScanRunState::Running).map_err(lift)?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
 
     // --- First enumeration → start manifest → UPDATE real revision ----------
+    // Story 4.2: the adapter's `EnumerateError` is classified by io kind at
+    // the I/O boundary, so the cause travels with the failure into the
+    // pipeline's error channel.
     let start_enumeration = adapter
         .enumerate_artifacts(canonical_root)
-        .map_err(|_| ScanError::EnumerationFailed)?;
-    ensure_not_cancelled(scan_store, scan_id)?;
+        .map_err(|err| (ScanError::EnumerationFailed, cause_from_enumerate_error(&err)))?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
     let active_generation = scan_store
         .active_generation(source_rowid)
-        .map_err(|_| ScanError::Internal)?;
+        .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
     if start_enumeration.supported.is_empty()
         && start_enumeration.diagnostics.is_empty()
         && scan_store
             .active_generation(source_rowid)
-            .map_err(|_| ScanError::Internal)?
+            .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?
             .is_some()
     {
         // An intentionally empty first scan is valid. Replacing an existing
         // active generation with an empty result is not: unreadable roots can
-        // otherwise masquerade as a successful destructive rescan.
-        return Err(ScanError::EmptyScanWithActiveGeneration);
+        // otherwise masquerade as a successful destructive rescan. Story 4.2:
+        // EmptyScanWithActiveGeneration is a scan-failed-shape cause (not
+        // path/perm/format — the enumeration succeeded but returned nothing
+        // over an active generation).
+        return Err((ScanError::EmptyScanWithActiveGeneration, HealthCause::ScanFailed));
     }
     let start_manifest = build_manifest(&start_enumeration.supported);
     let manifest_revision = manifest_revision(&start_manifest);
-    set_manifest_revision(scan_store, scan_id, &manifest_revision)?;
+    set_manifest_revision(scan_store, scan_id, &manifest_revision).map_err(lift)?;
 
-    advance(scan_store, scan_id, ScanRunState::Staging)?;
-    ensure_not_cancelled(scan_store, scan_id)?;
+    advance(scan_store, scan_id, ScanRunState::Staging).map_err(lift)?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
 
     // Per file: read bytes, hash, build a staged file-level record. The
     // enumerated canonical target and metadata are re-validated before and
@@ -331,13 +431,22 @@ fn run_pipeline(
     let mut source_digests = Vec::with_capacity(start_enumeration.supported.len());
     let observed_at = unix_seconds_now();
     for artifact in &start_enumeration.supported {
-        ensure_not_cancelled(scan_store, scan_id)?;
-        let bytes = read_verified(canonical_root, artifact)?;
+        ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
+        let bytes = read_verified(canonical_root, artifact).map_err(|e| {
+            // Story 4.2: read_verified returns ScanError::ReadFailed or
+            // ScanError::DirtyAfterValidation; classify the cause from the
+            // variant (DirtyAfterValidation → ScanFailed, ReadFailed →
+            // ScanFailed — the io kind was erased inside read_verified, but
+            // ReadFailed's cause shape is the catch-all by default).
+            let cause = health_cause_for_scan_error(&e, None);
+            (e, cause)
+        })?;
         let source_revision = fnv1a_hex(&bytes);
         source_digests.push((artifact.clone(), source_revision.clone()));
-        let file_locator =
-            file_uri(&artifact.file.absolute_path).map_err(|_| ScanError::ParseFailed)?;
-        let canonical_units = canonicalize_markdown(&bytes).map_err(|_| ScanError::ParseFailed)?;
+        let file_locator = file_uri(&artifact.file.absolute_path)
+            .map_err(|_| (ScanError::ParseFailed, HealthCause::FormatUnsupported))?;
+        let canonical_units = canonicalize_markdown(&bytes)
+            .map_err(|_| (ScanError::ParseFailed, HealthCause::FormatUnsupported))?;
         for unit in canonical_units {
             let native_locator = format!(
                 "{}#{}",
@@ -379,8 +488,8 @@ fn run_pipeline(
     }
     scan_store
         .stage_records(generation, &staged)
-        .map_err(|_| ScanError::Internal)?;
-    ensure_not_cancelled(scan_store, scan_id)?;
+        .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
     let diagnostics: Vec<StagedDiagnostic> = start_enumeration
         .diagnostics
         .iter()
@@ -392,38 +501,41 @@ fn run_pipeline(
         .collect();
     scan_store
         .stage_diagnostics(generation, &diagnostics)
-        .map_err(|_| ScanError::Internal)?;
+        .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
 
     // Count while the generation is still staging. A database failure here
     // can still mark the run failed; no fallible work remains after CAS.
     let records_indexed = scan_store
         .count_generation_records(source_rowid, generation)
-        .map_err(|_| ScanError::Internal)?;
+        .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
 
     // --- Final manifest re-validation (AD-34/AD-36) ------------------------
     let final_enumeration = adapter
         .enumerate_artifacts(canonical_root)
-        .map_err(|_| ScanError::EnumerationFailed)?;
-    ensure_not_cancelled(scan_store, scan_id)?;
+        .map_err(|err| (ScanError::EnumerationFailed, cause_from_enumerate_error(&err)))?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
     let final_manifest = build_manifest(&final_enumeration.supported);
     if final_manifest != start_manifest || final_enumeration != start_enumeration {
         // Source changed during the scan: this generation is never activated.
-        return Err(ScanError::DirtyAfterValidation);
+        return Err((ScanError::DirtyAfterValidation, HealthCause::ScanFailed));
     }
     // Re-read every staged source after final enumeration and compare the
     // whole-file byte digest. Metadata alone cannot detect a same-size write
     // with restored mtime; `read_verified` proves containment both before and
     // after the read so an escaping retarget is never read.
     for (artifact, expected_digest) in &source_digests {
-        let final_bytes = read_verified(canonical_root, artifact)?;
+        let final_bytes = read_verified(canonical_root, artifact).map_err(|e| {
+            let cause = health_cause_for_scan_error(&e, None);
+            (e, cause)
+        })?;
         if fnv1a_hex(&final_bytes) != *expected_digest {
-            return Err(ScanError::DirtyAfterValidation);
+            return Err((ScanError::DirtyAfterValidation, HealthCause::ScanFailed));
         }
     }
 
     // --- Commit under CAS (AD-32) ------------------------------------------
-    advance(scan_store, scan_id, ScanRunState::Committing)?;
-    ensure_not_cancelled(scan_store, scan_id)?;
+    advance(scan_store, scan_id, ScanRunState::Committing).map_err(lift)?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
 
     // A diagnostic-only observation may explain excluded artifacts but must
     // never replace a usable supported generation. This is deliberately after
@@ -431,14 +543,14 @@ fn run_pipeline(
     if start_enumeration.supported.is_empty() && !start_enumeration.diagnostics.is_empty() {
         let committed = scan_store
             .complete_without_activation(scan_id, fencing_token, generation, source_rowid)
-            .map_err(|_| ScanError::Internal)?;
+            .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
         if !committed {
-            return Err(ScanError::CommitCasFailed);
+            return Err((ScanError::CommitCasFailed, HealthCause::ScanFailed));
         }
         let generation = active_generation.unwrap_or_else(|| generation.clone());
         let records_indexed = scan_store
             .count_active_records(source_rowid)
-            .map_err(|_| ScanError::Internal)?;
+            .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
         return Ok(ScanOutcome {
             source_id: source.source_id.clone(),
             scan_id,
@@ -448,9 +560,9 @@ fn run_pipeline(
     }
     let committed = scan_store
         .commit_cas(scan_id, fencing_token, generation, source_rowid)
-        .map_err(|_| ScanError::Internal)?;
+        .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
     if !committed {
-        return Err(ScanError::CommitCasFailed);
+        return Err((ScanError::CommitCasFailed, HealthCause::ScanFailed));
     }
 
     Ok(ScanOutcome {
@@ -459,6 +571,30 @@ fn run_pipeline(
         generation: generation.clone(),
         records_indexed,
     })
+}
+
+/// Story 4.2 — classify the cause from an adapter's `EnumerateError` variant.
+/// Used at the I/O boundary where the adapter returns its refined error and
+/// the pipeline lifts it into the `(ScanError, HealthCause)` error channel.
+/// The `EnumerateError` variants already encode the io-kind classification
+/// (`RootMissing` / `RootPermissionDenied` / `DirMissing` /
+/// `DirPermissionDenied` / etc.), so this is a pure variant → cause mapping.
+fn cause_from_enumerate_error(err: &crate::domain::ports::provider_adapter::EnumerateError) -> HealthCause {
+    use crate::domain::ports::provider_adapter::EnumerateError::{
+        AllowlistedArtifactUnresolvable, DirMissing, DirPermissionDenied, RootMissing,
+        RootPermissionDenied, RootUnresolvable, Unreadable,
+    };
+    match err {
+        // Path-missing io kind at any root/dir site.
+        RootMissing | DirMissing => HealthCause::PathMissing,
+        // PermissionDenied io kind at any root/dir site.
+        RootPermissionDenied | DirPermissionDenied => HealthCause::PermissionDenied,
+        // Fallback root/dir io kinds + the allowlisted-artifact site. The
+        // artifact site's io kind is not propagated through the variant (an
+        // artifact read failure could be any io kind), so it defaults to the
+        // scan_failed catch-all — distinct from path/perm/format.
+        RootUnresolvable | Unreadable | AllowlistedArtifactUnresolvable => HealthCause::ScanFailed,
+    }
 }
 
 fn ensure_not_cancelled(scan_store: &ScanStore<'_>, scan_id: i64) -> Result<(), ScanError> {
@@ -491,6 +627,72 @@ fn health_for_scan_error(error: &ScanError) -> HealthState {
         }
         ScanError::DirtyAfterValidation | ScanError::CommitCasFailed | ScanError::Internal => {
             HealthState::Error
+        }
+    }
+}
+
+/// Classify a [`ScanError`] into the structured [`HealthCause`] taxonomy
+/// (Story 4.2). Parallel to [`health_for_scan_error`], but answers "why is
+/// the source's health degraded" (persisted on the source row), whereas
+/// `health_for_scan_error` answers "what state should the row show".
+///
+/// The root-validation path (`RootInvalid` / `RootIdentityChanged`) classifies
+/// the canonicalize io error kind directly at the call site (it has the io
+/// error in hand before mapping to `ScanError`) and passes the kind via
+/// `io_kind_hint`. The base mapping for this arm is `PathMissing` (per the
+/// spec's Boundaries: RootInvalid/RootIdentityChanged → PathMissing, refined
+/// by io kind at the call site); only a `PermissionDenied` hint overrides it
+/// to `PermissionDenied`. `RootIdentityChanged`'s call sites pass `None` (it
+/// is a fingerprint mismatch, not an io error), so it surfaces `PathMissing`.
+/// `EnumerationFailed` / `ReadFailed` likewise refine their cause from an io
+/// kind hint when the call site captured one (defaulting to `ScanFailed` for
+/// any non-I/O failure or a missing hint). `ParseFailed` always maps to
+/// `FormatUnsupported`. `DirtyAfterValidation` / `CommitCasFailed` /
+/// `Internal` / `EmptyScanWithActiveGeneration` always map to `ScanFailed`.
+/// `SourceNotFound` / `NotConfirmed` / `Cancelled` map to `None` (cancel is
+/// not a health transition; not-found/not-confirmed are not health probes).
+fn health_cause_for_scan_error(
+    error: &ScanError,
+    io_kind_hint: Option<std::io::ErrorKind>,
+) -> HealthCause {
+    match error {
+        ScanError::RootInvalid | ScanError::RootIdentityChanged => {
+            // The root-validation path passes the canonicalize io error kind
+            // directly (RootInvalid's call sites supply `Some(err.kind())`).
+            // RootIdentityChanged's call sites pass `None` (it is a fingerprint
+            // mismatch, not an io error), so the BASE mapping for this arm is
+            // `PathMissing` — the spec's Boundaries name RootInvalid/
+            // RootIdentityChanged → PathMissing, refined by io kind at the
+            // call site. Only a `PermissionDenied` hint overrides toward a
+            // different category; `NotFound`, `InvalidInput`, `NotADirectory`
+            // (a root that exists but is a regular file — synthesized by
+            // `policy::canonicalize_root` as `ErrorKind::InvalidInput`), and
+            // a missing hint all stay `PathMissing`.
+            match io_kind_hint {
+                Some(std::io::ErrorKind::PermissionDenied) => HealthCause::PermissionDenied,
+                _ => HealthCause::PathMissing,
+            }
+        }
+        ScanError::EnumerationFailed | ScanError::ReadFailed => {
+            // Classified by io kind at the adapter boundary. The application
+            // layer does not always have the io kind in hand here (the
+            // adapter returns an `EnumerateError` whose variant already
+            // encodes the classification, but `ScanError` erases it); default
+            // to `ScanFailed` when no hint is supplied. Specific
+            // permission-denied mid-scan failures pass a hint.
+            match io_kind_hint {
+                Some(std::io::ErrorKind::NotFound) => HealthCause::PathMissing,
+                Some(std::io::ErrorKind::PermissionDenied) => HealthCause::PermissionDenied,
+                _ => HealthCause::ScanFailed,
+            }
+        }
+        ScanError::ParseFailed => HealthCause::FormatUnsupported,
+        ScanError::EmptyScanWithActiveGeneration
+        | ScanError::DirtyAfterValidation
+        | ScanError::CommitCasFailed
+        | ScanError::Internal => HealthCause::ScanFailed,
+        ScanError::SourceNotFound | ScanError::NotConfirmed | ScanError::Cancelled => {
+            HealthCause::None
         }
     }
 }
@@ -615,6 +817,19 @@ pub fn get_scan_status(
 /// Assemble server-owned inventory facts. This deliberately reads the last
 /// success, current active count, and latest failure independently so a failed
 /// rescan cannot erase a previously safe, searchable generation.
+///
+/// Story 4.2 — the inventory row now also carries:
+/// - `cause`: the structured cause persisted on the source row (read from
+///   `source.health_cause`), surfaced as `Some(cause)` for any non-`None`
+///   persisted cause; `None` for a healthy/never-probed source.
+/// - `stale`: derived at read time as
+///   `(health_state in {degraded, error}) AND active_generation IS NOT NULL`.
+///   A degraded source with NO active generation is `unavailable`, not stale.
+///
+/// `latest_error` keeps its existing derivation (from `scan_runs.error_code`
+/// for a Failed latest run, plus the existing Degraded fallback). `cause` and
+/// `latest_error` are INDEPENDENT — keeping `latest_error`'s derivation
+/// untouched preserves the pinned strings at `inventory.rs:43,111,176,287`.
 pub fn list_inventory(
     registry: &SourceRegistry<'_>,
     conn: &Connection,
@@ -638,6 +853,21 @@ pub fn list_inventory(
                 .then(|| store.count_active_records(source_rowid))
                 .transpose()
                 .map_err(|_| ScanError::Internal)?;
+            // Story 4.2 — derive `stale` and surface the persisted `cause`.
+            // `stale` is a pure function of health_state + active_generation:
+            // an older successful generation is still serving results while
+            // the source currently fails to refresh it.
+            let active_generation = store
+                .active_generation(source_rowid)
+                .map_err(|_| ScanError::Internal)?;
+            let stale = matches!(
+                source.health_state,
+                HealthState::Degraded | HealthState::Error
+            ) && active_generation.is_some();
+            // Surface the persisted cause as `Some` for any non-`None` value;
+            // `None` (null on the wire) means healthy/never-probed.
+            let cause = (source.health_cause != HealthCause::None)
+                .then_some(source.health_cause);
             Ok(SourceInventory {
                 source_id: source.source_id,
                 provider: source.provider,
@@ -651,6 +881,8 @@ pub fn list_inventory(
                     .map_err(|_| ScanError::Internal)?,
                 complete_record_count,
                 latest_error: latest_error.or_else(|| (source.health_state == HealthState::Degraded).then(|| "Tessera could not access this source.".to_string())),
+                cause,
+                stale,
             })
         })
         .collect()
@@ -820,5 +1052,166 @@ mod tests {
                 "scan dispatch and confirm registry disagree for provider {provider:?}"
             );
         }
+    }
+
+    // Story 4.2 — `health_cause_for_scan_error` is the load-bearing classifier
+    // for the root-validation path (where the application layer has the io
+    // error in hand) and for the post-begin_run failure paths (where the io
+    // kind is not threaded). These unit tests pin the mapping directly,
+    // independently of the inventory projection tests.
+
+    /// Patch 2 — `RootIdentityChanged` (a fingerprint mismatch, no io error in
+    /// hand) classifies as `PathMissing`, the base mapping for the
+    /// `RootInvalid | RootIdentityChanged` arm per the spec's Boundaries.
+    #[test]
+    fn health_cause_for_scan_error_maps_root_identity_changed_to_path_missing() {
+        assert_eq!(
+            health_cause_for_scan_error(&ScanError::RootIdentityChanged, None),
+            HealthCause::PathMissing,
+        );
+    }
+
+    /// Patch 3 — a root that exists but is a regular file is rejected by
+    /// `policy::canonicalize_root` with `ErrorKind::InvalidInput`
+    /// ("source root is not a directory"). The spec's `PathMissing` definition
+    /// explicitly includes "not-a-dir", so `InvalidInput` must classify as
+    /// `PathMissing`, not the catch-all `ScanFailed`.
+    #[test]
+    fn health_cause_for_scan_error_maps_root_invalid_invalid_input_to_path_missing() {
+        assert_eq!(
+            health_cause_for_scan_error(
+                &ScanError::RootInvalid,
+                Some(std::io::ErrorKind::InvalidInput),
+            ),
+            HealthCause::PathMissing,
+            "InvalidInput (not-a-dir) must classify as path_missing, not scan_failed",
+        );
+    }
+
+    /// Patch 3 — `ErrorKind::NotADirectory` likewise classifies as
+    /// `PathMissing` (a root path component is not a directory).
+    #[test]
+    fn health_cause_for_scan_error_maps_root_invalid_not_a_directory_to_path_missing() {
+        assert_eq!(
+            health_cause_for_scan_error(
+                &ScanError::RootInvalid,
+                Some(std::io::ErrorKind::NotADirectory),
+            ),
+            HealthCause::PathMissing,
+            "NotADirectory must classify as path_missing, not scan_failed",
+        );
+    }
+
+    /// Patch 2/3 — the base mapping for the root-validation arm is
+    /// `PathMissing`; only `PermissionDenied` overrides it. `NotFound`
+    /// (deleted root) stays `PathMissing`.
+    #[test]
+    fn health_cause_for_scan_error_root_arm_path_missing_for_not_found_and_unknown_kinds() {
+        assert_eq!(
+            health_cause_for_scan_error(&ScanError::RootInvalid, Some(std::io::ErrorKind::NotFound)),
+            HealthCause::PathMissing,
+        );
+        // An unknown io kind at the root site also stays PathMissing (the base
+        // mapping), NOT ScanFailed — the root is gone/unusable either way.
+        assert_eq!(
+            health_cause_for_scan_error(&ScanError::RootInvalid, Some(std::io::ErrorKind::Other)),
+            HealthCause::PathMissing,
+        );
+        // PermissionDenied is the one override.
+        assert_eq!(
+            health_cause_for_scan_error(
+                &ScanError::RootInvalid,
+                Some(std::io::ErrorKind::PermissionDenied),
+            ),
+            HealthCause::PermissionDenied,
+        );
+    }
+
+    /// Patch 7 — `ParseFailed` always maps to `FormatUnsupported` regardless
+    /// of any io hint (a parse failure is never a path/perm/scan failure).
+    #[test]
+    fn health_cause_for_scan_error_maps_parse_failed_to_format_unsupported() {
+        assert_eq!(
+            health_cause_for_scan_error(&ScanError::ParseFailed, None),
+            HealthCause::FormatUnsupported,
+        );
+        // An io hint is ignored for ParseFailed (it is a Markdown decode
+        // failure, not an io error).
+        assert_eq!(
+            health_cause_for_scan_error(
+                &ScanError::ParseFailed,
+                Some(std::io::ErrorKind::PermissionDenied),
+            ),
+            HealthCause::FormatUnsupported,
+        );
+    }
+
+    /// Patch 7 — `EmptyScanWithActiveGeneration`, `DirtyAfterValidation`,
+    /// `CommitCasFailed`, and `Internal` all map to `ScanFailed` (the catch-all
+    /// that is NOT path/perm/format).
+    #[test]
+    fn health_cause_for_scan_error_maps_internal_catch_all_variants_to_scan_failed() {
+        for variant in [
+            ScanError::EmptyScanWithActiveGeneration,
+            ScanError::DirtyAfterValidation,
+            ScanError::CommitCasFailed,
+            ScanError::Internal,
+        ] {
+            assert_eq!(
+                health_cause_for_scan_error(&variant, None),
+                HealthCause::ScanFailed,
+                "{variant:?} must classify as scan_failed",
+            );
+        }
+    }
+
+    /// Patch 7 — `SourceNotFound`, `NotConfirmed`, and `Cancelled` all map to
+    /// `None` (cancel is not a health transition; not-found/not-confirmed are
+    /// not health probes).
+    #[test]
+    fn health_cause_for_scan_error_maps_non_health_variants_to_none() {
+        for variant in [
+            ScanError::SourceNotFound,
+            ScanError::NotConfirmed,
+            ScanError::Cancelled,
+        ] {
+            assert_eq!(
+                health_cause_for_scan_error(&variant, None),
+                HealthCause::None,
+                "{variant:?} must classify as None",
+            );
+        }
+    }
+
+    /// Patch 7 — `EnumerationFailed`/`ReadFailed` without an io hint default
+    /// to `ScanFailed`; `NotFound`/`PermissionDenied` hints refine toward the
+    /// matching cause.
+    #[test]
+    fn health_cause_for_scan_error_enumeration_and_read_default_and_refine() {
+        // No hint → default to scan_failed (the io kind was erased by the
+        // ScanError mapping at the adapter boundary).
+        for variant in [ScanError::EnumerationFailed, ScanError::ReadFailed] {
+            assert_eq!(
+                health_cause_for_scan_error(&variant, None),
+                HealthCause::ScanFailed,
+                "{variant:?} with no hint defaults to scan_failed",
+            );
+        }
+        // NotFound hint → path_missing.
+        assert_eq!(
+            health_cause_for_scan_error(
+                &ScanError::EnumerationFailed,
+                Some(std::io::ErrorKind::NotFound),
+            ),
+            HealthCause::PathMissing,
+        );
+        // PermissionDenied hint → permission_denied.
+        assert_eq!(
+            health_cause_for_scan_error(
+                &ScanError::ReadFailed,
+                Some(std::io::ErrorKind::PermissionDenied),
+            ),
+            HealthCause::PermissionDenied,
+        );
     }
 }

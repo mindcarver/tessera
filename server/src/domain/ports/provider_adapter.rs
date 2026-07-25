@@ -300,26 +300,73 @@ impl ArtifactEnumeration {
 /// The spec forbids `Result<_, ()>` on the port (Code Map: "错误类型由实现
 /// 定义，不要返回 `Result<_,()>`"). This concrete error type carries a
 /// category the application layer can map onto its own structured
-/// [`crate::domain::scan::ScanError`]; it deliberately carries NO path/body
-/// detail (AD-13 safe surface).
+/// [`crate::domain::scan::ScanError`] AND a cause-shape for the Story 4.2
+/// [`HealthCause`](crate::domain::source::HealthCause) taxonomy; it
+/// deliberately carries NO path/body detail (AD-13 safe surface).
+///
+/// ## Story 4.2 — cause classification at the I/O boundary
+///
+/// The architecture mandates the cause distinguish at minimum: path missing,
+/// permission denied, format unsupported, scan failed. Cause classification
+/// happens at the I/O boundary by inspecting `io::Error::kind()` (NOT by
+/// string-matching OS messages — AD-13 forbids surfacing them and they are
+/// locale/OS-dependent). The variants below are the refined shape:
+/// - [`EnumerateError::RootMissing`] — `ErrorKind::NotFound` at the root
+///   canonicalize site. Maps to `HealthCause::PathMissing`.
+/// - [`EnumerateError::RootPermissionDenied`] — `ErrorKind::PermissionDenied`
+///   at the root canonicalize site. Maps to `HealthCause::PermissionDenied`.
+/// - [`EnumerateError::RootUnresolvable`] — any other io kind at the root
+///   canonicalize site (fallback for kinds that are neither NotFound nor
+///   PermissionDenied). Maps to `HealthCause::ScanFailed`.
+/// - [`EnumerateError::DirMissing`] / [`EnumerateError::DirPermissionDenied`]
+///   / [`EnumerateError::Unreadable`] — the analogous split for a directory
+///   inside the root (e.g. `rollout_summaries/`).
+/// - [`EnumerateError::AllowlistedArtifactUnresolvable`] — an allowlisted
+///   artifact could not be resolved/inspected/read; terminal rather than a
+///   diagnostic so a supported memory cannot disappear from a successful
+///   generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnumerateError {
-    /// The root itself could not be canonicalized / resolved (missing,
-    /// unreadable, or not a directory). Maps to scan `EnumerationFailed`.
+    /// The root itself could not be canonicalized / resolved because it is
+    /// missing, not a directory, or `ErrorKind::NotFound`. Maps to scan
+    /// `EnumerationFailed` and `HealthCause::PathMissing`.
+    RootMissing,
+    /// The root itself could not be canonicalized / resolved because
+    /// `ErrorKind::PermissionDenied`. Maps to scan `EnumerationFailed` and
+    /// `HealthCause::PermissionDenied`.
+    RootPermissionDenied,
+    /// The root itself could not be canonicalized / resolved for any other io
+    /// kind (fallback — e.g. `ErrorKind::Other`, `ErrorKind::InvalidInput`).
+    /// Maps to scan `EnumerationFailed` and `HealthCause::ScanFailed`.
     RootUnresolvable,
     /// A directory inside the root (e.g. `rollout_summaries/`) could not be
-    /// read during enumeration. Maps to scan `EnumerationFailed`.
+    /// read because `ErrorKind::NotFound`. Maps to scan `EnumerationFailed`
+    /// and `HealthCause::PathMissing`.
+    DirMissing,
+    /// A directory inside the root could not be read because
+    /// `ErrorKind::PermissionDenied`. Maps to scan `EnumerationFailed` and
+    /// `HealthCause::PermissionDenied`.
+    DirPermissionDenied,
+    /// A directory inside the root could not be read for any other io kind
+    /// (fallback). Maps to scan `EnumerationFailed` and
+    /// `HealthCause::ScanFailed`.
     Unreadable,
     /// An observed allowlisted artifact could not be resolved, inspected, or
     /// read. This is terminal rather than a diagnostic so a supported memory
-    /// cannot disappear from a successful generation.
+    /// cannot disappear from a successful generation. Maps to scan
+    /// `EnumerationFailed` (the cause is refined by the caller from the io
+    /// kind at the artifact site; defaulting to `ScanFailed`).
     AllowlistedArtifactUnresolvable,
 }
 
 impl std::fmt::Display for EnumerateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EnumerateError::RootMissing => f.write_str("root missing"),
+            EnumerateError::RootPermissionDenied => f.write_str("root permission denied"),
             EnumerateError::RootUnresolvable => f.write_str("root unresolvable"),
+            EnumerateError::DirMissing => f.write_str("directory missing"),
+            EnumerateError::DirPermissionDenied => f.write_str("directory permission denied"),
             EnumerateError::Unreadable => f.write_str("directory unreadable"),
             EnumerateError::AllowlistedArtifactUnresolvable => {
                 f.write_str("allowlisted artifact unresolvable")
@@ -329,6 +376,54 @@ impl std::fmt::Display for EnumerateError {
 }
 
 impl std::error::Error for EnumerateError {}
+
+impl EnumerateError {
+    /// Classify an io error at the **root** canonicalize/resolution site into
+    /// the refined [`EnumerateError`] variants (Story 4.2). Adapters call this
+    /// at every `std::fs::canonicalize(root)` / `read_dir(root)` /
+    /// `metadata(root)` failure site so the four health-cause categories are
+    /// genuinely distinguishable by `io::Error::kind()` (not string-matched).
+    ///
+    /// Per the spec's `PathMissing` definition ("root gone / not-a-dir /
+    /// `ErrorKind::NotFound`"), three io kinds classify as `RootMissing`:
+    /// - `NotFound` — the root is gone.
+    /// - `InvalidInput` — the policy layer synthesizes this for a root that
+    ///   exists but is a regular file (`policy::canonicalize_root`).
+    /// - `NotADirectory` — a path component is not a directory (surfaced by
+    ///   `read_dir` on Rust 1.85+).
+    ///
+    /// `PermissionDenied` → [`Self::RootPermissionDenied`];
+    /// any other kind → [`Self::RootUnresolvable`] (the fallback).
+    ///
+    /// Takes the error by value so it composes with `Result::map_err`.
+    pub fn from_root_io_error(err: std::io::Error) -> Self {
+        match err.kind() {
+            std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::NotADirectory => EnumerateError::RootMissing,
+            std::io::ErrorKind::PermissionDenied => EnumerateError::RootPermissionDenied,
+            _ => EnumerateError::RootUnresolvable,
+        }
+    }
+
+    /// Classify an io error at a **directory-inside-root** site (e.g.
+    /// `rollout_summaries/`) into the refined [`EnumerateError`] variants
+    /// (Story 4.2). Mirrors [`Self::from_root_io_error`] but yields the
+    /// `Dir*` / `Unreadable` variants. The same three path-missing-shape kinds
+    /// (`NotFound` / `InvalidInput` / `NotADirectory`) classify as `DirMissing`
+    /// — `NotADirectory` in particular surfaces from `read_dir` when a path
+    /// component is a regular file. Takes the error by value so it composes
+    /// with `Result::map_err`.
+    pub fn from_dir_io_error(err: std::io::Error) -> Self {
+        match err.kind() {
+            std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::NotADirectory => EnumerateError::DirMissing,
+            std::io::ErrorKind::PermissionDenied => EnumerateError::DirPermissionDenied,
+            _ => EnumerateError::Unreadable,
+        }
+    }
+}
 
 /// The ProviderAdapter contract.
 ///
@@ -401,5 +496,118 @@ pub trait ProviderAdapter: std::fmt::Debug {
     fn enumerate_artifacts(&self, root: &Path) -> Result<ArtifactEnumeration, EnumerateError> {
         self.enumerate_file_units(root)
             .map(ArtifactEnumeration::from_file_units)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Story 4.2 — `from_root_io_error` classifies an io error at the root
+    /// canonicalize/resolution site by `ErrorKind::kind()` (NOT by
+    /// string-matching OS messages — AD-13 forbids surfacing them and they
+    /// are locale/OS-dependent). The classification is the middle hop of the
+    /// 3-hop kind→variant→cause chain (the cause hop is the application
+    /// layer's `cause_from_enumerate_error`); pinning it here means a future
+    /// refactor cannot silently change a category at the middle hop without
+    /// also failing the application-layer cause tests.
+    ///
+    /// Per the spec's `PathMissing` definition (Patch 3 of the Story 4.2
+    /// review): `NotFound`, `InvalidInput` (the synthesized kind for a
+    /// not-a-directory root), and `NotADirectory` all classify as
+    /// `RootMissing`; `PermissionDenied` classifies as `RootPermissionDenied`;
+    /// every other kind falls through to `RootUnresolvable`.
+    #[test]
+    fn from_root_io_error_classifies_by_io_kind() {
+        // PathMissing-shape kinds.
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            let err = std::io::Error::from(kind);
+            assert_eq!(
+                EnumerateError::from_root_io_error(err),
+                EnumerateError::RootMissing,
+                "ErrorKind::{kind:?} at the root site must classify as RootMissing",
+            );
+        }
+        // PermissionDenied.
+        assert_eq!(
+            EnumerateError::from_root_io_error(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            )),
+            EnumerateError::RootPermissionDenied,
+        );
+        // Catch-all fallback for any other io kind.
+        for kind in [std::io::ErrorKind::AlreadyExists, std::io::ErrorKind::UnexpectedEof] {
+            let err = std::io::Error::from(kind);
+            assert_eq!(
+                EnumerateError::from_root_io_error(err),
+                EnumerateError::RootUnresolvable,
+                "ErrorKind::{kind:?} at the root site must fall through to RootUnresolvable",
+            );
+        }
+    }
+
+    /// Story 4.2 — `from_dir_io_error` mirrors `from_root_io_error` for a
+    /// directory inside the root (e.g. `rollout_summaries/`), yielding the
+    /// `Dir*` / `Unreadable` variants.
+    #[test]
+    fn from_dir_io_error_classifies_by_io_kind() {
+        // PathMissing-shape kinds.
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            let err = std::io::Error::from(kind);
+            assert_eq!(
+                EnumerateError::from_dir_io_error(err),
+                EnumerateError::DirMissing,
+                "ErrorKind::{kind:?} at a dir site must classify as DirMissing",
+            );
+        }
+        // PermissionDenied.
+        assert_eq!(
+            EnumerateError::from_dir_io_error(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            )),
+            EnumerateError::DirPermissionDenied,
+        );
+        // Catch-all fallback for any other io kind.
+        for kind in [std::io::ErrorKind::AlreadyExists, std::io::ErrorKind::UnexpectedEof] {
+            let err = std::io::Error::from(kind);
+            assert_eq!(
+                EnumerateError::from_dir_io_error(err),
+                EnumerateError::Unreadable,
+                "ErrorKind::{kind:?} at a dir site must fall through to Unreadable",
+            );
+        }
+    }
+
+    /// Pin the Display strings for every variant — they are the human-facing
+    /// diagnostic surface and the variant set is fixed by the architecture.
+    #[test]
+    fn enumerate_error_display_strings_are_stable() {
+        assert_eq!(EnumerateError::RootMissing.to_string(), "root missing");
+        assert_eq!(
+            EnumerateError::RootPermissionDenied.to_string(),
+            "root permission denied",
+        );
+        assert_eq!(
+            EnumerateError::RootUnresolvable.to_string(),
+            "root unresolvable",
+        );
+        assert_eq!(EnumerateError::DirMissing.to_string(), "directory missing");
+        assert_eq!(
+            EnumerateError::DirPermissionDenied.to_string(),
+            "directory permission denied",
+        );
+        assert_eq!(EnumerateError::Unreadable.to_string(), "directory unreadable");
+        assert_eq!(
+            EnumerateError::AllowlistedArtifactUnresolvable.to_string(),
+            "allowlisted artifact unresolvable",
+        );
     }
 }
