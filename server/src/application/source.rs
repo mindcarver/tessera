@@ -63,7 +63,12 @@ pub enum SourceError {
 /// boxed unit struct, but the unit structs are zero-sized so the heap cost is
 /// negligible. The boxed trait object preserves the existing confirm/reject
 /// dispatch shape — only the registry width changes.
-pub(crate) fn adapter_for(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
+///
+/// Story 4.1: exposed as `pub` (was `pub(crate)`) so integration tests can
+/// assert that reconcile dispatches through the same registry as scan (no
+/// drift between the two mutation paths). Production code outside this crate
+/// has no business calling this directly; the surface is for tests.
+pub fn adapter_for(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
     match provider {
         // Reference Codex's canonical provider-id constant (single source of
         // truth) so a rename cannot desync the registry from the scan guard,

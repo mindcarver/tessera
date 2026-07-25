@@ -14,8 +14,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
-
 fn main() {
     let port: u16 = std::env::var("TESSERA_PORT")
         .ok()
@@ -24,7 +22,7 @@ fn main() {
     let static_root = std::env::var("TESSERA_STATIC_DIR").unwrap_or_else(|_| "dist".to_string());
     let data_dir = tessera_lib::default_data_dir();
 
-    let state = tessera_lib::boot(&data_dir).unwrap_or_else(|e| {
+    let state = tessera_lib::boot_with_reconcile(&data_dir, tessera_lib::application::ReconcileConfig::default()).unwrap_or_else(|e| {
         eprintln!("tessera: boot failed at {}: {e}", data_dir.display());
         std::process::exit(1);
     });
@@ -42,5 +40,5 @@ fn main() {
         }
     }
 
-    tessera_lib::http::server::serve(&addr, Arc::new(state), std::path::PathBuf::from(static_root));
+    tessera_lib::http::server::serve(&addr, state, std::path::PathBuf::from(static_root));
 }

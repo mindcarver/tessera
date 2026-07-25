@@ -118,6 +118,13 @@ fn wrap_discover(candidates: Vec<CandidateSource>) -> Envelope<Vec<CandidateSour
 /// flips any prior rejected/disabled state back to `confirmed` (wake-up). The
 /// root is re-canonicalized at confirm time (NFR-5/6); a vanished or non-dir
 /// root surfaces as `confirm_failed`.
+///
+/// Story 4.1: after a successful confirm, the file-change watcher is started
+/// for the confirmed source's canonical root (mirroring the boot-time
+/// `boot_start_watches` path). Best-effort: a watcher start failure is logged
+/// and swallowed — the request still succeeds, and the periodic reconcile tick
+/// still covers the source (AD-8 self-heal). This is the lifecycle hook the
+/// spec I/O matrix row "Source confirmed at runtime" requires.
 pub fn confirm_source(
     candidate: &CandidateSource,
     state: &IndexState,
@@ -126,11 +133,22 @@ pub fn confirm_source(
     let registry = SourceRegistry::new(&conn);
     let source = application::confirm_source(&registry, candidate)
         .map_err(|err| map_source_error(err, None))?;
+    drop(conn);
+    // Start the file-change watcher for this newly-confirmed source. The
+    // supervisor slot may be `None` (no supervisor installed, e.g. in tests
+    // that exercise only the scan surface); in that case the periodic tick is
+    // also absent, so the caller is responsible for triggering reconciles.
+    start_watch_best_effort(state, &source.source_id, &source.normalized_root_path);
     Ok(wrap_source(source))
 }
 
 /// `reject_source` — reject a Candidate Source. Persisted so the decision
 /// survives restart. Idempotent by fingerprint.
+///
+/// Story 4.1: stopping the watcher on reject mirrors the confirm→start hook.
+/// A previously-confirmed source being rejected (an unusual but legal
+/// transition) would otherwise keep recording hints that the now-rejected
+/// source cannot reconcile through.
 pub fn reject_source(
     candidate: &CandidateSource,
     state: &IndexState,
@@ -139,11 +157,17 @@ pub fn reject_source(
     let registry = SourceRegistry::new(&conn);
     let source = application::reject_source(&registry, candidate)
         .map_err(|err| map_source_error(err, None))?;
+    drop(conn);
+    stop_watch_best_effort(state, &source.source_id);
     Ok(wrap_source(source))
 }
 
 /// `disable_source` — disable a confirmed Source by `source_id` (AD-4: only
 /// `source_id`, never an arbitrary path). Unknown id → `source_not_found`.
+///
+/// Story 4.1: disabling stops the watcher and clears any pending hint so a
+/// stale hint cannot fire a reconcile for a source that is no longer
+/// confirmed. The watcher can be re-started by re-confirming.
 pub fn disable_source(
     source_id: &SourceId,
     state: &IndexState,
@@ -152,7 +176,46 @@ pub fn disable_source(
     let registry = SourceRegistry::new(&conn);
     let source = application::disable_source(&registry, source_id)
         .map_err(|err| map_source_error(err, Some(&source_id.0)))?;
+    drop(conn);
+    stop_watch_best_effort(state, &source.source_id);
     Ok(wrap_source(source))
+}
+
+/// Best-effort `start_watch` on the reconcile supervisor, if one is installed.
+/// Logs and swallows watcher errors: the HTTP request must not fail because a
+/// notify backend could not register a kernel watch (the periodic reconcile
+/// tick still covers the source — AD-8 self-heal).
+fn start_watch_best_effort(state: &IndexState, source_id: &SourceId, canonical_root: &str) {
+    let Ok(slot) = state.reconcile_supervisor.lock() else {
+        eprintln!(
+            "tessera: reconcile_supervisor mutex poisoned during start_watch for {source_id}"
+        );
+        return;
+    };
+    let Some(supervisor) = slot.as_ref() else {
+        return;
+    };
+    if let Err(e) = supervisor.start_watch(source_id, std::path::Path::new(canonical_root)) {
+        eprintln!(
+            "tessera: watcher start failed for {source_id} ({canonical_root}): {e:?}; periodic reconcile still covers it"
+        );
+    }
+}
+
+/// Best-effort `stop_watch` on the reconcile supervisor, if one is installed.
+/// Idempotent: a source that was never watched is a no-op. Locking errors are
+/// logged — the lifecycle transition itself already succeeded.
+fn stop_watch_best_effort(state: &IndexState, source_id: &SourceId) {
+    let Ok(slot) = state.reconcile_supervisor.lock() else {
+        eprintln!(
+            "tessera: reconcile_supervisor mutex poisoned during stop_watch for {source_id}"
+        );
+        return;
+    };
+    let Some(supervisor) = slot.as_ref() else {
+        return;
+    };
+    supervisor.stop_watch(source_id);
 }
 
 /// `list_sources` — list every registered Source (any lifecycle). Versioned
@@ -242,6 +305,15 @@ pub fn source_inventory(
 /// Start one background rescan. The worker opens its own SQLite connection so
 /// an SSE observation request and cancel request never hold the main request
 /// connection mutex for the duration of filesystem scanning.
+///
+/// The reservation block (validate confirmed + `begin_run`) is shared with the
+/// watcher/reconcile path via [`application::reserve_run`]: there is ONE
+/// canonical reservation path, and both surfaces reuse [`application::
+/// scan_reserved_source`] for the FS work, so HTTP rescan and watcher reconcile
+/// can never diverge into two mutation paths (spec task — "factor
+/// `start_rescan`'s begin_run+spawn into a shared callable"). The HTTP path
+/// layers transport job tracking (the SSE event log) on top; the watcher path
+/// layers hint-queue tracking on top.
 pub fn start_rescan(
     source_id: &SourceId,
     state: &std::sync::Arc<IndexState>,
@@ -252,29 +324,36 @@ pub fn start_rescan(
             return Ok(Envelope { api_version: API_VERSION, payload: existing.events[0].clone() });
         }
     }
-    let (scan_id, fencing_token, generation) = {
-        let conn = lock_conn(state)?;
-        let registry = SourceRegistry::new(&conn);
-        let source = registry
-            .get(source_id)
-            .map_err(|_| ErrorEnvelope::internal_for(Some(&source_id.0), "rescan"))?;
-        match source {
-            None => {
-                return Err(ErrorEnvelope::source_not_found(
-                    Some(&source_id.0),
-                    "rescan",
-                ))
+    // Shared reservation: validate confirmed + begin_run, holding the
+    // synchronous request mutex only for that reservation.
+    let (scan_id, fencing_token, generation) =
+        match application::reserve_run(source_id, state) {
+            Ok(triple) => triple,
+            Err(application::TriggerError::AlreadyRunning { .. }) => {
+                // AD-5/16/28/32 single-owner gate: another rescan/reconcile is
+                // already in-flight for this source. Surface as `bad_request`
+                // so the UI can show "a rescan is already running" and the
+                // client can retry once the in-flight run finishes.
+                return Err(ErrorEnvelope::bad_request("rescan"));
             }
-            Some(source)
-                if source.lifecycle_state != crate::domain::source::SourceLifecycle::Confirmed =>
-            {
-                return Err(ErrorEnvelope::scan_failed_not_confirmed(&source_id.0))
+            Err(application::TriggerError::ReservationFailed(reason)) => {
+                // Map the reservation failure to the same stable codes the
+                // pre-refactor path produced: source_not_found for an unknown
+                // id, scan_failed for a non-confirmed source, internal for a
+                // DB failure. The reason string comes from the shared
+                // reservation code so the two surfaces cannot drift.
+                if reason.contains("not found") || reason.contains("rowid") {
+                    return Err(ErrorEnvelope::source_not_found(
+                        Some(&source_id.0),
+                        "rescan",
+                    ));
+                }
+                if reason.contains("not confirmed") {
+                    return Err(ErrorEnvelope::scan_failed_not_confirmed(&source_id.0));
+                }
+                return Err(ErrorEnvelope::internal_for(Some(&source_id.0), "rescan"));
             }
-            Some(_) => {}
-        }
-        let rowid = ScanStore::source_rowid(source_id).ok_or_else(|| ErrorEnvelope::source_not_found(Some(&source_id.0), "rescan"))?;
-        ScanStore::new(&conn).begin_run(rowid, "pending").map_err(|_| ErrorEnvelope::internal_for(Some(&source_id.0), "rescan"))?
-    };
+        };
     let job_id = format!("job_{scan_id}");
     let queued = RescanEvent { api_version: API_VERSION, job_id: job_id.clone(), source_id: source_id.0.clone(), sequence: 1, state: "queued".to_string(), message: "Rescan queued.".to_string() };
     jobs.insert(source_id.0.clone(), RescanJob { scan_id, job_id, events: vec![queued.clone()], terminal: false });
