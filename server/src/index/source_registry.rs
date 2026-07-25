@@ -27,14 +27,16 @@ use rusqlite::{params, Connection, Row};
 
 use crate::domain::ports::provider_adapter::CoverageLevel;
 use crate::domain::source::{
-    HealthState, Source, SourceFingerprint, SourceId, SourceKind, SourceLifecycle,
+    HealthCause, HealthState, Source, SourceFingerprint, SourceId, SourceKind, SourceLifecycle,
 };
 
 /// SQL columns for the `source_registry` table, in the order the row mapper
 /// reads them. Centralized so every query stays in lock-step with the schema.
+/// Story 4.2 appends `health_cause` (nullable TEXT; `None` reads back as
+/// [`HealthCause::None`]).
 const SELECT_COLS: &str = concat!(
     "id, provider, source_kind, lifecycle_state, health_state, ",
-    "coverage_level, normalized_root_path, fingerprint, native_project"
+    "coverage_level, normalized_root_path, fingerprint, native_project, health_cause"
 );
 
 /// The Source Registry. Borrows the Derived Index connection for its lifetime;
@@ -84,8 +86,8 @@ impl<'a> SourceRegistry<'a> {
         self.conn.execute(
             "INSERT INTO source_registry
                 (provider, source_kind, lifecycle_state, health_state, coverage_level,
-                 normalized_root_path, fingerprint, native_project)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 normalized_root_path, fingerprint, native_project, health_cause)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 fields.provider,
                 fields.source_kind.as_str(),
@@ -95,6 +97,7 @@ impl<'a> SourceRegistry<'a> {
                 fields.normalized_root_path,
                 fields.fingerprint.0,
                 fields.native_project,
+                fields.health_cause.as_str(),
             ],
         )?;
         let rowid = self.conn.last_insert_rowid();
@@ -125,20 +128,30 @@ impl<'a> SourceRegistry<'a> {
         self.get_by_rowid(rowid)
     }
 
-    /// Persist a scan-derived health fact without changing the Source's stable
-    /// identity or lifecycle. Unknown stored values are rejected by
-    /// `row_to_source`; this method never coerces corruption to `unknown`.
-    pub fn set_health(
+    /// Persist a scan-derived health fact AND its structured cause together
+    /// (Story 4.2). This is the single write surface for health: cause and
+    /// state never drift apart because they are written in one UPDATE.
+    /// Success writes `(Healthy, None)`; root-validation failure writes
+    /// `(Degraded, path_missing|permission_denied|scan_failed)`; parse failure
+    /// writes `(Degraded, format_unsupported)`; dirty-after-validation/internal
+    /// write `(Error, scan_failed)`. The cause is cleared (set to `None`) on
+    /// the next successful scan via this same call.
+    ///
+    /// Unknown stored values are rejected by `row_to_source`; this method
+    /// never coerces corruption to `unknown`/`none`. Returns `Ok(Some(updated))`
+    /// on success, `Ok(None)` when the `source_id` does not match any row.
+    pub fn set_health_and_cause(
         &self,
         source_id: &SourceId,
         health: HealthState,
+        cause: HealthCause,
     ) -> rusqlite::Result<Option<Source>> {
         let Some(rowid) = source_id.to_rowid() else {
             return Ok(None);
         };
         if self.conn.execute(
-            "UPDATE source_registry SET health_state = ?1 WHERE id = ?2",
-            params![health.as_str(), rowid],
+            "UPDATE source_registry SET health_state = ?1, health_cause = ?2 WHERE id = ?3",
+            params![health.as_str(), cause.as_str(), rowid],
         )? == 0
         {
             return Ok(None);
@@ -196,6 +209,9 @@ pub struct SourceInsert<'a> {
     pub normalized_root_path: &'a str,
     pub fingerprint: &'a SourceFingerprint,
     pub native_project: Option<&'a str>,
+    /// Story 4.2 — persisted structured health cause. Defaults to `None` for a
+    /// fresh insert (a brand-new row has had no health probe yet).
+    pub health_cause: HealthCause,
 }
 
 /// Map a `rusqlite::Row` into a [`Source`]. Field order MUST match
@@ -205,7 +221,7 @@ pub struct SourceInsert<'a> {
 fn row_to_source(row: &Row<'_>) -> Source {
     // Columns (per SELECT_COLS): id, provider, source_kind, lifecycle_state,
     // health_state, coverage_level, normalized_root_path, fingerprint,
-    // native_project.
+    // native_project, health_cause.
     let rowid: i64 = row.get_unwrap(0);
     let provider: String = row.get_unwrap(1);
     let source_kind: String = row.get_unwrap(2);
@@ -215,6 +231,17 @@ fn row_to_source(row: &Row<'_>) -> Source {
     let normalized_root_path: String = row.get_unwrap(6);
     let fingerprint: String = row.get_unwrap(7);
     let native_project: Option<String> = row.get_unwrap(8);
+    // Story 4.2: health_cause is nullable (the v5 migration adds the column
+    // with no default, so pre-existing rows and any row written before a
+    // `set_health_and_cause` carry NULL). A NULL reads back as `None` so a
+    // never-probed or pre-4.2 source surfaces no stale cause. An unrecognized
+    // non-null value also reads back as `None` — the cause is a display-only
+    // hint, and corruption should not crash the read path.
+    let health_cause_str: Option<String> = row.get_unwrap(9);
+    let health_cause = health_cause_str
+        .as_deref()
+        .and_then(HealthCause::parse_str)
+        .unwrap_or(HealthCause::None);
 
     Source {
         source_id: SourceId::from_rowid(rowid),
@@ -226,6 +253,7 @@ fn row_to_source(row: &Row<'_>) -> Source {
         normalized_root_path,
         native_project,
         fingerprint: SourceFingerprint(fingerprint),
+        health_cause,
     }
 }
 

@@ -24,7 +24,8 @@ use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::codex::CodexAdapter;
 use crate::domain::ports::provider_adapter::{CandidateSource, ProviderAdapter};
 use crate::domain::source::{
-    build_fingerprint, HealthState, Source, SourceId, SourceKind, SourceLifecycle, ROOT_KIND_DIR,
+    build_fingerprint, HealthCause, HealthState, Source, SourceId, SourceKind, SourceLifecycle,
+    ROOT_KIND_DIR,
 };
 use crate::index::source_registry::{SourceInsert, SourceRegistry};
 use crate::policy;
@@ -157,6 +158,7 @@ pub fn confirm_source(
             normalized_root_path: normalized_str,
             fingerprint: &fingerprint,
             native_project: candidate.native_project.as_deref(),
+            health_cause: HealthCause::None,
         })
         .map_err(|_| SourceError::Internal)?;
     Ok(inserted)
@@ -207,6 +209,7 @@ pub fn reject_source(
             normalized_root_path: normalized_str,
             fingerprint: &fingerprint,
             native_project: candidate.native_project.as_deref(),
+            health_cause: HealthCause::None,
         })
         .map_err(|_| SourceError::Internal)?;
     Ok(inserted)

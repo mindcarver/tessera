@@ -64,6 +64,11 @@ pub static MIGRATIONS: &[Migration] = &[
         name: "v4_rescan_cancellation",
         apply: v4_rescan_cancellation,
     },
+    Migration {
+        id: 6,
+        name: "v5_source_health_cause",
+        apply: v5_source_health_cause,
+    },
 ];
 
 /// Ensure the meta tables exist on a fresh DB so [`apply`] can read
@@ -279,6 +284,33 @@ fn v4_rescan_cancellation(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v5 (Story 4.2) — persist the structured health-cause taxonomy on each
+/// Source row.
+///
+/// `source_registry.health_cause TEXT` is nullable: a `NULL` (the default for
+/// pre-existing rows) reads back as [`HealthCause::None`] via the registry's
+/// row mapper. The cause is written at every `set_health_and_cause` site —
+/// success writes `(Healthy, none)`, root-validation failure writes
+/// `(Degraded, path_missing|permission_denied|scan_failed)`, parse failure
+/// writes `(Degraded, format_unsupported)`, dirty-after-validation/internal
+/// write `(Error, scan_failed)`. The cause is cleared (set to `none`) on the
+/// next successful scan.
+///
+/// **Why persist rather than derive.** The single most important Connector
+/// failure — root deleted — fails at root validation BEFORE `begin_run`, so
+/// it writes NO `scan_runs` row. Deriving cause from `scan_runs.error_code`
+/// would therefore return `None` for exactly the failure that matters most.
+/// Persisting `health_cause` on the `source_registry` row — written at the
+/// same `set_health` call sites — makes every failure category recoverable
+/// regardless of whether a run row exists. This pays the debt the 1.3 design
+/// note (`domain/source.rs`) explicitly deferred: "Source rows carry no
+/// timestamps … last-scan / last-error times belong to Story 1.8 / 4.x."
+/// `health_cause` is a categorical code (not a timestamp), so it does not
+/// violate the "no timestamps / no `chrono`" rule.
+fn v5_source_health_cause(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("ALTER TABLE source_registry ADD COLUMN health_cause TEXT;")
+}
+
 /// Apply all pending migrations atomically (AD-29).
 ///
 /// Semantics:
@@ -385,10 +417,11 @@ mod tests {
         // `fresh_db` applies ALL migrations in MIGRATIONS. Phase 0 shipped only
         // v0_meta (id 1) so schema_version was 1; Story 1.3 appended
         // v1_source_registry (id 2) and Story 1.4 appended v2_scan_generations
-        // (id 3), Story 1.5 appended v3_canonical_memory_records (id 4), and
-        // Story 1.8 appended durable rescan cancellation (id 5).
+        // (id 3), Story 1.5 appended v3_canonical_memory_records (id 4),
+        // Story 1.8 appended durable rescan cancellation (id 5), and Story 4.2
+        // appended the structured source health cause (id 6).
         // The `0` value remains reserved as the pre-migration sentinel.
-        assert_eq!(v, "5");
+        assert_eq!(v, "6");
     }
 
     #[test]
@@ -421,8 +454,9 @@ mod tests {
         // Phase 0 shipped 1 migration (v0_meta); Story 1.3 appended
         // v1_source_registry and Story 1.4 appended v2_scan_generations, so the
         // v3_canonical_memory_records and v4_rescan_cancellation make the
-        // idempotent baseline five audit rows.
-        assert_eq!(count, 5, "exactly five audit rows after idempotent re-run");
+        // idempotent baseline five audit rows; Story 4.2's v5_source_health_cause
+        // brings it to six.
+        assert_eq!(count, 6, "exactly six audit rows after idempotent re-run");
     }
 
     /// AD-29 / A-7: migration is atomic. If a later migration fails mid-batch,
@@ -432,15 +466,16 @@ mod tests {
     /// binding "atomic apply" invariant.
     ///
     /// The current shipping migrations are v0_meta (id 1), v1_source_registry
-    /// (id 2), v2_scan_generations (id 3), and v3_canonical_memory_records
-    /// (id 4), and v4_rescan_cancellation (id 5). This test starts from a
-    /// fully-migrated DB and simulates a failing migration id 6.
+    /// (id 2), v2_scan_generations (id 3), v3_canonical_memory_records (id 4),
+    /// v4_rescan_cancellation (id 5), and v5_source_health_cause (id 6). This
+    /// test starts from a fully-migrated DB and simulates a failing migration
+    /// id 7.
     #[test]
     fn failed_migration_batch_rolls_back_atomically() {
         let mut conn = Connection::open_in_memory().expect("open db");
         apply(&mut conn).expect("all shipping migrations apply on first boot");
 
-        // After all shipping migrations: schema_version = 5, five audit rows.
+        // After all shipping migrations: schema_version = 6, six audit rows.
         let pre_version: String = conn
             .query_row(
                 "SELECT value FROM tessera_meta WHERE key = 'schema_version'",
@@ -448,7 +483,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema_version readable");
-        assert_eq!(pre_version, "5");
+        assert_eq!(pre_version, "6");
 
         // Simulate a failing follow-up migration. The failing migration
         // writes a sentinel table first, then errors; the atomic batch must
@@ -490,6 +525,11 @@ mod tests {
             },
             Migration {
                 id: 6,
+                name: "v5_source_health_cause",
+                apply: v5_source_health_cause,
+            },
+            Migration {
+                id: 7,
                 name: "partial_then_fail",
                 apply: partial_then_fail,
             },
@@ -546,7 +586,7 @@ mod tests {
             )
             .expect("schema_version still readable after rollback");
         assert_eq!(
-            post_version, "5",
+            post_version, "6",
             "schema_version must not advance on failure"
         );
 
@@ -558,7 +598,7 @@ mod tests {
             )
             .expect("count");
         assert_eq!(
-            audit_count, 5,
+            audit_count, 6,
             "no audit row recorded for the failed migration"
         );
 

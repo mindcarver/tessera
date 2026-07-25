@@ -527,6 +527,126 @@ fn inventory_returns_both_providers_rows_over_http() {
     );
 }
 
+/// Story 4.2 AC — `GET /api/sources/inventory` surfaces the structured
+/// `cause` and derived `stale` fields on the wire for a degraded source, and
+/// reports `cause=null, stale=false` for a healthy source. The DTO change is
+/// additive (cause + stale); `latest_error` keeps its existing derivation.
+#[test]
+fn inventory_surfaces_cause_and_stale_on_the_wire() {
+    let dir = tempfile::tempdir().expect("scratch app-data dir");
+    let state = tessera_lib::boot(dir.path()).expect("boot");
+    {
+        let conn = state.conn.lock().expect("connection lock");
+        // Source 1: Codex, healthy, indexed — the additive fields read
+        // `cause=null, stale=false`.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project, health_cause)
+             VALUES (1, 'codex', 'agent_memory', 'confirmed', 'healthy', 'full', '/fixture-codex', 'fp-codex', NULL, 'none')",
+            [],
+        )
+        .expect("codex source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision, finished_at)
+             VALUES (1, 'gen_1', 'succeeded', 1, 'gen_1', 'fixture', 100)",
+            [],
+        )
+        .expect("codex scan run");
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')",
+            [],
+        )
+        .expect("codex active gen");
+        conn.execute(
+            "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+             VALUES ('rec_codex', 1, 'gen_1', 'codex', 'section', 'rec_codex', 'file:///codex', 'hash', 'v1', 'title', 'body', NULL, 'memory', 'full', 100, 'revision', 'file:///codex#L1')",
+            [],
+        )
+        .expect("codex record");
+        // Source 2: Claude Code, degraded, stale (active generation exists),
+        // persisted cause = path_missing.
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project, health_cause)
+             VALUES (2, 'claude_code', 'agent_memory', 'confirmed', 'degraded', 'full', '/fixture-claude', 'fp-claude', 'proj-claude', 'path_missing')",
+            [],
+        )
+        .expect("claude source");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision, finished_at)
+             VALUES (2, 'gen_2', 'succeeded', 1, 'gen_2', 'fixture', 200)",
+            [],
+        )
+        .expect("claude scan run");
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:2', 'gen_2')",
+            [],
+        )
+        .expect("claude active gen");
+        conn.execute(
+            "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+             VALUES ('rec_claude', 2, 'gen_2', 'claude_code', 'section', 'rec_claude', 'file:///claude', 'hash', 'v1', 'title', 'body', 'proj-claude', 'memory', 'full', 200, 'revision', 'file:///claude#L1')",
+            [],
+        )
+        .expect("claude record");
+    }
+    let server = bind("127.0.0.1:0");
+    let port = server.server_addr().to_ip().expect("bound addr").port();
+    let state = Arc::new(state);
+    let server_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let _dir = dir;
+        serve_with(server, server_state, PathBuf::from("dist"), Some(port));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let response = raw_http(
+        port,
+        &format!(
+            "GET /api/sources/inventory HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("inventory body");
+    let json: serde_json::Value = serde_json::from_str(body).expect("inventory json");
+    let rows = json["payload"].as_array().expect("inventory array");
+    assert_eq!(rows.len(), 2, "both rows return: {rows:?}");
+
+    let codex = rows
+        .iter()
+        .find(|r| r["provider"].as_str() == Some("codex"))
+        .expect("codex row on the wire");
+    assert_eq!(codex["health_state"].as_str(), Some("healthy"));
+    // Story 4.2 — a healthy source reports cause=null, stale=false.
+    assert!(
+        codex["cause"].is_null(),
+        "healthy source cause is null: {:?}",
+        codex["cause"],
+    );
+    assert_eq!(
+        codex["stale"].as_bool(),
+        Some(false),
+        "healthy source is not stale",
+    );
+
+    let claude = rows
+        .iter()
+        .find(|r| r["provider"].as_str() == Some("claude_code"))
+        .expect("claude row on the wire");
+    assert_eq!(claude["health_state"].as_str(), Some("degraded"));
+    // Story 4.2 — a degraded source with an active generation reports
+    // cause=path_missing (persisted on the source row) and stale=true.
+    assert_eq!(
+        claude["cause"].as_str(),
+        Some("path_missing"),
+        "degraded source surfaces its persisted cause on the wire: {:?}",
+        claude["cause"],
+    );
+    assert_eq!(
+        claude["stale"].as_bool(),
+        Some(true),
+        "degraded source with an active generation is stale",
+    );
+}
+
 #[test]
 fn rescan_is_singleton_and_events_are_versioned_ordered_and_job_scoped() {
     let port = boot_rescan_server();

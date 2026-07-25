@@ -598,8 +598,10 @@ fn enumerate_file_units_indexes_direct_child_md_for_claude_code() {
 
 /// `enumerate_artifacts` returns `Ok` for a Claude `memory/` dir and rejects
 /// `CLAUDE.md`/`AGENTS.md`/non-`*.md` as `unsupported_artifact` diagnostics.
-/// A missing root still returns `Err(RootUnresolvable)` (the only legitimate
-/// failure path now that Claude is scannable).
+/// A missing root returns `Err(RootMissing)` (Story 4.2: the root-resolution
+/// variant is split by io kind, and a `NotFound` at canonicalize yields
+/// `RootMissing` — the only legitimate failure path now that Claude is
+/// scannable).
 #[test]
 fn enumerate_artifacts_rejects_instruction_files_and_non_markdown() {
     let adapter = ClaudeCodeAdapter;
@@ -622,7 +624,10 @@ fn enumerate_artifacts_rejects_instruction_files_and_non_markdown() {
     diag.sort();
     assert_eq!(diag, vec!["AGENTS.md", "data.json"]);
 
-    // A missing root is the one remaining failure path.
+    // A missing root is the one remaining failure path. Story 4.2 splits the
+    // root-resolution variant by io kind: a missing root yields `RootMissing`
+    // (the `NotFound` arm) so the health-cause taxonomy can distinguish
+    // path-missing from permission-denied at the I/O boundary.
     let err = adapter
         .enumerate_artifacts(std::path::Path::new(
             "/this/does/not/exist/tessera-2-2-discover",
@@ -630,7 +635,7 @@ fn enumerate_artifacts_rejects_instruction_files_and_non_markdown() {
         .expect_err("missing root must Err");
     assert!(matches!(
         err,
-        tessera_lib::domain::ports::provider_adapter::EnumerateError::RootUnresolvable
+        tessera_lib::domain::ports::provider_adapter::EnumerateError::RootMissing
     ));
 }
 

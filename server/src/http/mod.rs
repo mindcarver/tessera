@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn wrap_source_carries_versioned_envelope_with_fingerprint_hidden() {
         use crate::domain::source::{
-            HealthState, SourceFingerprint, SourceId, SourceKind, SourceLifecycle,
+            HealthCause, HealthState, SourceFingerprint, SourceId, SourceKind, SourceLifecycle,
         };
         let src = Source {
             source_id: SourceId::from_rowid(7),
@@ -700,6 +700,7 @@ mod tests {
             normalized_root_path: "/x/memories".to_string(),
             native_project: None,
             fingerprint: SourceFingerprint("root-fingerprint/v1|internal".to_string()),
+            health_cause: HealthCause::None,
         };
         let env = wrap_source(src);
         assert_eq!(env.api_version, API_VERSION);
@@ -710,6 +711,8 @@ mod tests {
         // Fingerprint must NOT cross the wire.
         assert!(!json.contains("fingerprint"));
         assert!(!json.contains("root-fingerprint"));
+        // Story 4.2: health_cause is also hidden on the bare-Source wire.
+        assert!(!json.contains("health_cause"));
     }
 
     /// Source round-trips through serde into the same value (payload only —
@@ -719,7 +722,7 @@ mod tests {
     #[test]
     fn source_wire_shape_round_trips() {
         use crate::domain::source::{
-            HealthState, SourceFingerprint, SourceId, SourceKind, SourceLifecycle,
+            HealthCause, HealthState, SourceFingerprint, SourceId, SourceKind, SourceLifecycle,
         };
         let src = Source {
             source_id: SourceId("src_3".to_string()),
@@ -731,6 +734,7 @@ mod tests {
             normalized_root_path: "/y/memories".to_string(),
             native_project: None,
             fingerprint: SourceFingerprint("skipped-on-wire".to_string()),
+            health_cause: HealthCause::None,
         };
         let json = serde_json::to_string(&src).expect("serialize");
         // Stable wire strings — must match the TS client's narrow type.

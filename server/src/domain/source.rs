@@ -8,7 +8,10 @@
 //! - [`SourceLifecycle`] — `confirmed | disabled | rejected`, all persisted.
 //! - [`SourceKind`] — MVP only `agent_memory` (AD-10/A-19).
 //! - [`HealthState`] — column exists in 1.3 but is always `unknown` (AD-7;
-//!   health tracking is 1.8/4.x).
+//!   health tracking is 1.8/4.x). Story 4.2 adds the structured
+//!   [`HealthCause`] taxonomy persisted alongside `health_state` on the
+//!   `source_registry` row, paying the cause debt the 1.3 design note
+//!   deferred to "Story 1.8 / 4.x".
 //! - [`FilesystemIdentity`] — `(device, file_id)` tuple used in fingerprints.
 //! - [`Source`] — the DTO returned to the UI. Fingerprint is hidden on the
 //!   wire (`#[serde(skip)]`) because it is an internal matching key with no
@@ -171,6 +174,86 @@ impl HealthState {
     }
 }
 
+/// Structured cause taxonomy for a Source's degraded/error health state
+/// (Story 4.2 — AD-7/AD-13). Persisted on the `source_registry` row alongside
+/// [`HealthState`] via the v5 migration (`source_registry.health_cause TEXT`,
+/// nullable; `None`/absent reads back as [`HealthCause::None`]).
+///
+/// The four architecture-mandated categories plus `None`:
+/// - [`HealthCause::PathMissing`] — root gone / not-a-dir /
+///   `ErrorKind::NotFound`. The single most important failure mode; it fails
+///   at root validation BEFORE `begin_run`, so it writes NO `scan_runs` row —
+///   persisting the cause on the source row is what makes it recoverable.
+/// - [`HealthCause::PermissionDenied`] — `ErrorKind::PermissionDenied` at any
+///   canonicalize/read_dir/metadata/File::open site.
+/// - [`HealthCause::FormatUnsupported`] — a parse/canonicalize failure on an
+///   allowlisted Markdown artifact.
+/// - [`HealthCause::ScanFailed`] — catch-all: dirty_after_validation,
+///   `commit_cas` loss, generic read errors, internal/SQLite failures.
+/// - [`HealthCause::None`] — healthy, or never probed.
+///
+/// Classification happens at the I/O boundary by inspecting
+/// `io::Error::kind()` (NOT by string-matching OS messages — AD-13 forbids
+/// surfacing them and they are locale/OS-dependent). The persisted value is a
+/// stable categorical code, never a path/body/credential (AD-13 safe surface).
+///
+/// `cause` is INDEPENDENT of `latest_error` on the inventory DTO: `cause`
+/// answers "why is the source's health degraded" (persisted on the source
+/// row); `latest_error` answers "what happened to the most recent run"
+/// (derived from `scan_runs.error_code`). A cancelled rescan sets
+/// `latest_error = "The last rescan was cancelled."` but leaves `cause`
+/// unchanged (cancel is not a health transition).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthCause {
+    /// Healthy, or never probed. The default cause; cleared on the next
+    /// successful scan so a recovered source shows no stale cause.
+    #[default]
+    None,
+    /// The root is gone, not a directory, or `ErrorKind::NotFound` at a
+    /// canonicalize/metadata site.
+    PathMissing,
+    /// `ErrorKind::PermissionDenied` at any I/O site.
+    PermissionDenied,
+    /// An allowlisted Markdown source failed to canonicalize or parse.
+    FormatUnsupported,
+    /// Catch-all: dirty_after_validation, commit_cas loss, generic read
+    /// errors, internal/SQLite failures.
+    ScanFailed,
+}
+
+impl HealthCause {
+    /// Stable wire string for storage (matches the serde rename). `None`
+    /// serializes to `"none"` so the column never carries a null cause for a
+    /// healthy source (the migration makes the column nullable for the
+    /// pre-4.2-default case only).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HealthCause::None => "none",
+            HealthCause::PathMissing => "path_missing",
+            HealthCause::PermissionDenied => "permission_denied",
+            HealthCause::FormatUnsupported => "format_unsupported",
+            HealthCause::ScanFailed => "scan_failed",
+        }
+    }
+
+    /// Parse the stable wire string back. Named `parse_str` (not `from_str`)
+    /// to avoid clashing with the `std::str::FromStr` trait method, matching
+    /// the `HealthState::parse_str` / `SourceKind::parse_str` convention.
+    /// `None` is returned for an unknown value so the registry layer surfaces
+    /// corruption rather than silently coercing it.
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(HealthCause::None),
+            "path_missing" => Some(HealthCause::PathMissing),
+            "permission_denied" => Some(HealthCause::PermissionDenied),
+            "format_unsupported" => Some(HealthCause::FormatUnsupported),
+            "scan_failed" => Some(HealthCause::ScanFailed),
+            _ => None,
+        }
+    }
+}
+
 /// Filesystem identity tuple `(device, file_id)` used in fingerprints when
 /// available (AD-35). On Unix this is `(st_dev, st_ino)`; the field is
 /// `Option` because non-Unix platforms or missing metadata fall back to
@@ -238,6 +321,14 @@ pub struct Source {
     /// never crosses the IPC boundary.
     #[serde(skip)]
     pub fingerprint: SourceFingerprint,
+    /// Persisted structured health cause (Story 4.2). `#[serde(skip)]` so it
+    /// stays in memory but never crosses the IPC boundary on the bare-Source
+    /// wire (`GET /api/sources`) — it is surfaced only via `SourceInventory`
+    /// (`GET /api/sources/inventory`), mirroring how `fingerprint` is hidden.
+    /// Because it is skipped, the wire shape is byte-identical and no
+    /// frontend/TS-mirror change is required.
+    #[serde(skip)]
+    pub health_cause: HealthCause,
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +550,7 @@ mod tests {
             normalized_root_path: "/x/memories".to_string(),
             native_project: None,
             fingerprint: SourceFingerprint("root-fingerprint/v1|secret".to_string()),
+            health_cause: HealthCause::PathMissing,
         };
         let json = serde_json::to_string(&src).expect("serialize");
         assert!(
@@ -469,11 +561,82 @@ mod tests {
             !json.contains("secret"),
             "internal key not leaked; json: {json}"
         );
+        // Story 4.2: health_cause is also hidden on the bare-Source wire — it
+        // is surfaced only via SourceInventory. Asserting here keeps the
+        // hidden-internal-field precedent (mirrors `fingerprint`) green.
+        assert!(
+            !json.contains("health_cause"),
+            "wire shape hides health_cause; json: {json}"
+        );
+        assert!(
+            !json.contains("path_missing"),
+            "internal cause not leaked; json: {json}"
+        );
         assert!(json.contains("\"source_id\":\"src_1\""));
         assert!(json.contains("\"lifecycle_state\":\"confirmed\""));
         assert!(json.contains("\"source_kind\":\"agent_memory\""));
         assert!(json.contains("\"health_state\":\"unknown\""));
         assert!(json.contains("\"coverage_level\":\"full\""));
+    }
+
+    #[test]
+    fn health_cause_round_trips() {
+        for cause in [
+            HealthCause::None,
+            HealthCause::PathMissing,
+            HealthCause::PermissionDenied,
+            HealthCause::FormatUnsupported,
+            HealthCause::ScanFailed,
+        ] {
+            assert_eq!(HealthCause::parse_str(cause.as_str()), Some(cause));
+        }
+        assert_eq!(HealthCause::parse_str("nope"), None);
+        // Default is None (cleared on successful scan / fresh row).
+        assert_eq!(HealthCause::default(), HealthCause::None);
+    }
+
+    #[test]
+    fn health_cause_wire_strings_are_stable() {
+        // Pin the exact snake_case wire strings persisted in
+        // source_registry.health_cause. The 4.2 inventory DTO serializes the
+        // same strings on the wire.
+        assert_eq!(HealthCause::None.as_str(), "none");
+        assert_eq!(HealthCause::PathMissing.as_str(), "path_missing");
+        assert_eq!(HealthCause::PermissionDenied.as_str(), "permission_denied");
+        assert_eq!(HealthCause::FormatUnsupported.as_str(), "format_unsupported");
+        assert_eq!(HealthCause::ScanFailed.as_str(), "scan_failed");
+    }
+
+    /// Story 4.2 review Patch 9 — the persisted column string (written by
+    /// `as_str`) and the wire DTO string (produced by serde's
+    /// `rename_all = "snake_case"`) MUST be the same string for every variant.
+    /// A divergence would silently break round-tripping through `parse_str`:
+    /// the registry writes `as_str`, but the DTO would emit a different
+    /// string, and a future reader deserializing the DTO would not match the
+    /// persisted value. This test pins the equivalence so a rename on either
+    /// side fails loudly.
+    #[test]
+    fn health_cause_serde_matches_as_str_for_every_variant() {
+        for cause in [
+            HealthCause::None,
+            HealthCause::PathMissing,
+            HealthCause::PermissionDenied,
+            HealthCause::FormatUnsupported,
+            HealthCause::ScanFailed,
+        ] {
+            let serde_str = serde_json::to_string(&cause)
+                .expect("serde_json::to_string")
+                .trim_matches('"')
+                .to_string();
+            assert_eq!(
+                serde_str,
+                cause.as_str(),
+                "serde wire string {:?} != as_str {:?} for {:?} — round-trip would break",
+                serde_str,
+                cause.as_str(),
+                cause,
+            );
+        }
     }
 
     #[test]

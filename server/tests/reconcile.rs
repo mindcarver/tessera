@@ -625,6 +625,120 @@ fn reconcile_failure_preserves_previous_generation() {
         "previous generation preserved on reconcile failure"
     );
     assert_eq!(count_active_records(&state, source_rowid), 1);
+
+    // Story 4.2 — the failed reconcile persists cause+stale on the inventory
+    // projection. EmptyScanWithActiveGeneration classifies as `scan_failed`
+    // (not path/perm/format — the enumeration succeeded but returned nothing
+    // over an active generation). The active generation is preserved, so the
+    // source is stale.
+    let inventory = {
+        let conn = state.conn.lock().expect("conn lock");
+        let registry = SourceRegistry::new(&conn);
+        application::list_inventory(&registry, &conn)
+            .expect("inventory")
+            .into_iter()
+            .find(|item| item.source_id == source.source_id)
+            .expect("inventory row for the failed source")
+    };
+    assert_eq!(
+        inventory.health_state,
+        tessera_lib::domain::source::HealthState::Degraded
+    );
+    assert_eq!(
+        inventory.cause,
+        Some(tessera_lib::domain::source::HealthCause::ScanFailed),
+        "EmptyScanWithActiveGeneration classifies as scan_failed",
+    );
+    assert!(
+        inventory.stale,
+        "failed reconcile over an active generation leaves the source stale",
+    );
+}
+
+/// Story 4.2 AC — a subsequent successful reconcile clears both the cause and
+/// the stale marker. After the failure in
+/// [`reconcile_failure_preserves_previous_generation`] persisted
+/// `(Degraded, scan_failed, stale=true)`, restoring the file and re-running
+/// reconcile writes `(Healthy, None, stale=false)`.
+#[test]
+fn successful_reconcile_after_failure_clears_cause_and_stale() {
+    let tmp = tempdir().expect("tempdir");
+    let memories = make_memories(tmp.path());
+    fs::write(memories.join("MEMORY.md"), "mem\n").expect("write");
+
+    let state = fresh_state(tmp.path());
+    let source = confirm_source(&state, &memories);
+    let source_rowid = source.source_id.to_rowid().expect("rowid");
+
+    {
+        let conn = state.conn.lock().expect("conn lock");
+        let registry = SourceRegistry::new(&conn);
+        application::scan_source(&registry, &conn, &source.source_id).expect("first scan");
+    }
+
+    // Induce a failure: remove the file, reconcile (fails with
+    // EmptyScanWithActiveGeneration → scan_failed).
+    std::thread::sleep(Duration::from_millis(50));
+    fs::remove_file(memories.join("MEMORY.md")).expect("remove");
+    application::trigger_reconcile(source.source_id.clone(), &state).expect("trigger");
+    let failed = wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+        let (run_state, _) = latest_run(&state, source_rowid);
+        !matches!(
+            run_state,
+            ScanRunState::Queued
+                | ScanRunState::Running
+                | ScanRunState::Staging
+                | ScanRunState::Committing
+        )
+    });
+    assert!(failed, "first reconcile should have failed");
+    let after_failure = {
+        let conn = state.conn.lock().expect("conn lock");
+        let registry = SourceRegistry::new(&conn);
+        application::list_inventory(&registry, &conn)
+            .expect("inventory")
+            .into_iter()
+            .find(|item| item.source_id == source.source_id)
+            .expect("row")
+    };
+    assert_eq!(
+        after_failure.cause,
+        Some(tessera_lib::domain::source::HealthCause::ScanFailed)
+    );
+    assert!(after_failure.stale);
+
+    // Restore the file and re-run reconcile (succeeds → clears cause+stale).
+    std::thread::sleep(Duration::from_millis(50));
+    fs::write(memories.join("MEMORY.md"), "mem\n").expect("restore");
+    application::trigger_reconcile(source.source_id.clone(), &state).expect("trigger");
+    let recovered = wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+        let (run_state, _) = latest_run(&state, source_rowid);
+        run_state == ScanRunState::Succeeded
+    });
+    assert!(recovered, "second reconcile should have succeeded");
+
+    let after_recovery = {
+        let conn = state.conn.lock().expect("conn lock");
+        let registry = SourceRegistry::new(&conn);
+        application::list_inventory(&registry, &conn)
+            .expect("inventory")
+            .into_iter()
+            .find(|item| item.source_id == source.source_id)
+            .expect("row")
+    };
+    assert_eq!(
+        after_recovery.health_state,
+        tessera_lib::domain::source::HealthState::Healthy
+    );
+    assert_eq!(
+        after_recovery.cause,
+        None,
+        "a successful reconcile clears the previously-persisted cause"
+    );
+    assert!(
+        !after_recovery.stale,
+        "a successful reconcile clears the stale marker"
+    );
 }
 
 // ---------------------------------------------------------------------------
