@@ -45,8 +45,17 @@ export type CoverageLevel =
  * How a Candidate Source was discovered (AD-4). Mirrors Rust `DiscoveryBasis`
  * with `#[serde(rename_all = "snake_case")]`. UI-facing metadata only — not
  * part of source identity.
+ *
+ * Story 2.1 appends the Claude Code variants (`claude_default_home`,
+ * `claude_config_dir_env`, `claude_auto_memory_dir`); the Codex strings are
+ * frozen by the `api_version=1` contract and never renamed.
  */
-export type DiscoveryBasis = "default_home" | "codex_home_env";
+export type DiscoveryBasis =
+  | "default_home"
+  | "codex_home_env"
+  | "claude_default_home"
+  | "claude_config_dir_env"
+  | "claude_auto_memory_dir";
 
 /**
  * Candidate Source metadata produced by discovery (AD-4 / Story 1.2).
@@ -81,6 +90,9 @@ const VALID_COVERAGE_LEVELS: ReadonlySet<string> = new Set([
 const VALID_DISCOVERY_BASES: ReadonlySet<string> = new Set([
   "default_home",
   "codex_home_env",
+  "claude_default_home",
+  "claude_config_dir_env",
+  "claude_auto_memory_dir",
 ]);
 
 /**

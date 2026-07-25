@@ -88,6 +88,14 @@ pub enum CoverageLevel {
 /// can explain how a candidate was found. Not part of source identity —
 /// `source_id` and the canonical root fingerprint land in Story 1.3
 /// (AD-33/AD-35). Serialization renames to stable wire strings.
+///
+/// ## Wire-contract discipline
+///
+/// Existing snake_case wire strings (`default_home`, `codex_home_env`) are
+/// frozen by the `api_version=1` contract; new providers append their own
+/// variants alongside rather than rename existing ones (Story 2.1 adds
+/// `claude_default_home`, `claude_config_dir_env`, and
+/// `claude_auto_memory_dir` for the Claude Code adapter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryBasis {
@@ -98,6 +106,23 @@ pub enum DiscoveryBasis {
     /// (e.g. `CODEX_HOME=/x` → `/x/memories`). When this basis is used, the
     /// default home is intentionally NOT also probed — see Codex adapter.
     CodexHomeEnv,
+    /// Candidate discovered via Claude Code's default home location
+    /// (`$HOME/.claude/projects/<project>/memory/` when `CLAUDE_CONFIG_DIR`
+    /// is not set). Story 2.1 — see Claude Code adapter.
+    ClaudeDefaultHome,
+    /// Candidate discovered via an explicit `CLAUDE_CONFIG_DIR` override
+    /// (absolute paths only; an explicit-but-relative value yields no
+    /// candidate with no silent fallback, mirroring Codex's `CODEX_HOME`
+    /// rule). When this basis is used, the default home is intentionally NOT
+    /// also probed. Story 2.1.
+    ClaudeConfigDirEnv,
+    /// Candidate discovered via the user-scope `autoMemoryDirectory` key in
+    /// `<config_dir>/settings.json` (Story 2.1). The value is an absolute
+    /// path or `~/`-prefixed; `~/` is expanded via `HOME`. Only emitted when
+    /// the resolved path is an existing UTF-8 directory, deduplicated against
+    /// the `projects/*` candidates by canonicalized path. Invalid / missing /
+    /// unparseable values safe-degrade to no candidate.
+    ClaudeAutoMemoryDir,
 }
 
 /// Candidate Source metadata produced by discovery (AD-4 / Story 1.2).

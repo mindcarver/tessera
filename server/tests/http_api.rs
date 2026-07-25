@@ -543,6 +543,203 @@ fn static_path_traversal_is_rejected() {
     );
 }
 
+/// Story 2.1 AC — confirming a Claude Code candidate through the wire contract
+/// reuses the Codex confirm pipeline (provider-neutral). The wire response
+/// carries `provider="claude_code"`, the encoded project key as
+/// `native_project`, Full coverage, and `lifecycle_state="confirmed"` — all
+/// under the same `api_version="1"` envelope, with no Codex-specific framing.
+#[test]
+fn claude_code_candidate_confirms_over_wire_with_native_project() {
+    let source_root = tempfile::tempdir().expect("source root");
+    let memory = source_root.path().join("memory");
+    std::fs::create_dir_all(&memory).expect("claude memory dir");
+    std::fs::write(memory.join("MEMORY.md"), "# memory\nbody").expect("write memory");
+    let port = boot_test_server();
+    let confirm_body = serde_json::json!({
+        "candidate": {
+            "provider": "claude_code",
+            "root_path": memory,
+            "basis": "claude_default_home",
+            "coverage_level": "full",
+            "native_project": "encoded-project-key",
+        }
+    })
+    .to_string();
+    let confirmed = raw_http(
+        port,
+        &format!(
+            "POST /api/sources/confirm HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            confirm_body.len(),
+            confirm_body
+        ),
+    );
+    assert!(confirmed.starts_with("HTTP/1.1 200"), "got:\n{confirmed}");
+    assert!(confirmed.contains("\"api_version\":\"1\""), "got:\n{confirmed}");
+    assert!(confirmed.contains("\"provider\":\"claude_code\""), "got:\n{confirmed}");
+    assert!(
+        confirmed.contains("\"native_project\":\"encoded-project-key\""),
+        "got:\n{confirmed}"
+    );
+    assert!(confirmed.contains("\"lifecycle_state\":\"confirmed\""), "got:\n{confirmed}");
+    assert!(confirmed.contains("\"coverage_level\":\"full\""), "got:\n{confirmed}");
+    assert!(confirmed.contains("\"source_id\":\"src_"), "got:\n{confirmed}");
+    // The encoded key is preserved verbatim — no reverse-mapping to a path.
+    assert!(!confirmed.contains("encoded_project_key"), "got:\n{confirmed}");
+
+    // Re-confirming is idempotent on the wire (same `source_id`).
+    let reconfirmed = raw_http(
+        port,
+        &format!(
+            "POST /api/sources/confirm HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            confirm_body.len(),
+            confirm_body
+        ),
+    );
+    let first_id = confirmed
+        .split("source_id\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or("");
+    let second_id = reconfirmed
+        .split("source_id\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or("");
+    assert_eq!(first_id, second_id, "re-confirm returns the same source_id");
+}
+
+/// Story 2.1 AC — a rescan of a confirmed Claude Code source surfaces the
+/// provider-aware safe message on EVERY surface: the rescan SSE terminal
+/// event, the inventory `latest_error`, AND the persisted
+/// `scan_runs.error_code`. The Codex parser is never applied; the previous
+/// index is unchanged (it never existed for this source). The message text
+/// (not just non-emptiness) is asserted so a regression that reroutes the
+/// outcome to the generic `internal` / "Rescan failed" path fails loudly.
+#[test]
+fn rescan_claude_code_source_returns_safe_scan_failed_on_wire() {
+    let source_root = tempfile::tempdir().expect("source root");
+    let memory = source_root.path().join("memory");
+    std::fs::create_dir_all(&memory).expect("claude memory dir");
+    std::fs::write(memory.join("MEMORY.md"), "# memory\nbody").expect("write memory");
+    let port = boot_test_server();
+    let confirm_body = serde_json::json!({
+        "candidate": {
+            "provider": "claude_code",
+            "root_path": memory,
+            "basis": "claude_default_home",
+            "coverage_level": "full",
+            "native_project": "proj",
+        }
+    })
+    .to_string();
+    let confirmed = raw_http(
+        port,
+        &format!(
+            "POST /api/sources/confirm HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            confirm_body.len(),
+            confirm_body
+        ),
+    );
+    let source_id = confirmed
+        .split("source_id\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("source_id");
+
+    let rescan_body = serde_json::json!({ "source_id": source_id }).to_string();
+    let rescan = raw_http(
+        port,
+        &format!(
+            "POST /api/sources/rescan HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            rescan_body.len(),
+            rescan_body
+        ),
+    );
+    assert!(rescan.starts_with("HTTP/1.1 200"), "got:\n{rescan}");
+    let payload: serde_json::Value = serde_json::from_str(
+        rescan.split("\r\n\r\n").nth(1).expect("rescan body"),
+    )
+    .expect("rescan json");
+    let job_id = payload["payload"]["job_id"].as_str().expect("job id");
+
+    // Drain SSE until the terminal event surfaces the provider-not-scannable
+    // outcome. The Codex parser is never applied, so no Claude body crosses
+    // the wire.
+    //
+    // Story 2.1 pass-2 review fix — the poll budget was 40 × 25 ms (~1 s),
+    // which is tight on a loaded CI runner where the rescan worker thread
+    // may be scheduled later than that. Raise to 200 × 25 ms (~5 s) while
+    // keeping the terminal-event break logic so a fast worker still exits
+    // early.
+    let mut final_state = String::new();
+    let mut final_message = String::new();
+    for _ in 0..200 {
+        let response = raw_http(
+            port,
+            &format!("GET /api/sources/rescan/events?source_id={source_id}&job_id={job_id}&after=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        );
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+        let events: Vec<serde_json::Value> = body
+            .split("\n\n")
+            .filter_map(|block| {
+                block.lines().find_map(|line| line.strip_prefix("data: "))
+            })
+            .filter_map(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .collect();
+        if let Some(terminal) = events.last() {
+            let state = terminal["state"].as_str().unwrap_or("");
+            if matches!(state, "succeeded" | "failed" | "cancelled") {
+                final_state = state.to_string();
+                final_message =
+                    terminal["message"].as_str().unwrap_or("").to_string();
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(final_state, "failed", "claude rescan must fail safely");
+    // Story 2.1 review fix — assert the PROVIDER-AWARE text, not just
+    // non-emptiness. A regression that reroutes this to the generic
+    // "Rescan failed. The previous index is unchanged." path would pass a
+    // !is_empty() check; this assertion catches it.
+    assert!(
+        final_message.contains("not available yet"),
+        "expected provider-aware message, got: {final_message:?}"
+    );
+    assert!(
+        !final_message.contains("previous index is unchanged"),
+        "must NOT fall back to the generic scan-failed message: {final_message:?}"
+    );
+
+    // Surface #2: the inventory `latest_error` must carry the same
+    // provider-aware text — it is derived from `scan_runs.error_code` via
+    // `safe_error_reason`, so this asserts both the persisted error_code is
+    // `provider_not_scannable` (NOT `internal`) and that the inventory shows
+    // the honest expected-2.1 outcome.
+    let inventory = raw_http(
+        port,
+        &format!("GET /api/sources/inventory HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(inventory.starts_with("HTTP/1.1 200"), "got:\n{inventory}");
+    let inventory_json: serde_json::Value = serde_json::from_str(
+        inventory.split("\r\n\r\n").nth(1).expect("inventory body"),
+    )
+    .expect("inventory json");
+    let claude_row = inventory_json["payload"]
+        .as_array()
+        .expect("inventory array")
+        .iter()
+        .find(|row| row["source_id"].as_str() == Some(source_id))
+        .expect("claude source row in inventory");
+    let latest_error = claude_row["latest_error"]
+        .as_str()
+        .expect("latest_error present");
+    assert!(
+        latest_error.contains("not available yet"),
+        "inventory latest_error must carry the provider-aware text, got: {latest_error:?}"
+    );
+}
+
 /// An unknown API route is a structured 404, not an empty socket or an HTML
 /// error page (AD-13 envelope discipline everywhere).
 #[test]
