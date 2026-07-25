@@ -175,3 +175,139 @@ fn root_validation_failure_has_a_safe_inventory_reason_without_erasing_success()
     assert_eq!(item.complete_record_count, Some(1));
     assert_eq!(item.latest_error.as_deref(), Some("Tessera could not access this source."));
 }
+
+/// Story 2.5 AC — the inventory lists every confirmed source regardless of
+/// provider. With one Codex + one Claude Code source confirmed and scanned,
+/// `list_inventory` returns both rows — each carrying its own provider,
+/// coverage, native project, and honest per-source record count. Pins the
+/// multi-provider panorama at the inventory endpoint (the backend has been
+/// multi-provider at the row level since 2.1; this test guards against a
+/// future regression that filters by provider).
+#[test]
+fn inventory_lists_multiple_providers_together() {
+    let conn = db();
+    conn.execute_batch(
+        "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project) VALUES
+         (1, 'codex', 'agent_memory', 'confirmed', 'healthy', 'full', '/codex/root', 'fp-codex', NULL),
+         (2, 'claude_code', 'agent_memory', 'confirmed', 'healthy', 'full', '/claude/root', 'fp-claude', 'proj-claude');
+         INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision, finished_at) VALUES
+         (1, 'gen_1', 'succeeded', 1, 'gen_1', 'fixture', 100),
+         (2, 'gen_2', 'succeeded', 1, 'gen_2', 'fixture', 200);
+         INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1'), ('active_generation:2', 'gen_2');
+         INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator) VALUES
+         ('rec_codex', 1, 'gen_1', 'codex', 'section', 'rec_codex', 'file:///codex', 'hash', 'v1', 'title', 'body', NULL, 'memory', 'full', 1, 'revision', 'file:///codex#L1'),
+         ('rec_claude_a', 2, 'gen_2', 'claude_code', 'section', 'rec_claude_a', 'file:///claude#A', 'hash', 'v1', 'title a', 'body a', 'proj-claude', 'memory', 'full', 2, 'revision', 'file:///claude#L1'),
+         ('rec_claude_b', 2, 'gen_2', 'claude_code', 'section', 'rec_claude_b', 'file:///claude#B', 'hash', 'v1', 'title b', 'body b', 'proj-claude', 'topic_memory', 'full', 3, 'revision', 'file:///claude#L2');",
+    )
+    .expect("fixture rows");
+    let registry = SourceRegistry::new(&conn);
+    let inventory = application::list_inventory(&registry, &conn).expect("inventory");
+    assert_eq!(
+        inventory.len(),
+        2,
+        "both providers' rows must appear in one inventory: {inventory:?}",
+    );
+    let codex = inventory
+        .iter()
+        .find(|item| item.source_id == SourceId("src_1".into()))
+        .expect("codex row present");
+    assert_eq!(codex.provider.as_str(), "codex");
+    assert_eq!(codex.health_state, HealthState::Healthy);
+    assert_eq!(codex.coverage_level.as_str(), "full");
+    assert_eq!(
+        codex.complete_record_count,
+        Some(1),
+        "codex count is its own, honest per-source",
+    );
+    assert_eq!(codex.last_successful_scan, Some(100));
+    assert_eq!(codex.native_project.as_deref(), None);
+
+    let claude = inventory
+        .iter()
+        .find(|item| item.source_id == SourceId("src_2".into()))
+        .expect("claude row present");
+    assert_eq!(claude.provider.as_str(), "claude_code");
+    assert_eq!(claude.health_state, HealthState::Healthy);
+    assert_eq!(claude.coverage_level.as_str(), "full");
+    assert_eq!(
+        claude.complete_record_count,
+        Some(2),
+        "claude count is its own, independent of codex",
+    );
+    assert_eq!(claude.last_successful_scan, Some(200));
+    assert_eq!(claude.native_project.as_deref(), Some("proj-claude"));
+
+    // The panorama reflects the real registry state: both providers, neither
+    // hidden, in registry order.
+    let providers: std::collections::HashSet<&str> =
+        inventory.iter().map(|item| item.provider.as_str()).collect();
+    assert!(providers.contains("codex"));
+    assert!(providers.contains("claude_code"));
+}
+
+/// Story 2.5 AC — one source's scan failure / `error` health does not affect
+/// another source's display or status. With source 1 in `error` (latest run
+/// failed) and source 2 `healthy` (succeeded scan, active generation), both
+/// rows return: the failed one carries its `latest_error`, the healthy one's
+/// count and last-successful-scan are intact. Pins the per-source isolation
+/// guarantee at the inventory endpoint (the scan/health layer has been
+/// per-source-isolated since 1.x; this test guards the inventory projection).
+#[test]
+fn inventory_one_source_down_does_not_affect_others() {
+    let conn = db();
+    conn.execute_batch(
+        "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project) VALUES
+         (1, 'codex', 'agent_memory', 'confirmed', 'error', 'full', '/codex/down', 'fp-codex', NULL),
+         (2, 'claude_code', 'agent_memory', 'confirmed', 'healthy', 'full', '/claude/up', 'fp-claude', 'proj-claude');
+         INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision, finished_at, error_code) VALUES
+         (1, 'gen_1', 'succeeded', 1, 'gen_1', 'fixture', 100, NULL),
+         (1, 'gen_2', 'failed', 2, 'gen_2', 'fixture', 200, 'enumeration_failed'),
+         (2, 'gen_3', 'succeeded', 1, 'gen_3', 'fixture', 300, NULL);
+         INSERT INTO tessera_meta(key, value) VALUES ('active_generation:2', 'gen_3');
+         INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator) VALUES
+         ('rec_claude', 2, 'gen_3', 'claude_code', 'section', 'rec_claude', 'file:///claude', 'hash', 'v1', 'title', 'body', 'proj-claude', 'memory', 'full', 3, 'revision', 'file:///claude#L1');",
+    )
+    .expect("fixture rows");
+    let registry = SourceRegistry::new(&conn);
+    let inventory = application::list_inventory(&registry, &conn).expect("inventory");
+    assert_eq!(
+        inventory.len(),
+        2,
+        "both rows return even though source 1 is down: {inventory:?}",
+    );
+
+    // Source 1: error health, latest run failed, latest_error carried.
+    let codex = inventory
+        .iter()
+        .find(|item| item.source_id == SourceId("src_1".into()))
+        .expect("codex row present despite failure");
+    assert_eq!(codex.health_state, HealthState::Error);
+    assert_eq!(
+        codex.latest_error.as_deref(),
+        Some("Tessera could not read this source."),
+        "failed latest run surfaces its safe reason",
+    );
+
+    // Source 2: healthy, its own count + last-successful-scan intact —
+    // unaffected by source 1's failure (per-source isolation at the inventory
+    // layer). This is the load-bearing assertion of the test.
+    let claude = inventory
+        .iter()
+        .find(|item| item.source_id == SourceId("src_2".into()))
+        .expect("claude row present");
+    assert_eq!(claude.health_state, HealthState::Healthy);
+    assert_eq!(
+        claude.complete_record_count,
+        Some(1),
+        "healthy source count is intact",
+    );
+    assert_eq!(
+        claude.last_successful_scan,
+        Some(300),
+        "healthy source last-successful-scan is intact",
+    );
+    assert!(
+        claude.latest_error.is_none(),
+        "healthy source carries no latest_error",
+    );
+}

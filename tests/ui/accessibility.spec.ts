@@ -559,3 +559,191 @@ test("filter-active empty state names active filters instead of blaming the keyw
   // It must NOT fall back to the keyword-blaming copy.
   await expect(searchRegion).not.toContainText("No indexed memory matched this keyword.");
 });
+
+/**
+ * Story 2.5 — the Source Inventory panorama groups cards by provider and
+ * surfaces a health-summary header so cross-source health is comparable at a
+ * glance. The backend has been multi-provider at the row level since 2.1; 2.5
+ * adds the panorama affordance (grouping, summary, `data-provider` on each
+ * card) and pins it here.
+ *
+ * The mock exercises every health branch the AC calls out:
+ * - one `error`-health Codex source (the "one source down" AC) carrying a
+ *   `latest_error`,
+ * - a second Codex source that is `healthy`, so the `codex` bucket is a
+ *   multi-card group AND the within-group health sort runs on it, and
+ * - a `claude_code` `degraded` source so the panorama stays cross-provider.
+ *
+ * Assertions pin: the summary surfaces an "error" token (attention-first), the
+ * error card's `latest_error` renders, within the same-provider group the
+ * worse-health card precedes the healthy one in DOM order, the groups render in
+ * stable alphabetical DOM order, and the summary precedes the grouped list.
+ *
+ * The existing single-source inventory coverage (the first test in this file)
+ * stays intact; this test pins the multi-provider panorama contract.
+ */
+test("multi-provider inventory groups cards by provider with a health summary", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  const inventory = [
+    {
+      source_id: "src_codex_down",
+      provider: "codex",
+      lifecycle_state: "confirmed",
+      root: "/fixture/codex/down",
+      native_project: null,
+      coverage_level: "full",
+      health_state: "error",
+      last_successful_scan: null,
+      complete_record_count: 0,
+      latest_error: "Tessera could not read this source.",
+    },
+    {
+      source_id: "src_codex_ok",
+      provider: "codex",
+      lifecycle_state: "confirmed",
+      root: "/fixture/codex/ok",
+      native_project: null,
+      coverage_level: "full",
+      health_state: "healthy",
+      last_successful_scan: 100,
+      complete_record_count: 2,
+      latest_error: null,
+    },
+    {
+      source_id: "src_claude",
+      provider: "claude_code",
+      lifecycle_state: "confirmed",
+      root: "/fixture/claude",
+      native_project: "proj-claude",
+      coverage_level: "full",
+      health_state: "degraded",
+      last_successful_scan: 200,
+      complete_record_count: 1,
+      latest_error: "Tessera could not access this source.",
+    },
+  ];
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: inventory }) }),
+  );
+  await page.goto("/");
+
+  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
+
+  // Health-summary header states the totals — cross-source health comparable
+  // at a glance. Attention-first ordering surfaces the actionable `error`
+  // token (the "one source down" AC) alongside degraded/healthy.
+  const summary = inventoryRegion.getByTestId("inventory-summary");
+  await expect(summary).toBeVisible();
+  await expect(summary).toContainText("3 sources");
+  await expect(summary).toContainText("1 error");
+  await expect(summary).toContainText("1 degraded");
+  await expect(summary).toContainText("1 healthy");
+
+  // The summary sits ABOVE the grouped list in DOM order (not just both
+  // visible). compareDocumentPosition: the first group is "following" the
+  // summary iff the summary precedes it.
+  const summaryFirst = await inventoryRegion.evaluate((root) => {
+    const head = root.querySelector('[data-testid="inventory-summary"]');
+    const firstGroup = root.querySelector("[data-provider-group]");
+    if (!head || !firstGroup) return false;
+    return (head.compareDocumentPosition(firstGroup) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  });
+  expect(summaryFirst).toBe(true);
+
+  // The cards render with the correct `data-provider` attribute. Assert via
+  // the stable attribute, NOT provider-name text — `getByText("codex")` would
+  // also match the card's Provider <dd> and the mock root path. Pinning the
+  // attribute makes a real grouping regression fail loudly. Two codex cards
+  // (the multi-card bucket) plus one claude card.
+  await expect(inventoryRegion.locator('[data-provider="codex"]')).toHaveCount(2);
+  await expect(inventoryRegion.locator('[data-provider="claude_code"]')).toHaveCount(1);
+
+  // Provider grouping: one section per provider, each with its group heading
+  // (accessible region name) and a stable `data-provider-group` container.
+  await expect(inventoryRegion.getByRole("region", { name: "Codex provider group" })).toBeVisible();
+  await expect(inventoryRegion.getByRole("region", { name: "Claude Code provider group" })).toBeVisible();
+  await expect(inventoryRegion.locator('[data-provider-group="codex"]')).toBeVisible();
+  await expect(inventoryRegion.locator('[data-provider-group="claude_code"]')).toBeVisible();
+
+  // Stable alphabetical group order is pinned in DOM order: `claude_code`
+  // precedes `codex` (the panorama must not flicker on confirmation order).
+  const groupOrder = await inventoryRegion
+    .locator("[data-provider-group]")
+    .evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.providerGroup));
+  expect(groupOrder).toEqual(["claude_code", "codex"]);
+
+  // All three cards' full status renders — the panorama must NOT narrow the AC
+  // field set. Three "Health" `<dt>` labels means every card rendered its
+  // status row.
+  await expect(inventoryRegion.getByText("Health", { exact: true })).toHaveCount(3);
+
+  // The `error`-health source (one source down) carries its `latest_error`;
+  // the `degraded` source carries its own. Both render — the panorama reflects
+  // real registry state.
+  await expect(inventoryRegion.getByText("Tessera could not read this source.")).toBeVisible();
+  await expect(inventoryRegion.getByText("Tessera could not access this source.")).toBeVisible();
+
+  // Within-group attention-first health sort: in the multi-card `codex` group
+  // the worse-health (`error`) card precedes the `healthy` card in DOM order.
+  // Read each codex card's Health `<dd>` in DOM order and assert the sequence.
+  const codexHealths = await inventoryRegion
+    .locator('[data-provider-group="codex"] [data-provider="codex"]')
+    .evaluateAll((cards) =>
+      cards.map((card) => {
+        for (const dt of card.querySelectorAll("dt")) {
+          if (dt.textContent === "Health") {
+            return dt.nextElementSibling?.textContent ?? "";
+          }
+        }
+        return "";
+      }),
+    );
+  expect(codexHealths).toEqual(["error", "healthy"]);
+
+  // Honest per-Coverage record counts render and are pluralized correctly
+  // (count === 1 → "record", otherwise "records"). The non-Full "unavailable"
+  // copy is exercised by the dedicated inventory-coverage test below.
+  await expect(inventoryRegion.getByText("2 complete indexed records.", { exact: true })).toBeVisible();
+  await expect(inventoryRegion.getByText("1 complete indexed record.", { exact: true })).toBeVisible();
+});
+
+/**
+ * Story 2.5 review — the non-Full honest-count copy ("Complete count
+ * unavailable: coverage is limited.") renders at the UI layer when a source's
+ * `complete_record_count` is null, and no per-source "N complete indexed
+ * records." line appears for it. A `search_only` source never claims a complete
+ * count (only Full coverage may), so its null count must surface honestly.
+ */
+test("non-full inventory source renders the honest unavailable count copy", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  const inventory = [
+    {
+      source_id: "src_search_only",
+      provider: "codex",
+      lifecycle_state: "confirmed",
+      root: "/fixture/codex/search-only",
+      native_project: null,
+      coverage_level: "search_only",
+      health_state: "healthy",
+      last_successful_scan: 100,
+      complete_record_count: null,
+      latest_error: null,
+    },
+  ];
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: inventory }) }),
+  );
+  await page.goto("/");
+
+  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
+
+  // The honest unavailable-count copy renders for the non-Full source.
+  await expect(inventoryRegion.getByText("Complete count unavailable: coverage is limited.")).toBeVisible();
+  // No per-source complete-count line renders for it (only Full coverage claims
+  // a count).
+  await expect(inventoryRegion.getByText(/complete indexed records?\./)).toHaveCount(0);
+});

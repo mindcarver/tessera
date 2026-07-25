@@ -5,6 +5,7 @@ import {
   disableSource,
   getSourceInventory,
   rejectSource,
+  type HealthState,
   type SourceInventory,
 } from "../../api/sources";
 import { cancelRescan, getRescanProgress, startRescan, type RescanProgress } from "../../api/scan";
@@ -94,15 +95,24 @@ export function Sources(): ReactElement {
       {inventory.kind === "loading" ? <p>Loading source inventory…</p> : null}
       {inventory.kind === "error" ? <p role="alert">{inventory.message}</p> : null}
       {inventory.kind === "ok" && inventory.value.length === 0 ? <p>No sources have been confirmed yet.</p> : null}
-      {inventory.kind === "ok" ? <ul data-testid="source-inventory">{inventory.value.map((item) => <InventoryCard key={item.source_id} item={item} progress={progress[item.source_id]} onRescan={onRescan} onCancel={onCancel} onDisable={(id) => disableSource(id).then(refresh).catch((error: unknown) => setMessage(readTesseraErrorMessage(error)))} />)}</ul> : null}
+      {inventory.kind === "ok" && inventory.value.length > 0 ? <>
+        <p data-testid="inventory-summary" role="status">{inventorySummary(inventory.value)}</p>
+        <section data-testid="source-inventory">{groupInventoryByProvider(inventory.value).map((group) => {
+          const name = providerDisplayName(group.provider);
+          return <section key={group.provider} aria-label={`${name} provider group`} data-provider-group={group.provider}>
+            <h4>{name}</h4>
+            <ul>{group.items.map((item) => <InventoryCard key={item.source_id} item={item} progress={progress[item.source_id]} onRescan={onRescan} onCancel={onCancel} onDisable={(id) => disableSource(id).then(refresh).catch((error: unknown) => setMessage(readTesseraErrorMessage(error)))} />)}</ul>
+          </section>;
+        })}</section>
+      </> : null}
     </section>
   </section>;
 }
 
 function InventoryCard({ item, progress, onRescan, onCancel, onDisable }: { item: SourceInventory; progress?: RescanProgress; onRescan: (id: string) => void; onCancel: (id: string) => void; onDisable: (id: string) => void }): ReactElement {
   const running = progress?.state === "queued" || progress?.state === "running";
-  return <li><article>
-    <h4>{item.provider} source</h4>
+  return <li data-provider={item.provider}><article>
+    <h5>{providerDisplayName(item.provider)} source</h5>
     <dl>
       <dt>Provider</dt><dd>{item.provider}</dd>
       <dt>Lifecycle</dt><dd>{item.lifecycle_state}</dd>
@@ -111,7 +121,7 @@ function InventoryCard({ item, progress, onRescan, onCancel, onDisable }: { item
       <dt>Coverage</dt><dd>{describeCoverage(item.coverage_level)}</dd>
       <dt>Health</dt><dd>{item.health_state}</dd>
       <dt>Last successful scan</dt><dd>{item.last_successful_scan === null ? "No successful scan yet." : new Date(item.last_successful_scan * 1000).toLocaleString()}</dd>
-      <dt>Record count</dt><dd>{item.complete_record_count === null ? "Complete count unavailable: coverage is limited." : `${item.complete_record_count} complete indexed records.`}</dd>
+      <dt>Record count</dt><dd>{item.complete_record_count === null ? "Complete count unavailable: coverage is limited." : `${item.complete_record_count} complete indexed ${item.complete_record_count === 1 ? "record" : "records"}.`}</dd>
       {item.latest_error ? <><dt>Latest safe error</dt><dd>{item.latest_error}</dd></> : null}
       {progress ? <><dt>Rescan progress</dt><dd>{progress.state}: {progress.message}</dd></> : null}
     </dl>
@@ -131,4 +141,82 @@ function describeCoverage(level: CandidateSource["coverage_level"]): string {
     case "existence_only": return "Existence-only coverage; complete count unavailable";
     case "unsupported": return "Unsupported coverage; complete count unavailable";
   }
+}
+
+/**
+ * Story 2.5 — multi-provider panorama helpers. The backend already returns
+ * every confirmed source (any provider) on the inventory endpoint; these
+ * pure functions shape that flat list into a comparable, grouped view:
+ *
+ * - `healthSeverityRank` — attention-first ordering within a provider group
+ *   (`error` > `degraded` > `healthy` > `unknown`) so the worst card sorts to
+ *     the top of its group.
+ * - `groupInventoryByProvider` — one section per provider (stable alphabetical
+ *   order so the panorama does not flicker on confirmation order), each
+ *   group's cards sorted by health severity.
+ * - `inventorySummary` — the cross-source health header counting sources by
+ *   health state so Carver can compare providers' health/coverage at a glance.
+ *
+ * No DTO change, no server-side aggregation: grouping/sorting is a client-side
+ * render decision (Boundaries: Never introduce server-side persistence of a
+ * "panorama" or grouping state).
+ */
+function healthSeverityRank(state: HealthState): number {
+  switch (state) {
+    case "error": return 0;
+    case "degraded": return 1;
+    case "healthy": return 2;
+    case "unknown": return 3;
+    // Treat any unexpected (future-widened) HealthState as least-attention-
+    // worthy so a new state can never yield `NaN` and scramble the sort.
+    default: return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+function providerDisplayName(provider: string): string {
+  switch (provider) {
+    case "codex": return "Codex";
+    case "claude_code": return "Claude Code";
+    default: return provider;
+  }
+}
+
+interface InventoryGroup {
+  provider: string;
+  items: SourceInventory[];
+}
+
+function groupInventoryByProvider(items: SourceInventory[]): InventoryGroup[] {
+  const groups = new Map<string, SourceInventory[]>();
+  for (const item of items) {
+    const bucket = groups.get(item.provider);
+    if (bucket === undefined) {
+      groups.set(item.provider, [item]);
+    } else {
+      bucket.push(item);
+    }
+  }
+  for (const bucket of groups.values()) {
+    bucket.sort((a, b) => healthSeverityRank(a.health_state) - healthSeverityRank(b.health_state));
+  }
+  return [...groups.entries()]
+    .sort(([a], [b]) => a.localeCompare(b, "en", { sensitivity: "base" }))
+    .map(([provider, bucket]) => ({ provider, items: bucket }));
+}
+
+function inventorySummary(items: SourceInventory[]): string {
+  const total = items.length;
+  const counts: Record<HealthState, number> = { healthy: 0, degraded: 0, error: 0, unknown: 0 };
+  for (const item of items) counts[item.health_state] += 1;
+  const parts: string[] = [`${total} source${total === 1 ? "" : "s"}`];
+  // Attention-first: surface actionable states first (error > degraded >
+  // healthy > unknown), matching the within-group health sort. Only non-zero
+  // categories appear so an all-healthy inventory stays compact
+  // ("3 sources · 3 healthy"). Each health noun pluralizes the same way as
+  // "source" ("2 errors", "1 healthy").
+  const order: HealthState[] = ["error", "degraded", "healthy", "unknown"];
+  for (const state of order) {
+    if (counts[state] > 0) parts.push(`${counts[state]} ${state}${counts[state] === 1 ? "" : "s"}`);
+  }
+  return parts.join(" · ");
 }
