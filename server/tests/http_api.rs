@@ -1851,3 +1851,181 @@ fn browse_wire_rejects_legacy_b3_cursor_as_stale() {
     assert!(response.contains("\"code\":\"cursor_stale\""), "got:\n{response}");
     assert!(response.contains("\"phase\":\"browse\""), "phase=browse: {response}");
 }
+
+// ===========================================================================
+// Story 4.3 — POST /api/sources/rebind wire contract
+// ===========================================================================
+//
+// Rebind is the explicit recovery path for a Confirmed Source whose root
+// moved / lost permissions / changed filesystem identity. The wire contract:
+// - Body: `{ "source_id": "src_<n>", "root_path": "<new-root>" }`.
+// - 200 on success: envelope wraps the NEW Confirmed Source row (fresh
+//   source_id at the new fingerprint, Unknown health, fresh cause=none).
+// - 404 `source_not_found`: unknown old source_id (no state change).
+// - 409 `confirm_failed`: old source not Confirmed, OR new root missing / not
+//   a dir / not absolute. The 409 (NOT 400) follows the existing
+//   `respond_result` envelope convention at server.rs — `confirm_failed` maps
+//   to 409 alongside `scan_failed` and `cursor_stale`.
+
+/// Boot a test server with one pre-confirmed Codex source and return
+/// `(port, source_id)`. The source root's `MEMORY.md` is created inside the
+/// helper; the root tempdir itself moves into the server thread (kept alive
+/// for the server's lifetime there). Callers that need a NEW root for rebind
+/// create their own tempdir — there is no need to hand back a caller-owned
+/// root handle (P6: the previous signature returned a misleading third
+/// element that was an UNRELATED empty tempdir created after the move).
+fn boot_rebind_server() -> (u16, String) {
+    let dir = tempfile::tempdir().expect("scratch app-data dir");
+    let source_root = tempfile::tempdir().expect("source root");
+    std::fs::write(source_root.path().join("MEMORY.md"), "# memory\nbody").expect("memory");
+    let state = tessera_lib::boot(dir.path()).expect("boot");
+    let source_id = {
+        let conn = state.conn.lock().expect("conn lock");
+        let registry = SourceRegistry::new(&conn);
+        let source = tessera_lib::application::confirm_source(&registry, &CandidateSource {
+            provider: "codex".into(),
+            root_path: source_root.path().to_string_lossy().into_owned(),
+            basis: DiscoveryBasis::CodexHomeEnv,
+            coverage_level: CoverageLevel::Full,
+            native_project: None,
+        })
+        .expect("confirm");
+        source.source_id.0
+    };
+    let server = bind("127.0.0.1:0");
+    let port = server.server_addr().to_ip().expect("bound addr").port();
+    std::thread::spawn(move || {
+        let _dir = dir;
+        let _source_root = source_root;
+        serve_with(server, Arc::new(state), PathBuf::from("dist"), Some(port));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    (port, source_id)
+}
+
+/// Story 4.3 AC — a successful rebind returns the new Confirmed Source on the
+/// wire, and the OLD row appears Disabled via the inventory endpoint. The new
+/// row carries a fresh `source_id` distinct from the old.
+#[test]
+fn rebind_returns_new_source_and_disables_old_on_the_wire() {
+    let (port, old_source_id) = boot_rebind_server();
+    let new_root = tempfile::tempdir().expect("new source root");
+    std::fs::write(new_root.path().join("MEMORY.md"), "# moved\nbody").expect("new memory");
+
+    let body = serde_json::json!({
+        "source_id": old_source_id,
+        "root_path": new_root.path().to_string_lossy(),
+    })
+    .to_string();
+    let response = raw_http(
+        port,
+        &format!(
+            "POST /api/sources/rebind HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("response body");
+    let payload = serde_json::from_str::<serde_json::Value>(body).expect("envelope JSON");
+    let new_source_id = payload["payload"]["source_id"].as_str().expect("new source_id");
+    assert!(
+        new_source_id.starts_with("src_"),
+        "new source_id has src_ shape: {new_source_id}"
+    );
+    assert_ne!(
+        new_source_id, old_source_id,
+        "rebind produces a fresh source_id at the new fingerprint"
+    );
+    assert_eq!(payload["payload"]["lifecycle_state"], "confirmed");
+    assert_eq!(payload["payload"]["health_state"], "unknown");
+
+    // The OLD row is now Disabled on the wire (visible via inventory).
+    let inv = raw_http(
+        port,
+        &format!("GET /api/sources/inventory HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(inv.starts_with("HTTP/1.1 200"), "got:\n{inv}");
+    let inv_body = inv.split("\r\n\r\n").nth(1).expect("inventory body");
+    let inv_payload =
+        serde_json::from_str::<serde_json::Value>(inv_body).expect("inventory JSON");
+    let rows = inv_payload["payload"].as_array().expect("inventory rows");
+    let old_row = rows
+        .iter()
+        .find(|row| row["source_id"].as_str() == Some(old_source_id.as_str()))
+        .expect("old row present in inventory");
+    assert_eq!(
+        old_row["lifecycle_state"],
+        "disabled",
+        "old row is Disabled after rebind: {old_row}"
+    );
+    let new_row = rows
+        .iter()
+        .find(|row| row["source_id"].as_str() == Some(new_source_id))
+        .expect("new row present in inventory");
+    assert_eq!(new_row["lifecycle_state"], "confirmed");
+    assert_eq!(new_row["health_state"], "unknown");
+}
+
+/// Story 4.3 AC — rebind with an unknown `source_id` returns a 404
+/// `source_not_found` envelope (NOT 400 / NOT 409). Pins the envelope
+/// convention at the wire surface.
+#[test]
+fn rebind_unknown_source_id_returns_404_source_not_found() {
+    let (port, _old_source_id) = boot_rebind_server();
+    let new_root = tempfile::tempdir().expect("new source root");
+    let body = serde_json::json!({
+        "source_id": "src_99999",
+        "root_path": new_root.path().to_string_lossy(),
+    })
+    .to_string();
+    let response = raw_http(
+        port,
+        &format!(
+            "POST /api/sources/rebind HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 404"), "got:\n{response}");
+    assert!(
+        response.contains("\"code\":\"source_not_found\""),
+        "got:\n{response}"
+    );
+}
+
+/// Story 4.3 AC (amendment F2) — rebind to a missing new root returns 409
+/// `confirm_failed` (NOT 400). `confirm_failed` maps to 409 per the existing
+/// `respond_result` convention at server.rs alongside `scan_failed` and
+/// `cursor_stale`.
+#[test]
+fn rebind_missing_new_root_returns_409_confirm_failed() {
+    let (port, old_source_id) = boot_rebind_server();
+    let body = serde_json::json!({
+        "source_id": old_source_id,
+        "root_path": "/this/does/not/exist/tessera-4-3-rebind",
+    })
+    .to_string();
+    let response = raw_http(
+        port,
+        &format!(
+            "POST /api/sources/rebind HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        ),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 409"),
+        "amendment F2: confirm_failed maps to 409, not 400 — got:\n{response}"
+    );
+    assert!(
+        response.contains("\"code\":\"confirm_failed\""),
+        "got:\n{response}"
+    );
+    // The source path the user supplied must NOT cross the wire (NFR-3).
+    assert!(
+        !response.contains("/this/does/not/exist"),
+        "user-supplied path must not leak: {response}"
+    );
+}
+

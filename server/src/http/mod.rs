@@ -181,6 +181,55 @@ pub fn disable_source(
     Ok(wrap_source(source))
 }
 
+/// Story 4.3 — `rebind_source`: the explicit recovery path for a Confirmed
+/// Source whose root moved / lost permissions / changed filesystem identity.
+/// Takes an old `source_id` (the degraded row 4.2 marked `Degraded +
+/// PathMissing`) and a new `root_path` (where the user moved it), canonicalizes
+/// and fingerprints the new root, and atomically disables the old row and
+/// inserts (or wakes) the new row in ONE SQLite transaction (spec Boundaries —
+/// "fail-closed on the new root BEFORE disabling the old, AND why disable+insert
+/// must be ONE transaction").
+///
+/// Boundaries honored here:
+/// - AD-1: HTTP calls only the application service; never the registry directly.
+/// - AD-4: rebind takes a `source_id` + a path (the path is the only
+///   allowlist-style input besides confirm/reject; disable/list still take only
+///   `source_id`).
+/// - The watcher lifecycle mirrors the row lifecycle: stop the watcher on the
+///   OLD source id (its row just went Disabled), and start a fresh watcher on
+///   the NEW source id at its new canonical root (Story 4.1's lifecycle hook
+///   — a runtime-confirmed source gets a watcher; rebind produces a fresh
+///   Confirmed row, so it gets the same hook). Best-effort: a watcher
+///   start/stop failure is logged and swallowed.
+pub fn rebind_source(
+    request: RebindRequest,
+    state: &IndexState,
+) -> Result<Envelope<Source>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let new_source = application::rebind_source(&registry, &request.source_id, &request.root_path)
+        .map_err(|err| map_source_error(err, Some(&request.source_id.0)))?;
+    let old_source_id = request.source_id.clone();
+    let new_source_id = new_source.source_id.clone();
+    let new_root = new_source.normalized_root_path.clone();
+    drop(conn);
+    // Stop the watcher on the old (now-Disabled) row; start a fresh watcher
+    // on the new Confirmed row at its new canonical root.
+    stop_watch_best_effort(state, &old_source_id);
+    start_watch_best_effort(state, &new_source_id, &new_root);
+    Ok(wrap_source(new_source))
+}
+
+/// Story 4.3 — rebind request body. Carries the old `source_id` (the row to
+/// disable) and the new `root_path` (where the user moved the root). The path
+/// is canonicalized by the application layer's policy module, never trusted
+/// verbatim.
+#[derive(Debug, serde::Deserialize)]
+pub struct RebindRequest {
+    pub source_id: SourceId,
+    pub root_path: String,
+}
+
 /// Best-effort `start_watch` on the reconcile supervisor, if one is installed.
 /// Logs and swallows watcher errors: the HTTP request must not fail because a
 /// notify backend could not register a kernel watch (the periodic reconcile
