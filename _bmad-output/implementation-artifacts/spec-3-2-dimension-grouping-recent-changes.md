@@ -2,7 +2,7 @@
 title: 'Story 3.2: Memory-Type Browse Filter & Recent-Scan-First Ordering'
 type: 'feature'
 created: '2026-07-25'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 0
 followup_review_recommended: true
 baseline_revision: '89cf308f0669f9f40405f9ab74299e0aae16809d'

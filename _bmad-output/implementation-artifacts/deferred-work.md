@@ -171,3 +171,27 @@ Tauri 移除、传输改为 loopback-only HTTP（tiny_http）后，上述条目�
 - source_spec: `_bmad-output/implementation-artifacts/spec-5-2-project-projection.md`
   summary: No TS unit-test layer guards `buildSearchParams`'s new `tessera_project` emission (or the `q=`-when-empty fallback); a typo or dropped wire emission would silently disable narrowing with no test failure.
   evidence: `src/api/search.ts` `buildSearchParams` (verification-gap F13). The locked stack ships no vitest/jest; either introduce one or cover via the extended Playwright test above.
+
+## Deferred from: follow-up review of spec-1-7-open-original-location (2026-07-26)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-7-open-original-location.md`
+  summary: TOCTOU between `canonical_target_within_root` (canonicalize + containment check) and `invoke_open_path` (`open::that`) — a memory file swapped (unlink + symlink) in that window can escape the allowlisted root.
+  evidence: `server/src/application/open.rs:35-46` + `server/src/policy/mod.rs:112-122` (adversarial F1). Fix needs `openat2`/`RESOLVE_BENEATH` (Linux) or handle-based re-verify (Windows) — a security-hardening task, not a trivial patch.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-7-open-original-location.md`
+  summary: The host opener uses the `open` crate unconditionally, but the spec's `Block If` requires a "project-approved abstraction"; no AD records the approval, the version is not pinned, and an unbounded path string reaches `open::that` (historical ShellExecute/cmd quoting risk on Windows).
+  evidence: `server/src/application/open.rs:69-71` vs spec-1-7 Block If (adversarial F12). Needs a security eval + AD entry + version pin + shell-significant-char guard.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-7-open-original-location.md`
+  summary: `path_from_file_uri` only strips a literal `file://` prefix and cannot parse `file://localhost/...`, UNC `file://server/share/...`, or the canonical Windows `file:///C:/...` form; no unit test exercises the parser.
+  evidence: `server/src/policy/mod.rs:93-110`, `:124-148` (adversarial F2). A future provider or a codex locator-format change degrades every open to `open_failed`; Windows locals may misparse. Fix needs a real URI parser (mind the locked-stack no-new-dep rule) or a hardened hand-rolled parser + tests.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-7-open-original-location.md`
+  summary: `open_target_for_record` filters on `lifecycle_state='confirmed'` + active generation but ignores `source_registry.health_state`, so a confirmed-but-degraded/error Source's records remain openable. Whether the intent's "stale records" prohibition covers the degraded-but-confirmed case is undefined (spec predates the 4.2 health taxonomy).
+  evidence: `server/src/index/scan_store.rs:387-396` (adversarial F3 / intent-alignment D6). Needs a product decision: refuse opens on degraded/error-health sources?
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-7-open-original-location.md`
+  summary: The opener invocation path has four concurrency/robustness gaps — the `IndexState` DB mutex is held across the external `open::that` call (slow opener blocks every search/browse/scan), the opener has no timeout (hung handler wedges the request thread), the global opener seam has no RAII reset (a panicking test leaks `capture_open`), and the active-generation check is non-atomic with the open (a concurrent rescan can retire the record in between).
+  evidence: `server/src/http/mod.rs:330-340`, `server/src/application/open.rs:30-46/58-71` (edge-case E1/E2/E3, adversarial F8/F9). Fix shape: split locked resolution from unlocked invocation, dispatch the opener on a background thread with a timeout, return a Drop guard from `set_open_path_for_tests`, optionally re-check active generation right before the open.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-7-open-original-location.md`
+  summary: The path handed to the opener is `canonicalize(target)` (symlinks resolved), but the card displays the raw `native_locator` (possibly a symlink), so what opens in the editor can differ from what the user saw.
+  evidence: `server/src/application/open.rs:35-46` (adversarial F10). Either open the non-canonical path the user saw (after the containment check) or echo the canonical path back in `OpenResult` for UI reconciliation.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-7-open-original-location.md`
+  summary: The UI fires N host opens under rapid clicks (no `AbortController`; only stale UI updates are suppressed), opening multiple files with a single visible success message.
+  evidence: `src/features/search/Search.tsx:41-50/67-90` (adversarial F11). Abort the prior open + disable other cards' Open buttons while one is in flight.

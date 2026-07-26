@@ -1254,6 +1254,58 @@ mod tests {
         }
     }
 
+    /// `map_open_error` routes each application-layer `OpenError` to the stable
+    /// API error code the TS client depends on (AD-13). The `open_failed` 409
+    /// path is currently exercised only at the application layer
+    /// (`tests/open.rs`) and over the wire (`tests/http_api.rs`), never through
+    /// `map_open_error` directly — this pins the handler `Err` return path so
+    /// a typo'd mapping can't ship silently. Mirrors
+    /// `map_source_error_routes_to_stable_api_codes` /
+    /// `map_scan_error_routes_to_stable_api_codes`.
+    #[test]
+    fn map_open_error_routes_to_stable_api_codes() {
+        let rnf = map_open_error(OpenError::RecordNotFound);
+        assert_eq!(rnf.code, "record_not_found");
+        let of = map_open_error(OpenError::OpenFailed {
+            source_id: Some(SourceId("src_7".to_string())),
+        });
+        assert_eq!(of.code, "open_failed");
+        assert_eq!(of.source_id.as_deref(), Some("src_7"));
+        // `OpenFailed` may surface without a source attribution; the stable
+        // code is unchanged.
+        let of_anon = map_open_error(OpenError::OpenFailed { source_id: None });
+        assert_eq!(of_anon.code, "open_failed");
+        assert!(of_anon.source_id.is_none());
+        let int = map_open_error(OpenError::Internal);
+        assert_eq!(int.code, "internal");
+        // AD-13/NFR-3: the safe messages are static strings — no source path,
+        // memory body, or credential is interpolated into either the message
+        // or the serialized envelope. The `native_locator` / filesystem root
+        // never cross this boundary; assert that via the serialized form too.
+        for env in [rnf, of, of_anon, int] {
+            assert!(!env.message.is_empty(), "non-empty safe message");
+            let lower = env.message.to_lowercase();
+            assert!(!lower.contains("body"));
+            assert!(!lower.contains("credential"));
+            assert!(
+                !lower.contains("native_locator"),
+                "internal field name leaked into message: {}",
+                env.message
+            );
+            let json = serde_json::to_string(&env).expect("serialize");
+            assert!(!json.contains("body"));
+            assert!(!json.contains("credential"));
+            assert!(
+                !json.contains("native_locator"),
+                "internal field name leaked onto the wire: {json}"
+            );
+            assert!(
+                !json.contains('\\'),
+                "no filesystem path separator leaks onto the wire: {json}"
+            );
+        }
+    }
+
     /// `wrap_scan_outcome` carries a ScanOutcome through the versioned
     /// envelope; the wire shape matches the TS mirror (`src/api/scan.ts`).
     #[test]

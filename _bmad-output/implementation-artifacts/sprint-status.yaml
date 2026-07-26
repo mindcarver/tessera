@@ -71,18 +71,18 @@ development_status:
   epic-2-retrospective: optional
 
   # === Epic 3: 无查询浏览与记忆结构可视化 ===
-  epic-3: backlog
-  3-1-browse-page-entry: backlog            # BrowsePage 查询契约与无查询浏览入口
-  3-2-browse-grouping: backlog              # 按维度分组与最近变化浏览
-  3-3-drill-down-visualize: backlog         # 记忆结构 drill-down 导航与可视化
+  epic-3: done
+  3-1-browse-page-entry: done            # BrowsePage 查询契约与无查询浏览入口
+  3-2-browse-grouping: done              # 按维度分组与最近变化浏览
+  3-3-drill-down-visualize: done         # 记忆结构 drill-down 导航与可视化
   epic-3-retrospective: optional
 
   # === Epic 4: 健康诊断、失败隔离与索引重建 ===
-  epic-4: in-progress
+  epic-4: done
   4-1-watcher-reconcile: done               # 文件变化 watcher hint 与 reconcile 自动刷新
   4-2-failure-isolation: done               # Connector 失败隔离与 stale 上一成功结果
   4-3-path-change-degraded: done            # 路径/权限/身份变化的重发现与 degraded 处理
-  4-4-rebuild-index: backlog                # Derived Index 整体重建
+  4-4-rebuild-index: done                # Derived Index 整体重建
   epic-4-retrospective: optional
 
   # === Epic 5: Tessera Project 跨 Agent 项目联邦视图 ===

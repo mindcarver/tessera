@@ -2,7 +2,7 @@
 title: 'Story 1.7: Open Original Memory Location'
 type: 'feature'
 created: '2026-07-24'
-status: 'blocked'
+status: 'done'
 baseline_revision: 'e5efdc3886881ac63df9b8269abfe6c821c381ea'
 review_loop_iteration: 0
 followup_review_recommended: false
@@ -81,10 +81,25 @@ warnings: []
 </intent-contract>
 
 
+## Review Triage Log
+
+### 2026-07-26 — Follow-up review pass (closing the original `no subagents` block)
+- intent_gap: 0
+- bad_spec: 0
+- patch: 3: (high 0, medium 1, low 2)
+- defer: 7 entries (11 findings, opener-seam findings grouped)
+- reject: 4
+- addressed_findings:
+  - `[medium]` `[patch]` F6/V2 (inactive-generation): the `active.value = m.generation` JOIN that confines opens to the current active index had NO test — added `inactive_generation_records_do_not_open` (`server/tests/open.rs`; open suite 4→5).
+  - `[low]` `[patch]` F5/V1 (open_failed wire): the 409 `open_failed` mapping was exercised only at the application layer — added `map_open_error_routes_to_stable_api_codes` (`server/src/http/mod.rs`) pinning RecordNotFound/open_failed/internal with no path/body leakage.
+  - `[low]` `[patch]` F15 (non-determinism): `open_target_for_record` `LIMIT 1` had no `ORDER BY` — added `ORDER BY m.source_id ASC` (`server/src/index/scan_store.rs`) for deterministic duplicate-`record_id` resolution.
+  - Deferred to `deferred-work.md`: TOCTOU canonicalize→`open::that` (security); host-opener (`open` crate) approval/version-pin vs the spec's Block If (security); `path_from_file_uri` cannot parse `file://localhost`/UNC/`file:///C:/`; degraded-but-confirmed Source remains openable (predates 4.2 health taxonomy); opener-seam cluster (DB mutex held across opener, no timeout, no RAII reset, active-gen check non-atomic); canonicalized path may differ from the displayed symlinked locator; UI fires N opens under rapid clicks (no AbortController).
+  - Rejected: `OpenResult.source_id` validated-but-unconsumed dead field; `OpenRequest::new` trim/512-cap (style); test-name overclaim nit; speculative active-gen timing window.
+
 ## Auto Run Result
 
-Status: blocked
-Blocking condition: no subagents
+Status: done (the follow-up review pass on 2026-07-26 closed the original `no subagents` block — see Review Triage Log above; the blocked-time record is preserved below)
+Blocking condition (original, resolved): no subagents
 
 Summary:
 - Implemented the server-side open-original-location path keyed only by `record_id`.

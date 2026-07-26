@@ -748,6 +748,7 @@ impl<'a> ScanStore<'a> {
                                        AND active.value = m.generation
              WHERE m.record_id = ?1
                AND s.lifecycle_state = 'confirmed'
+             ORDER BY m.source_id ASC
              LIMIT 1",
         )?;
         let mut rows = stmt.query(params![record_id])?;
