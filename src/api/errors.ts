@@ -38,6 +38,15 @@ export const TESSERA_STABLE_ERROR_CODES: ReadonlySet<string> = new Set([
   // across any source. The previous index is unchanged; the user should wait
   // for or cancel the in-flight scan, then retry the rebuild.
   "rebuild_failed",
+  // Story 5.1: project + mapping errors. `project_not_found` / `mapping_not_found`
+  // surface when a `project_id`-keyed or `(provider, native_project)`-keyed
+  // operation targets nothing. `mapping_conflict` surfaces when `addMapping`
+  // rejects because the scope is already owned by another project (AD-27
+  // cardinality); the safe message names the owning project so the user can
+  // see who owns the scope.
+  "project_not_found",
+  "mapping_not_found",
+  "mapping_conflict",
 ]);
 
 /**

@@ -20,6 +20,7 @@
 //! reject / disable / list orchestrators.
 
 pub mod open;
+pub mod project;
 pub mod query;
 pub mod reconcile;
 pub mod rebuild;
@@ -31,6 +32,13 @@ pub mod source;
 pub use source::{
     confirm_source, disable_source, discover_sources, list_sources, native_project_for_root,
     rebind_source, reject_source, SourceError,
+};
+
+// Story 5.1 — Tessera Project orchestration. Re-exported so IPC and tests
+// can name `application::create_project` etc. without a long path.
+pub use project::{
+    add_mapping, create_project, delete_project, list_projects, remove_mapping, rename_project,
+    ProjectError,
 };
 
 // Story 4.4 — synchronous rebuild core. Re-exported so IPC and tests can name

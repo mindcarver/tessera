@@ -42,8 +42,9 @@ use crate::domain::ports::provider_adapter::ProviderMemoryType;
 use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
-    browse, cancel_rescan_request, confirm_source, disable_source, discover_sources,
-    get_scan_status, list_sources, open_original_location, ping, rebind_source, reject_source,
+    add_mapping, browse, cancel_rescan_request, confirm_source, create_project, delete_project,
+    disable_source, discover_sources, get_scan_status, list_projects, list_sources,
+    open_original_location, ping, rebind_source, reject_source, remove_mapping, rename_project,
     rescan_events, scan_source, search, source_inventory, start_rebuild, start_rescan,
 };
 use crate::IndexState;
@@ -188,6 +189,57 @@ fn route(
         // source (the primary race guard).
         (Method::Post, "/api/index/rebuild") => {
             respond_result(request, start_rebuild(state))
+        }
+        // Story 5.1 — Tessera Project mapping surface (six versioned,
+        // loopback-only endpoints). All project endpoints are POST except
+        // `GET /api/projects`; bodies are JSON request DTOs parsed the same
+        // way `/api/sources/rebind` already parses its body (read_json_body
+        // enforces the 1 MiB bound + bad_request stable code on shape drift).
+        (Method::Post, "/api/projects/create") => {
+            let body = match read_json_body::<crate::domain::project::CreateProjectRequest>(
+                &mut request,
+            ) {
+                Ok(body) => body,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, create_project(body, state))
+        }
+        (Method::Get, "/api/projects") => respond_result(request, list_projects(state)),
+        (Method::Post, "/api/projects/rename") => {
+            let body = match read_json_body::<crate::domain::project::RenameProjectRequest>(
+                &mut request,
+            ) {
+                Ok(body) => body,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, rename_project(body, state))
+        }
+        (Method::Post, "/api/projects/delete") => {
+            let body = match read_json_body::<crate::domain::project::DeleteProjectRequest>(
+                &mut request,
+            ) {
+                Ok(body) => body,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, delete_project(body, state))
+        }
+        (Method::Post, "/api/projects/mappings/add") => {
+            let body = match read_json_body::<crate::domain::project::MappingRequest>(
+                &mut request,
+            ) {
+                Ok(body) => body,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, add_mapping(body, state))
+        }
+        (Method::Post, "/api/projects/mappings/remove") => {
+            let body = match read_json_body::<crate::domain::project::MappingRequest>(
+                &mut request,
+            ) {
+                Ok(body) => body,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, remove_mapping(body, state))
         }
         (Method::Post, "/api/sources/rescan") => {
             let source_id = match read_source_id_body(&mut request) {
@@ -648,9 +700,10 @@ fn respond_result<T: serde::Serialize>(
         Err(error) => {
             let status = match error.code.as_str() {
                 "bad_request" => StatusCode(400),
-                "source_not_found" | "record_not_found" => StatusCode(404),
+                "source_not_found" | "record_not_found" | "project_not_found"
+                | "mapping_not_found" => StatusCode(404),
                 "confirm_failed" | "scan_failed" | "cursor_stale" | "open_failed"
-                | "rebuild_failed" => StatusCode(409),
+                | "rebuild_failed" | "mapping_conflict" => StatusCode(409),
                 _ => StatusCode(500),
             };
             request.respond(json_response(status, &error))

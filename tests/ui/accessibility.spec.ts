@@ -1616,3 +1616,439 @@ test("browse breadcrumb surfaces provider and native-project hierarchy and is ke
   await expect(browseRegion.getByTestId("browse-source-health")).toContainText("available");
   await expect(browseRegion.getByTestId("browse-source-health")).not.toContainText("degraded");
 });
+
+/**
+ * Story 5.1 — the Projects region is keyboard-reachable (AD-21 / NFR-13): the
+ * user can create a project, rename it, add a mapping, remove the mapping,
+ * and delete the project (via the inline-confirm pattern Story 4.4
+ * introduced for Rebuild), all without using a pointer. Status changes are
+ * announced via `aria-live`, and the reserved "Tessera project" filter
+ * control in Search stays `disabled` (Story 5.2 slot untouched).
+ *
+ * The mock exercises every Projects branch the AC calls out:
+ * - create via the New-project input + Enter;
+ * - add-mapping picker fed by getSourceInventory() (Codex global + Claude per-
+ *   project branches);
+ * - remove-mapping (per-mapping button);
+ * - delete via the inline-confirm region (aria-expanded trigger, focus moved
+ *   in, Esc / Cancel closes it).
+ *
+ * The 409 `mapping_conflict` safe message also surfaces via `readTesseraErrorMessage`
+ * (allowlisted in `TESSERA_STABLE_ERROR_CODES`); a separate assertion pins
+ * that path.
+ */
+test("projects region is keyboard-reachable for create rename add remove delete", async ({ page }) => {
+  // Empty discover + inventory by default; the add-mapping picker is fed by
+  // the inventory, so we route it to return a Codex global + Claude per-
+  // project source when the test reaches that branch.
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  let inventoryCalls = 0;
+  const inventoryEmpty = { api_version: "1", payload: [] };
+  const inventoryTwo = {
+    api_version: "1",
+    payload: [
+      {
+        source_id: "src_codex",
+        provider: "codex",
+        lifecycle_state: "confirmed",
+        root: "/fixture/codex",
+        native_project: null,
+        coverage_level: "full",
+        health_state: "healthy",
+        last_successful_scan: 100,
+        complete_record_count: 1,
+        latest_error: null,
+      },
+      {
+        source_id: "src_claude",
+        provider: "claude_code",
+        lifecycle_state: "confirmed",
+        root: "/fixture/claude",
+        native_project: "proj-claude",
+        coverage_level: "full",
+        health_state: "healthy",
+        last_successful_scan: 100,
+        complete_record_count: 1,
+        latest_error: null,
+      },
+    ],
+  };
+  await page.route("**/api/sources/inventory", async (route) => {
+    inventoryCalls += 1;
+    // The Projects component fetches inventory on mount. Return the populated
+    // inventory so the add-mapping picker has options; the Sources region
+    // also fetches it and renders the inventory cards, but those are not
+    // under test here.
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(inventoryTwo),
+    });
+  });
+
+  // --- Project list + create round-trip via the versioned envelope. ---
+  let listCalls = 0;
+  const projectsState: { list: TesseraProjectViewMock[] } = { list: [] };
+  await page.route("**/api/projects", async (route) => {
+    listCalls += 1;
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: projectsState.list }),
+    });
+  });
+  let createCalls = 0;
+  await page.route("**/api/projects/create", async (route) => {
+    createCalls += 1;
+    const body = JSON.parse(route.request().postData() ?? "{}") as { name: string };
+    const now = Math.floor(Date.now() / 1000);
+    const view: TesseraProjectViewMock = {
+      project_id: `proj_${createCalls}`,
+      name: body.name,
+      created_at: now,
+      updated_at: now,
+      mappings: [],
+    };
+    projectsState.list = [...projectsState.list, view];
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: view }),
+    });
+  });
+  let renameCalls = 0;
+  await page.route("**/api/projects/rename", async (route) => {
+    renameCalls += 1;
+    const body = JSON.parse(route.request().postData() ?? "{}") as {
+      project_id: string;
+      name: string;
+    };
+    projectsState.list = projectsState.list.map((p) =>
+      p.project_id === body.project_id
+        ? { ...p, name: body.name, updated_at: Math.floor(Date.now() / 1000) }
+        : p,
+    );
+    const updated = projectsState.list.find((p) => p.project_id === body.project_id)!;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: updated }),
+    });
+  });
+  await page.route("**/api/projects/mappings/add", async (route) => {
+    const body = JSON.parse(route.request().postData() ?? "{}") as {
+      project_id: string;
+      provider: string;
+      native_project: string | null;
+    };
+    // Cardinality check across the mock state: if another project already
+    // owns this scope, return 409 mapping_conflict naming the owner.
+    const owner = projectsState.list.find(
+      (p) =>
+        p.project_id !== body.project_id &&
+        p.mappings.some(
+          (m) =>
+            m.provider === body.provider &&
+            (m.native_project ?? "") === (body.native_project ?? ""),
+        ),
+    );
+    if (owner) {
+      return route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          code: "mapping_conflict",
+          message: `That native project is already mapped to project “${owner.name}”. Remove it there first.`,
+          source_id: null,
+          phase: "project",
+        }),
+      });
+    }
+    projectsState.list = projectsState.list.map((p) =>
+      p.project_id === body.project_id
+        ? {
+            ...p,
+            mappings: [
+              ...p.mappings,
+              { provider: body.provider, native_project: body.native_project },
+            ],
+          }
+        : p,
+    );
+    const updated = projectsState.list.find((p) => p.project_id === body.project_id)!;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: updated }),
+    });
+  });
+  await page.route("**/api/projects/mappings/remove", async (route) => {
+    const body = JSON.parse(route.request().postData() ?? "{}") as {
+      project_id: string;
+      provider: string;
+      native_project: string | null;
+    };
+    projectsState.list = projectsState.list.map((p) =>
+      p.project_id === body.project_id
+        ? {
+            ...p,
+            mappings: p.mappings.filter(
+              (m) =>
+                !(
+                  m.provider === body.provider &&
+                  (m.native_project ?? "") === (body.native_project ?? "")
+                ),
+            ),
+          }
+        : p,
+    );
+    const updated = projectsState.list.find((p) => p.project_id === body.project_id)!;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: updated }),
+    });
+  });
+  let deleteCalls = 0;
+  await page.route("**/api/projects/delete", async (route) => {
+    deleteCalls += 1;
+    const body = JSON.parse(route.request().postData() ?? "{}") as { project_id: string };
+    const target = projectsState.list.find((p) => p.project_id === body.project_id);
+    const removed = target ? target.mappings.length : 0;
+    projectsState.list = projectsState.list.filter((p) => p.project_id !== body.project_id);
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: { project_id: body.project_id, removed_mappings: removed },
+      }),
+    });
+  });
+
+  await page.goto("/");
+
+  const projectsRegion = page.getByRole("region", { name: "Tessera projects" });
+
+  // Empty state renders initially (no projects yet).
+  await expect(projectsRegion.getByTestId("projects-empty")).toContainText("No Tessera projects yet.");
+
+  // --- Create a project via keyboard (New-project input + Enter). ---
+  const nameInput = projectsRegion.getByLabel("Project name", { exact: true });
+  await nameInput.focus();
+  await nameInput.fill("Federation");
+  await page.keyboard.press("Enter");
+  // The created project's card renders with its name as a heading.
+  await expect(projectsRegion.getByTestId("projects-item-name")).toContainText("Federation");
+  expect(createCalls).toBe(1);
+
+  // --- Rename via keyboard (Rename button → input → Enter). ---
+  await projectsRegion.getByRole("button", { name: "Rename", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  // Scope to the rename input INSIDE the project item (the create form's
+  // input also carries the "Project name" label, so the bare selector is
+  // ambiguous after the create-form input became empty post-create).
+  const renameInput = projectsRegion.getByTestId("projects-item").getByRole("textbox", { name: "Project name" });
+  await renameInput.focus();
+  await renameInput.fill("Federated");
+  await page.keyboard.press("Enter");
+  await expect(projectsRegion.getByTestId("projects-item-name")).toContainText("Federated");
+  expect(renameCalls).toBe(1);
+
+  // --- Add a mapping via keyboard (Add mapping → select → Add). ---
+  await projectsRegion.getByRole("button", { name: "Add mapping", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  const addMappingSelect = projectsRegion.getByLabel("Native project to map");
+  await addMappingSelect.focus();
+  // Pick the Codex global option by its value (the option's `key` is
+  // `codex::` because native_project is null). Value-based selection is more
+  // reliable than label-regex matching under React-controlled selects.
+  await addMappingSelect.selectOption("codex::");
+  await projectsRegion.getByRole("button", { name: "Add", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  // The mapping renders under the project.
+  await expect(projectsRegion.getByTestId("projects-item-mappings")).toContainText("Codex (global store)");
+
+  // --- Remove the mapping via keyboard. ---
+  const removeMappingButton = projectsRegion.getByRole("button", { name: "Remove mapping", exact: true }).first();
+  await removeMappingButton.focus();
+  await page.keyboard.press("Enter");
+  // The mappings list is empty again — the "No mappings yet." copy renders.
+  await expect(projectsRegion.getByText("No mappings yet.")).toBeVisible();
+
+  // --- Delete via the inline-confirm region (AD-21 — keyboard-reachable). ---
+  await projectsRegion.getByRole("button", { name: "Delete", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  const confirmRegion = projectsRegion.getByRole("group", { name: /Delete project Federated confirmation/ });
+  await expect(confirmRegion).toBeVisible();
+  // Focus moved into the confirm region so the keyboard user lands on the
+  // warning before the destructive action.
+  await expect(confirmRegion).toBeFocused();
+  // Esc closes the confirm region without firing the destructive call.
+  await page.keyboard.press("Escape");
+  await expect(confirmRegion).toHaveCount(0);
+  expect(deleteCalls).toBe(0);
+
+  // Re-open the confirm region and complete the delete via the explicit
+  // "Delete now" activation.
+  await projectsRegion.getByRole("button", { name: "Delete", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await projectsRegion.getByRole("group", { name: /Delete project Federated confirmation/ }).getByRole("button", { name: "Delete now", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  // The project is gone; the empty state renders again.
+  await expect(projectsRegion.getByTestId("projects-empty")).toContainText("No Tessera projects yet.");
+  expect(deleteCalls).toBe(1);
+
+  // --- Reserved Tessera-project filter slot stays disabled (Story 5.2). ---
+  // The existing 2.4 test already pins this; assert it here too so a 5.1
+  // regression that accidentally fills the slot fails loudly in this test.
+  const tesseraSlot = page.getByLabel("Tessera project (reserved)");
+  await expect(tesseraSlot).toBeVisible();
+  await expect(tesseraSlot).toBeDisabled();
+
+  expect(inventoryCalls).toBeGreaterThan(0);
+  expect(listCalls).toBeGreaterThan(0);
+});
+
+/**
+ * Story 5.1 — a 409 `mapping_conflict` envelope surfaces as a `role="alert"`
+ * safe message naming the owning project (AD-27 cardinality; NFR-3: same
+ * posture as the Source Inventory). The conflict path is mocked separately
+ * so the test does not depend on the in-memory mock-state from the test
+ * above.
+ */
+test("projects add-mapping 409 surfaces a safe mapping_conflict alert naming the owner", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: [] }),
+    }),
+  );
+  // Project A already owns (claude_code, "<key>"); a second add to project B
+  // returns 409 naming A.
+  const aView = {
+    api_version: "1",
+    payload: {
+      project_id: "proj_1",
+      name: "Owner-Project-A",
+      created_at: 100,
+      updated_at: 100,
+      mappings: [{ provider: "claude_code", native_project: "<key>" }],
+    },
+  };
+  await page.route("**/api/projects", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      // The list endpoint returns both projects so the UI can render them.
+      body: JSON.stringify({
+        api_version: "1",
+        payload: [
+          aView.payload,
+          {
+            project_id: "proj_2",
+            name: "B",
+            created_at: 100,
+            updated_at: 100,
+            mappings: [],
+          },
+        ],
+      }),
+    }),
+  );
+  await page.route("**/api/projects/create", async (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(aView) }),
+  );
+  await page.route("**/api/projects/mappings/add", async (route) => {
+    const body = JSON.parse(route.request().postData() ?? "{}") as { project_id: string };
+    if (body.project_id === "proj_2") {
+      return route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          code: "mapping_conflict",
+          message:
+            "That native project is already mapped to project “Owner-Project-A”. Remove it there first.",
+          source_id: null,
+          phase: "project",
+        }),
+      });
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(aView),
+    });
+  });
+
+  await page.goto("/");
+
+  const projectsRegion = page.getByRole("region", { name: "Tessera projects" });
+  // The two seeded projects render.
+  await expect(projectsRegion.getByRole("button", { name: "Add mapping", exact: true })).toHaveCount(2);
+
+  // Open the add-mapping picker for project B (the second one) and trigger
+  // the conflict. We cannot pick a real inventory option (the inventory is
+  // empty for this test), so we mock the wire-level add-mapping call to
+  // always 409; the test just needs to dispatch the call and observe the
+  // alert. The picker is gated on a non-empty selection, so we re-route the
+  // inventory to provide an option first.
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: [
+          {
+            source_id: "src_claude",
+            provider: "claude_code",
+            lifecycle_state: "confirmed",
+            root: "/fixture/claude",
+            native_project: "<key>",
+            coverage_level: "full",
+            health_state: "healthy",
+            last_successful_scan: 100,
+            complete_record_count: 1,
+            latest_error: null,
+          },
+        ],
+      }),
+    }),
+  );
+  await page.reload();
+  await expect(projectsRegion.getByRole("button", { name: "Add mapping", exact: true })).toHaveCount(2);
+
+  // Project B (second button) — open its picker, select the conflicting
+  // scope, and dispatch the add.
+  const addMappingButtons = projectsRegion.getByRole("button", { name: "Add mapping", exact: true });
+  await addMappingButtons.nth(1).focus();
+  await page.keyboard.press("Enter");
+  const addMappingSelect = projectsRegion.getByLabel("Native project to map");
+  await addMappingSelect.focus();
+  // The option's value is the key `claude_code::<key>` (provider + "::" +
+  // native_project). Selecting by value avoids ambiguity with the option
+  // label's "<key>" (which contains regex-special chars).
+  await addMappingSelect.selectOption("claude_code::<key>");
+  await projectsRegion.getByRole("button", { name: "Add", exact: true }).focus();
+  await page.keyboard.press("Enter");
+
+  // The 409 surfaces as a `role="alert"` naming Owner-Project-A. No raw
+  // diagnostic / body / credential leak.
+  const alert = projectsRegion.getByRole("alert").last();
+  await expect(alert).toContainText("Owner-Project-A");
+  await expect(alert).toContainText("already mapped");
+  const body = (await alert.textContent()) ?? "";
+  expect(body.toLowerCase()).not.toContain("credential");
+});
+
+// Local mock type for the projects region test (mirrors TesseraProjectView
+// from src/api/projects.ts without importing it into the test bundle).
+interface TesseraProjectViewMock {
+  project_id: string;
+  name: string;
+  created_at: number;
+  updated_at: number;
+  mappings: { provider: string; native_project: string | null }[];
+}

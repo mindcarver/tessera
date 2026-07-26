@@ -29,9 +29,10 @@ pub mod state;
 
 pub use http::envelope::{Envelope, ErrorEnvelope, Pong, API_VERSION};
 pub use http::{
-    browse, cancel_rescan_request, confirm_source, disable_source, discover_sources,
-    get_scan_status, list_sources, open_original_location, ping, reject_source, scan_source,
-    search, source_inventory, start_rebuild, start_rescan,
+    add_mapping, browse, cancel_rescan_request, confirm_source, create_project, delete_project,
+    disable_source, discover_sources, get_scan_status, list_projects, list_sources,
+    open_original_location, ping, reject_source, remove_mapping, rename_project,
+    scan_source, search, source_inventory, start_rebuild, start_rescan,
 };
 
 use std::collections::HashMap;

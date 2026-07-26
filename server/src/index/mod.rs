@@ -11,9 +11,13 @@
 //! migration id `2`) so confirmed / rejected / disabled Sources and their
 //! fingerprints persist across restarts. Staging generations, scan_runs state
 //! machine, canonical body table and FTS5 search schema land in Stories
-//! 1.4/1.5.
+//! 1.4/1.5. Story 5.1 adds the Tessera Project mapping layer
+//! (`project_store` module + migration id `7`) so the user can explicitly
+//! associate provider-native projects into a cross-Agent view (local-only;
+//! provider directories are never modified).
 
 pub mod migrations;
+pub mod project_store;
 pub mod scan_store;
 pub mod source_registry;
 
@@ -22,12 +26,16 @@ pub mod source_registry;
 ///
 /// Phase 0 shipped migration id `1` (`v0_meta`). Story 1.3 appended migration
 /// id `2` (`v1_source_registry`); Story 1.4 appended migration id `3`
-/// (`v2_scan_generations`), and Story 1.5 appended migration id `4`
-/// (`v3_canonical_memory_records`), so the current schema version is `4`. The value
+/// (`v2_scan_generations`); Story 1.5 appended migration id `4`
+/// (`v3_canonical_memory_records`); Story 1.8 appended migration id `5`
+/// (`v4_rescan_cancellation`); Story 4.2 appended migration id `6`
+/// (`v5_source_health_cause`); Story 5.1 appended migration id `7`
+/// (`v6_tessera_projects`), so the current schema version is `7`. The value
 /// `0` is reserved as the pre-migration sentinel on a fresh database and is
 /// never a valid `CURRENT_SCHEMA_VERSION`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
-/// Re-export the registry so application / IPC code can name it without a long
-/// path.
+/// Re-export the registries so application / IPC code can name them without a
+/// long path.
+pub use project_store::ProjectStore;
 pub use source_registry::SourceRegistry;

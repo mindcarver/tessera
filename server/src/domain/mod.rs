@@ -14,6 +14,7 @@
 
 pub mod open;
 pub mod ports;
+pub mod project;
 pub mod query;
 pub mod scan;
 pub mod source;
@@ -37,6 +38,16 @@ pub use open::{OpenRequest, OpenRequestError, OpenResult};
 pub use source::{
     build_fingerprint, FilesystemIdentity, HealthState, Source, SourceFingerprint, SourceId,
     SourceKind, SourceLifecycle, ROOT_KIND_DIR,
+};
+
+// Story 5.1 adds the Tessera Project mapping domain model: opaque
+// `proj_<n>` handle, view DTO, and the (provider, native_project) mapping
+// ref. Re-exported so application / index / ipc can name them without a long
+// path.
+pub use project::{
+    CreateProjectRequest, DeleteProjectRequest, DeleteProjectResponse, MappingRequest,
+    NativeProjectRef, ProjectId, ProjectMapping, RenameProjectRequest, TesseraProject,
+    TesseraProjectView, KNOWN_PROVIDERS, MAX_NATIVE_PROJECT_LEN, MAX_PROJECT_NAME_LEN,
 };
 
 // Story 1.4 adds the scan state machine + generation identity + DTOs + pure

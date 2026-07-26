@@ -37,13 +37,17 @@ use std::sync::MutexGuard;
 
 use crate::application;
 use crate::application::query::QueryError;
-use crate::application::{OpenError, SourceError};
+use crate::application::{OpenError, ProjectError, SourceError};
 use crate::domain::open::{OpenRequest, OpenResult};
+use crate::domain::project::{
+    CreateProjectRequest, DeleteProjectRequest, DeleteProjectResponse, MappingRequest,
+    RenameProjectRequest, TesseraProjectView,
+};
 use crate::domain::query::{BrowsePage, BrowseRequest, SearchPage, SearchRequest};
 use crate::domain::scan::{ScanError, ScanOutcome, ScanStatus};
 use crate::domain::source::{Source, SourceId};
 use crate::domain::CandidateSource;
-use crate::index::{scan_store::ScanStore, SourceRegistry};
+use crate::index::{scan_store::ScanStore, ProjectStore, SourceRegistry};
 use crate::{IndexState, RescanEvent, RescanJob};
 
 /// `ping` — contract-sample endpoint (Phase 0).
@@ -349,6 +353,147 @@ pub fn source_inventory(
         api_version: API_VERSION,
         payload: inventory,
     })
+}
+
+// --- Story 5.1: Tessera Project mapping surface ---------------------------
+//
+// Six versioned, loopback-only endpoints under `/api/projects`. They all
+// follow the same shape as the 1.3 handlers: acquire the IndexState mutex,
+// construct a `ProjectStore` view over the guarded connection, and delegate
+// to `application::project`. The mutex is held for the whole operation —
+// synchronous handlers serialize writes and keep the cardinality pre-check
+// + insert inside one transaction honest (the project store's
+// `with_transaction` is the atomic boundary; the IndexState mutex guarantees
+// no concurrent writer can observe a half-applied transaction).
+//
+// Boundaries honored here:
+// - AD-1: HTTP calls only the application service; never the store directly.
+// - AD-17/A-6: responses carry `api_version` on the envelope.
+// - NFR-3: errors map to stable codes via `map_project_error`; no body /
+//   query text / credentials surface (the project layer carries only
+//   user-visible metadata: name + provider + native_project).
+// - Zero-source-mutation: no handler here touches `source_registry` or
+//   `memory_records`; the application layer never does either. The AC's
+//   non-destruction gate is enforced by the application layer's project-only
+//   SQL surface.
+
+/// `POST /api/projects/create` — create a Tessera Project. AD-24: creating a
+/// project creates zero mappings; the response carries an empty `mappings`
+/// array.
+pub fn create_project(
+    request: CreateProjectRequest,
+    state: &IndexState,
+) -> Result<Envelope<TesseraProjectView>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let store = ProjectStore::new(&conn);
+    let view =
+        application::create_project(&store, &request).map_err(|err| map_project_error(err, None))?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: view,
+    })
+}
+
+/// `GET /api/projects` — list every Tessera Project with its mappings. Empty
+/// array when none exist (the I/O matrix row "List projects" with no
+/// projects).
+pub fn list_projects(
+    state: &IndexState,
+) -> Result<Envelope<Vec<TesseraProjectView>>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let store = ProjectStore::new(&conn);
+    let views = application::list_projects(&store).map_err(|err| map_project_error(err, None))?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: views,
+    })
+}
+
+/// `POST /api/projects/rename` — rename a Tessera Project. Advances
+/// `updated_at`; unknown id → `project_not_found`.
+pub fn rename_project(
+    request: RenameProjectRequest,
+    state: &IndexState,
+) -> Result<Envelope<TesseraProjectView>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let store = ProjectStore::new(&conn);
+    let project_id = request.project_id.clone();
+    let view = application::rename_project(&store, &request)
+        .map_err(|err| map_project_error(err, Some(&project_id.0)))?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: view,
+    })
+}
+
+/// `POST /api/projects/delete` — delete a Tessera Project. Cascades its
+/// mappings (`ON DELETE CASCADE`); the response carries the cascade count via
+/// [`DeleteProjectResponse`].
+pub fn delete_project(
+    request: DeleteProjectRequest,
+    state: &IndexState,
+) -> Result<Envelope<DeleteProjectResponse>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let store = ProjectStore::new(&conn);
+    let project_id = request.project_id.clone();
+    let outcome = application::delete_project(&store, &request)
+        .map_err(|err| map_project_error(err, Some(&project_id.0)))?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: outcome,
+    })
+}
+
+/// `POST /api/projects/mappings/add` — add an explicit `(provider,
+/// native_project)` mapping to a project. AD-27 cardinality: a scope already
+/// owned by another project returns 409 `mapping_conflict` naming the owner;
+/// re-adding the same scope to the same project is idempotent.
+pub fn add_mapping(
+    request: MappingRequest,
+    state: &IndexState,
+) -> Result<Envelope<TesseraProjectView>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let store = ProjectStore::new(&conn);
+    let project_id = request.project_id.clone();
+    let view = application::add_mapping(&store, &request)
+        .map_err(|err| map_project_error(err, Some(&project_id.0)))?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: view,
+    })
+}
+
+/// `POST /api/projects/mappings/remove` — remove a mapping. Distinguishes
+/// "no such project" (404 `project_not_found`) from "project exists, no such
+/// mapping" (404 `mapping_not_found`).
+pub fn remove_mapping(
+    request: MappingRequest,
+    state: &IndexState,
+) -> Result<Envelope<TesseraProjectView>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let store = ProjectStore::new(&conn);
+    let project_id = request.project_id.clone();
+    let view = application::remove_mapping(&store, &request)
+        .map_err(|err| map_project_error(err, Some(&project_id.0)))?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: view,
+    })
+}
+
+/// Map an application-layer [`ProjectError`] onto the stable API error codes
+/// (AD-13). The `project_id` is threaded in so the 404 envelopes can surface
+/// the stable id the caller supplied (it is already user-visible).
+fn map_project_error(err: ProjectError, project_id: Option<&str>) -> ErrorEnvelope {
+    match err {
+        ProjectError::BadRequest => ErrorEnvelope::bad_request("project"),
+        ProjectError::ProjectNotFound => ErrorEnvelope::project_not_found(project_id),
+        ProjectError::MappingConflict { owning_project_name } => {
+            ErrorEnvelope::mapping_conflict(&owning_project_name)
+        }
+        ProjectError::MappingNotFound => ErrorEnvelope::mapping_not_found(project_id),
+        ProjectError::Internal => ErrorEnvelope::internal_for(project_id, "project"),
+    }
 }
 
 /// Start one background rescan. The worker opens its own SQLite connection so

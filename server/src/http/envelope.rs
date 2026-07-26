@@ -88,6 +88,7 @@ impl ErrorEnvelope {
         let message = match phase {
             "search" => "The request did not match Tessera's search contract.",
             "open" => "The request did not match Tessera's open contract.",
+            "project" => "The request did not match Tessera's project contract.",
             _ => "The request did not match Tessera's API contract.",
         };
         Self::new("bad_request", message, None, phase)
@@ -202,6 +203,57 @@ impl ErrorEnvelope {
             "rebuild",
         )
     }
+
+    /// Story 5.1 — construct a `project_not_found` envelope. Emitted when a
+    /// `project_id`-keyed operation (rename / delete / add_mapping /
+    /// remove_mapping) targets an id that matches no `tessera_projects` row.
+    /// Maps to HTTP 404 via the existing `respond_result` convention at
+    /// `server.rs`.
+    pub fn project_not_found(project_id: Option<&str>) -> Self {
+        Self::new(
+            "project_not_found",
+            "Tessera could not find that project.",
+            project_id,
+            "project",
+        )
+    }
+
+    /// Story 5.1 — construct a `mapping_conflict` envelope naming the owning
+    /// project (AD-27 cardinality: within one mapping scope `(provider,
+    /// native_project)`, a Native Project belongs to at most one active
+    /// Tessera Project). Emitted when `add_mapping` rejects because the scope
+    /// is already owned by another project. Maps to HTTP 409 via the existing
+    /// `respond_result` convention. The owning project name is user-visible
+    /// metadata (consistent with the Source Inventory's posture — NFR-3); no
+    /// body / query text / credentials are surfaced.
+    pub fn mapping_conflict(owning_project_name: &str) -> Self {
+        // The owning project name is already user-visible (it appears in the
+        // project list); naming it here is the same posture as the Source
+        // Inventory surfacing `provider`/`native_project`. The message tells
+        // the user how to recover — remove the mapping from the owning
+        // project first, then re-add it here (AD-27: never silently moved).
+        Self::new(
+            "mapping_conflict",
+            &format!(
+                "That native project is already mapped to project “{owning_project_name}”. Remove it there first."
+            ),
+            None,
+            "project",
+        )
+    }
+
+    /// Story 5.1 — construct a `mapping_not_found` envelope. Emitted when
+    /// `remove_mapping` targets a `(provider, native_project)` that does not
+    /// match any mapping row for the project (the project exists, the mapping
+    /// does not). Maps to HTTP 404.
+    pub fn mapping_not_found(project_id: Option<&str>) -> Self {
+        Self::new(
+            "mapping_not_found",
+            "Tessera could not find that mapping.",
+            project_id,
+            "project",
+        )
+    }
 }
 
 #[cfg(test)]
@@ -292,5 +344,37 @@ mod tests {
         assert_eq!(err.source_id.as_deref(), Some("src_7"));
         assert_eq!(err.phase, "scan");
         assert!(err.message.contains("changed"));
+    }
+
+    /// Story 5.1 — the three new project error constructors carry stable
+    /// codes, the `"project"` phase, and safe messages (no body / query text
+    /// / credential leak — NFR-3/AD-13).
+    #[test]
+    fn project_envelopes_carry_stable_codes_and_safe_messages() {
+        let not_found = ErrorEnvelope::project_not_found(Some("proj_7"));
+        assert_eq!(not_found.code, "project_not_found");
+        assert_eq!(not_found.source_id.as_deref(), Some("proj_7"));
+        assert_eq!(not_found.phase, "project");
+
+        let conflict = ErrorEnvelope::mapping_conflict("A");
+        assert_eq!(conflict.code, "mapping_conflict");
+        assert_eq!(conflict.phase, "project");
+        // The owning project name surfaces in the message (NFR-3: same
+        // posture as the Source Inventory).
+        assert!(conflict.message.contains("A"));
+        assert!(conflict.message.contains("already mapped"));
+
+        let missing = ErrorEnvelope::mapping_not_found(Some("proj_7"));
+        assert_eq!(missing.code, "mapping_not_found");
+        assert_eq!(missing.phase, "project");
+
+        // AD-13/NFR-3: none of the new envelopes leak body / query text /
+        // credentials in either the code, message, or phase.
+        for env in [not_found, conflict, missing] {
+            let lower = env.message.to_lowercase();
+            assert!(!lower.contains("body"));
+            assert!(!lower.contains("credential"));
+            assert!(!env.code.contains("credential"));
+        }
     }
 }

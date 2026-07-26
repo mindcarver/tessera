@@ -997,7 +997,10 @@ fn reset_derived_data_wipes_four_targets_preserves_schema_version() {
         0
     );
 
-    // schema_version + reserved meta key preserved.
+    // schema_version + reserved meta key preserved. Story 5.1 bumped
+    // schema_version from 6 to 7 (the v6_tessera_projects migration adds the
+    // `tessera_projects` + `project_mappings` tables); the rebuild wipe
+    // preserves it.
     let schema_version: String = conn
         .query_row(
             "SELECT value FROM tessera_meta WHERE key = 'schema_version'",
@@ -1005,7 +1008,7 @@ fn reset_derived_data_wipes_four_targets_preserves_schema_version() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(schema_version, "6", "schema_version preserved");
+    assert_eq!(schema_version, "7", "schema_version preserved");
     let reserved: String = conn
         .query_row(
             "SELECT value FROM tessera_meta WHERE key = 'reserved'",
