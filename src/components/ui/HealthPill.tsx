@@ -47,11 +47,13 @@ export function healthLabel(state: HealthState): string {
 
 interface HealthPillProps {
   state: HealthState;
+  /** Optional localized label for a specific surface. */
+  label?: string;
   /** Compact form renders just the dot + short label (row aside). Default false. */
   compact?: boolean;
 }
 
-export function HealthPill({ state, compact = false }: HealthPillProps): ReactElement {
+export function HealthPill({ state, label, compact = false }: HealthPillProps): ReactElement {
   const variant = variantFor(state);
   return (
     <span
@@ -59,7 +61,7 @@ export function HealthPill({ state, compact = false }: HealthPillProps): ReactEl
       data-health={state}
     >
       <span className="tsr-health__dot" aria-hidden="true" />
-      {healthLabel(state).toUpperCase()}
+      {(label ?? healthLabel(state)).toUpperCase()}
     </span>
   );
 }

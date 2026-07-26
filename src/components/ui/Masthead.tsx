@@ -20,7 +20,7 @@ interface NavItem {
 }
 
 const NAV: readonly NavItem[] = [
-  { id: "inventory", label: "Inventory", href: "#tessera-sources" },
+  { id: "inventory", label: "来源", href: "#tessera-sources" },
   { id: "projects", label: "Projects", href: "#tessera-projects" },
   { id: "search", label: "Search", href: "#tessera-search" },
 ];
