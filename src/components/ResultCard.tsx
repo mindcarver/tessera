@@ -1,25 +1,25 @@
 /**
- * Tessera — shared search/browse result card (Story 3.1).
+ * Tessera — shared search/browse result card (Story 3.1, restyled).
  *
- * Extracted from `src/features/search/Search.tsx` so Search and Browse render
- * a record's Provenance, Coverage, and Source Health identically (Epic 3
- * Boundaries: "reuse, do not re-implement"). The card is presentational only
- * — no fetch, no state. The `onOpen` callback lets each feature wire its own
- * open-original-location flow without duplicating the card markup.
+ * Presentational only — no fetch, no state. Search and Browse render a record's
+ * excerpt, Provenance, Coverage, and Source Health identically (Epic 3
+ * Boundaries: "reuse, do not re-implement"). The `onOpen` callback lets each
+ * feature wire its own open-original-location flow without duplicating markup.
  *
- * Accessibility:
- * - The `<li>` carries `tabIndex={0}` so the whole card is keyboard-focusable
- *   in AD-21's focus order.
- * - The Provenance `<dl>` uses stable `<dt>` labels ("Provider", "Source",
+ * Accessibility (unchanged contract):
+ * - The `<li>` carries `tabIndex={0}` (keyboard-focusable in AD-21's order) and
+ *   the snake_case `data-provider` attribute the e2e tests locate cards by.
+ * - The Provenance `<dl>` keeps the stable `<dt>` labels ("Provider", "Source",
  *   "Native project", "Semantic location", "Display location", "Last observed
- *   (scan)", "Coverage", "Source health") so screen-reader users hear the
- *   same vocabulary Search has always spoken — Browse is "the same surface,
- *   query-less", not a new shape.
+ *   (scan)", "Coverage", "Source health") so screen-reader users hear the same
+ *   vocabulary — now demoted to a muted L3 detail spine beneath the visual row.
  */
 
 import type { ReactElement } from "react";
 import type { SearchResult } from "../api/search";
+import type { HealthState } from "../api/sources";
 import { providerDisplayName } from "./providerDisplayName";
+import { HealthPill } from "./ui/HealthPill";
 
 interface ResultCardProps {
   result: SearchResult;
@@ -34,12 +34,32 @@ interface ResultCardProps {
 }
 
 export function ResultCard({ result, onOpen, openInFlight }: ResultCardProps): ReactElement {
+  // `degraded` + `error` both carry the red "needs attention" vocabulary.
+  const attention = result.health_state === "degraded" || result.health_state === "error";
   return (
-    <li key={result.record_id} tabIndex={0}>
-      <p>{result.excerpt}</p>
-      <dl>
+    <li key={result.record_id} tabIndex={0} className={`tsr-res${attention ? " tsr-res--deg" : ""}`} data-provider={result.provider}>
+      <div className="tsr-res__row">
+        <div className="tsr-res__main">
+          <span className="tsr-res__prov">{providerDisplayName(result.provider)}</span>
+          <p className="tsr-res__excerpt">{result.excerpt}</p>
+          <div className="tsr-res__loc">{result.native_locator}</div>
+        </div>
+        <div className="tsr-res__aside">
+          <HealthPill state={result.health_state as HealthState} compact />
+          <button
+            type="button"
+            className="tsr-btn tsr-btn--link"
+            onClick={() => onOpen(result.record_id)}
+            disabled={openInFlight}
+          >
+            Open original location<span aria-hidden="true" className="tsr-arrow"> ▸</span>
+          </button>
+        </div>
+      </div>
+
+      <dl className="tsr-card__details">
         <dt>Provider</dt>
-        <dd>{providerBadge(result.provider)}</dd>
+        <dd>{providerDisplayName(result.provider)}</dd>
         <dt>Source</dt>
         <dd>{result.source_id}</dd>
         <dt>Native project</dt>
@@ -49,32 +69,17 @@ export function ResultCard({ result, onOpen, openInFlight }: ResultCardProps): R
         <dt>Display location</dt>
         <dd>{result.display_locator}</dd>
         <dt>Last observed (scan)</dt>
-        <dd>{result.observed_at}</dd>
+        <dd>{formatObserved(result.observed_at)}</dd>
         <dt>Coverage</dt>
         <dd>{result.coverage_level}</dd>
         <dt>Source health</dt>
         <dd>{result.health_state}</dd>
       </dl>
-      <button
-        type="button"
-        onClick={() => onOpen(result.record_id)}
-        disabled={openInFlight}
-      >
-        Open original location
-      </button>
     </li>
   );
 }
 
-/**
- * Provider badge — renders a short label so Codex vs Claude Code cards are
- * visually comparable at a glance. Mirrors the badge Search has always
- * rendered; extracted so Browse cards share it without duplication.
- */
-function providerBadge(provider: string): ReactElement {
-  return (
-    <span className="tessera-provider-badge" data-provider={provider}>
-      {providerDisplayName(provider)}
-    </span>
-  );
+/** Format the scan-observed epoch (seconds) for the detail spine. */
+function formatObserved(observedAt: number): string {
+  return new Date(observedAt * 1000).toLocaleString();
 }

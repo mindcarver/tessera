@@ -321,176 +321,174 @@ export function Projects(): ReactElement {
   // --- Render ----------------------------------------------------------------
 
   return (
-    <section aria-label="Tessera projects">
-      <h2>Projects</h2>
-      <p
-        aria-live="polite"
-        data-testid="projects-status"
-        className="visually-hidden-text"
-      >
+    <section aria-label="Tessera projects" id="tessera-projects" className="tsr-section">
+      <h2 className="tsr-section__title">Projects</h2>
+      <p aria-live="polite" data-testid="projects-status" className="visually-hidden-text">
         {statusMessage}
       </p>
       {errorMessage ? (
-        <p role="alert" data-testid="projects-error">
+        <p role="alert" data-testid="projects-error" className="tsr-prose">
           {errorMessage}
         </p>
       ) : null}
 
-      <section aria-label="Create a Tessera project">
-        <h3>New project</h3>
-        <label htmlFor="projects-new-name">Project name</label>
-        {" "}
-        <input
-          id="projects-new-name"
-          type="text"
-          value={newName}
-          onChange={(e) => setNewName(e.target.value)}
-          onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              onCreate();
-            }
-          }}
-          maxLength={128}
-        />
-        {" "}
-        <button type="button" onClick={onCreate}>
-          Create project
-        </button>
+      <section aria-label="Create a Tessera project" className="tsr-block">
+        <h3 className="tsr-block__title">New project</h3>
+        <div className="tsr-create">
+          <label className="tsr-create__label" htmlFor="projects-new-name">Project name</label>
+          <input
+            id="projects-new-name"
+            className="tsr-create__input"
+            type="text"
+            placeholder="Name this federation project…"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                onCreate();
+              }
+            }}
+            maxLength={128}
+          />
+          <button type="button" className="tsr-btn tsr-btn--primary" onClick={onCreate}>
+            Create project
+          </button>
+        </div>
       </section>
 
       <section
         aria-label="Tessera project list"
         aria-busy={projects.kind === "loading"}
+        className="tsr-block"
       >
-        <h3>Projects</h3>
-        {projects.kind === "loading" ? <p>Loading projects…</p> : null}
+        <h3 className="tsr-block__title">Projects</h3>
+        {projects.kind === "loading" ? <p className="tsr-prose">Loading projects…</p> : null}
         {projects.kind === "error" ? (
-          <p role="alert">{projects.message}</p>
+          <p role="alert" className="tsr-prose">{projects.message}</p>
         ) : null}
         {projects.kind === "ok" && projects.value.length === 0 ? (
-          <p data-testid="projects-empty">No Tessera projects yet.</p>
+          <p data-testid="projects-empty" className="tsr-empty tsr-empty--mute">
+            No Tessera projects yet.
+          </p>
         ) : null}
         {projects.kind === "ok" && projects.value.length > 0 ? (
-          <ul data-testid="projects-list">
+          <ul data-testid="projects-list" className="tsr-projlist">
             {projects.value.map((project) => (
-              <li key={project.project_id} data-testid="projects-item">
-                <article>
-                  {/* Heading: name OR inline rename input. */}
-                  {renamingId === project.project_id ? (
-                    <>
-                      <label htmlFor={`rename-${project.project_id}`}>
-                        Project name
-                      </label>
-                      {" "}
-                      <input
-                        id={`rename-${project.project_id}`}
-                        type="text"
-                        value={renameValue}
-                        onChange={(e) => setRenameValue(e.target.value)}
-                        onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
-                          if (e.key === "Enter") {
-                            e.preventDefault();
-                            submitRename(project.project_id);
-                          } else if (e.key === "Escape") {
-                            e.preventDefault();
-                            cancelRename();
-                          }
-                        }}
-                        maxLength={128}
-                      />
-                      {" "}
+              <li key={project.project_id} data-testid="projects-item" className="tsr-projcard">
+                <article className="tsr-projcard__body">
+                  <div className="tsr-projcard__row">
+                    <div className="tsr-projcard__main">
+                      {renamingId === project.project_id ? (
+                        <div className="tsr-rename">
+                          {/* Visually-hidden label keeps the rename textbox's
+                              accessible name "Project name" (the e2e test finds
+                              it via the projects-item scope). */}
+                          <label className="visually-hidden-text" htmlFor={`rename-${project.project_id}`}>
+                            Project name
+                          </label>
+                          <input
+                            id={`rename-${project.project_id}`}
+                            className="tsr-rename__input"
+                            type="text"
+                            value={renameValue}
+                            onChange={(e) => setRenameValue(e.target.value)}
+                            onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                submitRename(project.project_id);
+                              } else if (e.key === "Escape") {
+                                e.preventDefault();
+                                cancelRename();
+                              }
+                            }}
+                            maxLength={128}
+                          />
+                          <button type="button" className="tsr-btn tsr-btn--primary" onClick={() => submitRename(project.project_id)}>
+                            Save
+                          </button>
+                          <button type="button" className="tsr-btn" onClick={cancelRename}>
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <h4 data-testid="projects-item-name" className="tsr-projcard__name">{project.name}</h4>
+                      )}
+                    </div>
+                    <div className="tsr-projcard__actions">
+                      {renamingId !== project.project_id ? (
+                        <button type="button" className="tsr-btn" onClick={() => beginRename(project)}>
+                          Rename
+                        </button>
+                      ) : null}
                       <button
                         type="button"
-                        onClick={() => submitRename(project.project_id)}
+                        className="tsr-btn"
+                        onClick={() => openDeleteConfirm(project.project_id)}
+                        aria-expanded={deleteConfirmId === project.project_id}
+                        aria-controls={`delete-confirm-${project.project_id}`}
+                        disabled={deleteConfirmId === project.project_id}
                       >
-                        Save
+                        Delete
                       </button>
-                      {" "}
-                      <button type="button" onClick={cancelRename}>
-                        Cancel
+                      <button
+                        type="button"
+                        className="tsr-btn tsr-btn--primary"
+                        onClick={() => {
+                          setAddMappingForId(project.project_id);
+                          setAddMappingChoice("");
+                        }}
+                        aria-expanded={addMappingForId === project.project_id}
+                        aria-controls={`add-mapping-${project.project_id}`}
+                      >
+                        Add mapping
                       </button>
-                    </>
-                  ) : (
-                    <h4 data-testid="projects-item-name">{project.name}</h4>
-                  )}
+                    </div>
+                  </div>
 
-                  <dl>
-                    <dt>Project id</dt>
-                    <dd>
-                      <code>{project.project_id}</code>
-                    </dd>
-                    <dt>Created</dt>
-                    <dd>
-                      {new Date(project.created_at * 1000).toLocaleString()}
-                    </dd>
-                    <dt>Updated</dt>
-                    <dd>
-                      {new Date(project.updated_at * 1000).toLocaleString()}
-                    </dd>
-                    <dt>Mapped native projects</dt>
-                    <dd>
-                      {project.mappings.length === 0 ? (
-                        <span>No mappings yet.</span>
-                      ) : (
-                        <ul data-testid="projects-item-mappings">
-                          {project.mappings.map((m) => (
-                            <li
-                              key={`${m.provider}::${m.native_project ?? ""}`}
-                              data-provider={m.provider}
+                  {/* Mappings — promoted to a prominent chip row (was a buried
+                      <dl> <dd>). The pinned projects-item-mappings testid + the
+                      "Codex (global store)" / "No mappings yet." strings are
+                      preserved. */}
+                  <div className="tsr-projcard__mappings">
+                    {project.mappings.length === 0 ? (
+                      <span className="tsr-projcard__mappings-empty">No mappings yet.</span>
+                    ) : (
+                      <ul data-testid="projects-item-mappings" className="tsr-chips">
+                        {project.mappings.map((m) => (
+                          <li
+                            key={`${m.provider}::${m.native_project ?? ""}`}
+                            data-provider={m.provider}
+                            className="tsr-chip"
+                          >
+                            <span className="tsr-chip__label">{describeMapping(m.provider, m.native_project)}</span>
+                            <button
+                              type="button"
+                              className="tsr-chip__remove"
+                              onClick={() =>
+                                onRemoveMapping(
+                                  project.project_id,
+                                  m.provider,
+                                  m.native_project,
+                                )
+                              }
                             >
-                              {describeMapping(m.provider, m.native_project)}
-                              {" "}
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  onRemoveMapping(
-                                    project.project_id,
-                                    m.provider,
-                                    m.native_project,
-                                  )
-                                }
-                              >
-                                Remove mapping
-                              </button>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </dd>
-                  </dl>
+                              Remove mapping
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
 
-                  {/* Row actions: rename / delete / add-mapping. */}
-                  {renamingId !== project.project_id ? (
-                    <button
-                      type="button"
-                      onClick={() => beginRename(project)}
-                    >
-                      Rename
-                    </button>
-                  ) : null}
-                  {" "}
-                  <button
-                    type="button"
-                    onClick={() => openDeleteConfirm(project.project_id)}
-                    aria-expanded={deleteConfirmId === project.project_id}
-                    aria-controls={`delete-confirm-${project.project_id}`}
-                    disabled={deleteConfirmId === project.project_id}
-                  >
-                    Delete
-                  </button>
-                  {" "}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAddMappingForId(project.project_id);
-                      setAddMappingChoice("");
-                    }}
-                    aria-expanded={addMappingForId === project.project_id}
-                    aria-controls={`add-mapping-${project.project_id}`}
-                  >
-                    Add mapping
-                  </button>
+                  <dl className="tsr-card__details">
+                    <dt>Project id</dt>
+                    <dd><code>{project.project_id}</code></dd>
+                    <dt>Created</dt>
+                    <dd>{new Date(project.created_at * 1000).toLocaleString()}</dd>
+                    <dt>Updated</dt>
+                    <dd>{new Date(project.updated_at * 1000).toLocaleString()}</dd>
+                  </dl>
 
                   {/* Inline delete-confirm region (AD-21 — keyboard-reachable,
                       focus moves in on open, Esc / Cancel closes it). */}
@@ -501,24 +499,23 @@ export function Projects(): ReactElement {
                       tabIndex={-1}
                       role="group"
                       aria-label={`Delete project ${project.name} confirmation`}
+                      className="tsr-confirm"
                     >
-                      <p role="alert">
+                      <p role="alert" className="tsr-confirm__warn">
                         Delete this project and unmap its{" "}
                         {project.mappings.length === 1
                           ? "1 mapping"
                           : `${project.mappings.length} mappings`}?
                         Source files and other projects are not affected.
                       </p>
-                      <button
-                        type="button"
-                        onClick={() => confirmDelete(project.project_id)}
-                      >
-                        Delete now
-                      </button>
-                      {" "}
-                      <button type="button" onClick={cancelDelete}>
-                        Cancel
-                      </button>
+                      <div className="tsr-confirm__actions">
+                        <button type="button" className="tsr-btn tsr-btn--primary" onClick={() => confirmDelete(project.project_id)}>
+                          Delete now
+                        </button>
+                        <button type="button" className="tsr-btn" onClick={cancelDelete}>
+                          Cancel
+                        </button>
+                      </div>
                     </div>
                   ) : null}
 
@@ -529,42 +526,42 @@ export function Projects(): ReactElement {
                       id={`add-mapping-${project.project_id}`}
                       role="group"
                       aria-label={`Add a mapping to project ${project.name}`}
+                      className="tsr-addmapping"
                     >
-                      <label htmlFor={`add-mapping-select-${project.project_id}`}>
-                        Native project to map
-                      </label>
-                      {" "}
-                      <select
-                        id={`add-mapping-select-${project.project_id}`}
-                        value={addMappingChoice}
-                        onChange={(e) => setAddMappingChoice(e.target.value)}
-                      >
-                        <option value="">Pick a native project…</option>
-                        {mappingOptions.map((opt) => (
-                          <option key={opt.key} value={opt.key}>
-                            {opt.label}
-                          </option>
-                        ))}
-                      </select>
-                      {" "}
-                      <button
-                        type="button"
-                        onClick={() => onAddMapping(project.project_id)}
-                      >
-                        Add
-                      </button>
-                      {" "}
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setAddMappingForId(null);
-                          setAddMappingChoice("");
-                        }}
-                      >
-                        Cancel
-                      </button>
+                      <div className="tsr-filter">
+                        <label htmlFor={`add-mapping-select-${project.project_id}`}>
+                          Native project to map
+                        </label>
+                        <select
+                          id={`add-mapping-select-${project.project_id}`}
+                          value={addMappingChoice}
+                          onChange={(e) => setAddMappingChoice(e.target.value)}
+                        >
+                          <option value="">Pick a native project…</option>
+                          {mappingOptions.map((opt) => (
+                            <option key={opt.key} value={opt.key}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="tsr-addmapping__actions">
+                        <button type="button" className="tsr-btn tsr-btn--primary" onClick={() => onAddMapping(project.project_id)}>
+                          Add
+                        </button>
+                        <button
+                          type="button"
+                          className="tsr-btn"
+                          onClick={() => {
+                            setAddMappingForId(null);
+                            setAddMappingChoice("");
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
                       {mappingOptions.length === 0 ? (
-                        <p>
+                        <p className="tsr-prose">
                           No confirmed sources are available to map. Confirm a
                           source first.
                         </p>

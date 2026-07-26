@@ -1,22 +1,25 @@
 /**
- * Tessera — shared empty-state component (Story 3.1).
+ * Tessera — shared empty-state component (Story 3.1, restyled).
  *
- * Extracted from the inlined `<p>{emptyCopy(...)}</p>` pattern in
- * `src/features/search/Search.tsx`. Both Search and Browse render an empty
- * state when the initial page yields zero results, and both want the same
- * polite `aria-live` announcement + accessible text. The component is
- * presentational: the parent computes the message string (so Search can keep
- * its filter-aware copy and Browse can carry its query-less three-state
- * copy).
+ * Presentational: the parent computes the message string (Search keeps its
+ * filter-aware copy; Browse carries its query-less three-state copy) and now
+ * also selects a `tone` so the three empty-result states read distinctly per
+ * the design tokens (mute = genuinely no match, blue = source present but not
+ * yet indexed, red = source unavailable — reusing the degraded vocabulary).
+ * Both surfaces keep the same polite `aria-live` announcement + accessible text.
  */
 
 import type { ReactElement } from "react";
 
+export type EmptyTone = "mute" | "blue" | "red";
+
 interface EmptyStateProps {
   /** The accessible empty-state message. Computed by the parent. */
   message: string;
+  /** Visual tone — encodes the empty-result reason (mute/blue/red). */
+  tone?: EmptyTone;
 }
 
-export function EmptyState({ message }: EmptyStateProps): ReactElement {
-  return <p>{message}</p>;
+export function EmptyState({ message, tone = "mute" }: EmptyStateProps): ReactElement {
+  return <p className={`tsr-empty tsr-empty--${tone}`}>{message}</p>;
 }

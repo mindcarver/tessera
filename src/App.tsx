@@ -36,6 +36,8 @@ import { Browse } from "./features/browse/Browse";
 import { Projects } from "./features/projects/Projects";
 import { readTesseraErrorMessage } from "./api/errors";
 import { providerDisplayName } from "./components/providerDisplayName";
+import { Masthead } from "./components/ui/Masthead";
+import { TrustFooter } from "./components/ui/TrustFooter";
 
 type PingState =
   | { kind: "idle" }
@@ -96,36 +98,42 @@ export function App(): ReactElement {
 
   if (view.kind === "browse") {
     return (
-      <main aria-live="polite">
-        <h1>Tessera</h1>
-        <Browse
-          sourceId={view.sourceId}
-          providerLabel={view.providerLabel}
-          nativeProject={view.nativeProject}
-          onBack={() => setView({ kind: "default" })}
-        />
-        <section aria-label="API ping status">{renderPingState(state)}</section>
-      </main>
+      <div className="tsr-page">
+        <Masthead active="inventory" />
+        <main aria-live="polite" className="tsr-main">
+          <Browse
+            sourceId={view.sourceId}
+            providerLabel={view.providerLabel}
+            nativeProject={view.nativeProject}
+            onBack={() => setView({ kind: "default" })}
+          />
+          <section aria-label="API ping status">{renderPingState(state)}</section>
+        </main>
+        <TrustFooter />
+      </div>
     );
   }
 
   return (
-    <main aria-busy={state.kind === "loading"} aria-live="polite">
-      <h1>Tessera</h1>
-      <Sources
-        onBrowse={(source) =>
-          setView({
-            kind: "browse",
-            sourceId: source.source_id,
-            providerLabel: providerDisplayName(source.provider),
-            nativeProject: source.native_project,
-          })
-        }
-      />
-      <Projects />
-      <Search />
-      <section aria-label="API ping status">{renderPingState(state)}</section>
-    </main>
+    <div className="tsr-page">
+      <Masthead active="inventory" />
+      <main aria-busy={state.kind === "loading"} aria-live="polite" className="tsr-main">
+        <Sources
+          onBrowse={(source) =>
+            setView({
+              kind: "browse",
+              sourceId: source.source_id,
+              providerLabel: providerDisplayName(source.provider),
+              nativeProject: source.native_project,
+            })
+          }
+        />
+        <Projects />
+        <Search />
+        <section aria-label="API ping status">{renderPingState(state)}</section>
+      </main>
+      <TrustFooter />
+    </div>
   );
 }
 
