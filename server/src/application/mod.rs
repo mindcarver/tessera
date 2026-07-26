@@ -22,6 +22,7 @@
 pub mod open;
 pub mod query;
 pub mod reconcile;
+pub mod rebuild;
 pub mod scan;
 pub mod source;
 
@@ -31,6 +32,12 @@ pub use source::{
     confirm_source, disable_source, discover_sources, list_sources, native_project_for_root,
     rebind_source, reject_source, SourceError,
 };
+
+// Story 4.4 — synchronous rebuild core. Re-exported so IPC and tests can name
+// `application::rebuild_index` / `application::RebuildError` without a long
+// path. The HTTP layer wraps this with transport job tracking + per-source
+// worker dispatch (see `http::start_rebuild`).
+pub use rebuild::{rebuild_index, RebuildError};
 
 // Story 1.4 scan orchestration (AD-1). Re-exported so IPC and the boot path
 // can name them without a long path.

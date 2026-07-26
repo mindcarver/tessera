@@ -2029,3 +2029,296 @@ fn rebind_missing_new_root_returns_409_confirm_failed() {
     );
 }
 
+// ===========================================================================
+// Story 4.4 — POST /api/index/rebuild wire contract
+// ===========================================================================
+//
+// Rebuild is the explicit recovery path for a corrupt Derived Index: it
+// atomically wipes EXACTLY `memory_records` + `scan_runs` + `scan_diagnostics`
+// + `tessera_meta` rows matching `active_generation:%` (preserving
+// `source_registry`, `schema_version`, `tessera_migrations_applied`, and any
+// other `tessera_meta` key), then re-scans every Confirmed Source by reusing
+// the existing scan pipeline. The wire contract:
+// - 200 on success: envelope wraps `RebuildOutcome { sources_rescanning }`.
+// - 409 `rebuild_failed`: any source has an in-flight scan (race guard).
+// - 500 `internal`: wipe / DB failure.
+
+/// Boot a test server with one pre-confirmed + scanned Codex source and
+/// return `(port, source_id, db_path)`. The source root is kept alive for the
+/// server's lifetime. The `db_path` is returned so individual tests can open
+/// their OWN connection (SQLite handles multi-connection fine) to seed state
+/// the live server does not expose via HTTP — e.g. injecting a non-terminal
+/// `scan_runs` row to deterministically trigger the rebuild race guard
+/// (Patch E). Used by the rebuild wire tests.
+fn boot_rebuild_server() -> (u16, String, PathBuf) {
+    let dir = tempfile::tempdir().expect("scratch app-data dir");
+    let source_root = tempfile::tempdir().expect("source root");
+    std::fs::write(source_root.path().join("MEMORY.md"), "# memory\nbody").expect("memory");
+    let state = tessera_lib::boot(dir.path()).expect("boot");
+    let db_path = state.db_path.clone();
+    let source_id = {
+        let conn = state.conn.lock().expect("conn lock");
+        let registry = SourceRegistry::new(&conn);
+        let source = tessera_lib::application::confirm_source(&registry, &CandidateSource {
+            provider: "codex".into(),
+            root_path: source_root.path().to_string_lossy().into_owned(),
+            basis: DiscoveryBasis::CodexHomeEnv,
+            coverage_level: CoverageLevel::Full,
+            native_project: None,
+        })
+        .expect("confirm");
+        tessera_lib::application::scan_source(&registry, &conn, &source.source_id)
+            .expect("initial scan");
+        source.source_id.0
+    };
+    let server = bind("127.0.0.1:0");
+    let port = server.server_addr().to_ip().expect("bound addr").port();
+    std::thread::spawn(move || {
+        let _dir = dir;
+        let _source_root = source_root;
+        serve_with(server, Arc::new(state), PathBuf::from("dist"), Some(port));
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    (port, source_id, db_path)
+}
+
+/// Story 4.4 AC — a successful rebuild returns `200` with a
+/// `RebuildOutcome` envelope naming the number of Confirmed Sources being
+/// re-scanned. The wipe is observable via `/api/inventory` once the
+/// (synchronous, in this single-source case) per-source re-scan settles.
+#[test]
+fn rebuild_returns_200_with_sources_rescanning_count_on_the_wire() {
+    let (port, _source_id, _db_path) = boot_rebuild_server();
+
+    let response = raw_http(
+        port,
+        &format!(
+            "POST /api/index/rebuild HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("response body");
+    let payload = serde_json::from_str::<serde_json::Value>(body).expect("envelope JSON");
+    assert_eq!(payload["api_version"], "1");
+    // Exactly one Confirmed source → one re-scan dispatched.
+    assert_eq!(payload["payload"]["sources_rescanning"], 1);
+    // AD-13/NFR-3: no credential leak in the safe envelope. (The payload is a
+    // pure count; no source path / query text / memory body crosses the wire.)
+    assert!(!body.to_lowercase().contains("credential"));
+}
+
+/// Story 4.4 AC (Patch E — deterministic 409). Rebuild while ANY source has
+/// an in-flight scan run MUST return 409 `rebuild_failed` with a redacted
+/// safe message. The race guard is pinned DETERMINISTICALLY by seeding a
+/// non-terminal `scan_runs` row directly via a separate SQLite connection
+/// (SQLite handles multi-connection fine); the row is `queued` so the
+/// rebuild's `any_in_flight_run` race guard MUST fire. This drops the
+/// 200-acceptance branch the previous version had (the race-loss branch is
+/// not part of the contract — the race guard fires whenever the row exists).
+#[test]
+fn rebuild_returns_409_rebuild_failed_when_a_scan_is_in_flight() {
+    let (port, source_id, db_path) = boot_rebuild_server();
+    let source_rowid: i64 = source_id
+        .strip_prefix("src_")
+        .and_then(|s| s.parse::<i64>().ok())
+        .expect("source_id rowid");
+
+    // Seed a non-terminal `queued` run via a SEPARATE connection. The rebuild
+    // handler will observe it (the state's own connection reads the same
+    // SQLite file) and reject with 409. The row stays `queued` — the rebuild
+    // never runs, so nothing transitions it.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        conn.execute_batch("PRAGMA foreign_keys = ON;").expect("pragma");
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (?1, 'gen_inflight', 'queued', 999, 'gen_inflight', 'inflight')",
+            params![source_rowid],
+        )
+        .expect("seed queued scan_runs row");
+    }
+
+    let response = raw_http(
+        port,
+        &format!(
+            "POST /api/index/rebuild HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ),
+    );
+    // Patch E — deterministic: the race guard MUST fire (no 200-acceptance
+    // branch). Exactly 409 + `rebuild_failed` code + safe message.
+    assert!(
+        response.starts_with("HTTP/1.1 409"),
+        "Patch E: race guard MUST fire deterministically; got:\n{response}"
+    );
+    assert!(
+        response.contains("\"code\":\"rebuild_failed\""),
+        "got:\n{response}"
+    );
+    // The message is the safe, redacted one — no source path / body / query
+    // / credential leak (AD-13/NFR-3).
+    assert!(!response.contains("/fixture"), "no path leak: {response}");
+    assert!(!response.to_lowercase().contains("credential"));
+}
+
+/// Story 4.4 AC (Patch G) — end-to-end rebuild via the LIVE server: boot
+/// with one pre-confirmed + pre-scanned source, POST /api/index/rebuild, then
+/// poll `GET /api/sources/inventory` until the source's record count is
+/// restored to its pre-rebuild value. This pins AC#1 (each Confirmed source
+/// re-scanned to a fresh generation) at the CONSUMPTION surface — a dispatch
+/// bug (wrong scan_id / fencing_token / connection, dropped/panicked worker)
+/// would leave the inventory with a zero count forever, and this test would
+/// time out instead of silently passing.
+#[test]
+fn rebuild_restores_records_via_live_inventory_poll() {
+    let (port, source_id, _db_path) = boot_rebuild_server();
+
+    // Snapshot the pre-rebuild record count via the inventory endpoint so we
+    // know what value to wait for after the rebuild's re-scan settles.
+    let pre_count = {
+        let inv = raw_http(
+            port,
+            &format!("GET /api/sources/inventory HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        );
+        let body = inv.split("\r\n\r\n").nth(1).expect("inv body");
+        let payload = serde_json::from_str::<serde_json::Value>(body).expect("inv JSON");
+        let row = payload["payload"]
+            .as_array()
+            .expect("inv rows")
+            .iter()
+            .find(|row| row["source_id"].as_str() == Some(source_id.as_str()))
+            .expect("source row in inv");
+        row["complete_record_count"]
+            .as_i64()
+            .expect("count is a number")
+    };
+    assert!(
+        pre_count > 0,
+        "fixture: pre-rebuild source has indexed records ({pre_count})"
+    );
+
+    // POST the rebuild — returns immediately after wipe + dispatch.
+    let response = raw_http(
+        port,
+        &format!(
+            "POST /api/index/rebuild HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+
+    // Poll inventory until the source's record count is restored. Bounded
+    // retry so a runaway dispatch surfaces as a test failure rather than a
+    // hang. The Codex scan is fast (one-file fixture); 5 seconds is plenty.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut restored = false;
+    while std::time::Instant::now() < deadline {
+        let inv = raw_http(
+            port,
+            &format!("GET /api/sources/inventory HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        );
+        let body = inv.split("\r\n\r\n").nth(1).expect("inv body");
+        let payload = serde_json::from_str::<serde_json::Value>(body).expect("inv JSON");
+        if let Some(row) = payload["payload"]
+            .as_array()
+            .expect("inv rows")
+            .iter()
+            .find(|row| row["source_id"].as_str() == Some(source_id.as_str()))
+        {
+            if row["complete_record_count"].as_i64() == Some(pre_count) {
+                restored = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        restored,
+        "Patch G: rebuild did not restore records via the live inventory within 5s (dispatch bug?)"
+    );
+}
+
+/// Story 4.4 AC (Patch F) — per-source progress flows through the existing
+/// `rescan_jobs` map + `GET /api/sources/rescan/events` SSE channel during a
+/// rebuild (Boundaries Always #5). Pins the queued→running→(succeeded|failed)
+/// progression at the wire level so a regression that bypasses
+/// `rescan_jobs` (e.g. spawning workers that emit progress somewhere else)
+/// would surface here.
+#[test]
+fn rebuild_per_source_progress_surfaces_via_rescan_events_sse() {
+    let (port, source_id, db_path) = boot_rebuild_server();
+
+    // POST the rebuild — returns immediately after wipe + dispatch.
+    let response = raw_http(
+        port,
+        &format!(
+            "POST /api/index/rebuild HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+
+    // The job_id scheme is `job_<scan_id>` (mirrors start_rescan). We don't
+    // know the scan_id up front (AUTOINCREMENT after the wipe). Read it from
+    // scan_runs via a separate connection (the rebuild's reserved run is the
+    // highest id for this source because the wipe cleared every prior row).
+    let source_rowid: i64 = source_id
+        .strip_prefix("src_")
+        .and_then(|s| s.parse::<i64>().ok())
+        .expect("source_id rowid");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let job_id = loop {
+        if std::time::Instant::now() > deadline {
+            panic!("Patch F: rebuild did not reserve a scan_run within 2s");
+        }
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        if let Ok(latest_scan_id) = conn.query_row::<i64, _, _>(
+            "SELECT id FROM scan_runs WHERE source_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![source_rowid],
+            |row| row.get(0),
+        ) {
+            let _ = conn;
+            break format!("job_{latest_scan_id}");
+        }
+        let _ = conn;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+
+    // Poll the SSE channel until we see at least queued + (running OR
+    // terminal). Bounded retry so a runaway dispatch surfaces as a test
+    // failure rather than a hang. The Codex scan is fast (one-file fixture).
+    let inner_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut seen_queued = false;
+    let mut seen_running = false;
+    let mut seen_terminal = false;
+    while std::time::Instant::now() < inner_deadline {
+        let sse = raw_http(
+            port,
+            &format!(
+                "GET /api/sources/rescan/events?source_id={source_id}&job_id={job_id}&after=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+            ),
+        );
+        if sse.starts_with("HTTP/1.1 200") {
+            if sse.contains("\"state\":\"queued\"") {
+                seen_queued = true;
+            }
+            if sse.contains("\"state\":\"running\"") {
+                seen_running = true;
+            }
+            if sse.contains("\"state\":\"succeeded\"")
+                || sse.contains("\"state\":\"failed\"")
+                || sse.contains("\"state\":\"cancelled\"")
+            {
+                seen_terminal = true;
+            }
+            if seen_queued && (seen_running || seen_terminal) {
+                // Progression pinned: queued + at least one later event.
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!(
+        "Patch F: SSE did not reach queued->running/terminal within 3s (queued={}, running={}, terminal={})",
+        seen_queued, seen_running, seen_terminal
+    );
+}
+
+

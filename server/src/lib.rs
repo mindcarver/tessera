@@ -31,7 +31,7 @@ pub use http::envelope::{Envelope, ErrorEnvelope, Pong, API_VERSION};
 pub use http::{
     browse, cancel_rescan_request, confirm_source, disable_source, discover_sources,
     get_scan_status, list_sources, open_original_location, ping, reject_source, scan_source,
-    search, source_inventory, start_rescan,
+    search, source_inventory, start_rebuild, start_rescan,
 };
 
 use std::collections::HashMap;

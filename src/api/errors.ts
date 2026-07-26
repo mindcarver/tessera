@@ -34,6 +34,10 @@ export const TESSERA_STABLE_ERROR_CODES: ReadonlySet<string> = new Set([
   "record_not_found",
   "open_failed",
   "rescan_not_running",
+  // Story 4.4: rebuild was rejected because a scan is currently in-flight
+  // across any source. The previous index is unchanged; the user should wait
+  // for or cancel the in-flight scan, then retry the rebuild.
+  "rebuild_failed",
 ]);
 
 /**

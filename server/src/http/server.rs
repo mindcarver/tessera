@@ -44,7 +44,7 @@ use crate::domain::CandidateSource;
 use crate::http::{
     browse, cancel_rescan_request, confirm_source, disable_source, discover_sources,
     get_scan_status, list_sources, open_original_location, ping, rebind_source, reject_source,
-    rescan_events, scan_source, search, source_inventory, start_rescan,
+    rescan_events, scan_source, search, source_inventory, start_rebuild, start_rescan,
 };
 use crate::IndexState;
 
@@ -178,6 +178,17 @@ fn route(
         }
         (Method::Get, "/api/sources") => respond_result(request, list_sources(state)),
         (Method::Get, "/api/sources/inventory") => respond_result(request, source_inventory(state)),
+        // Story 4.4 — Derived Index rebuild. Atomically wipes
+        // `memory_records` + `scan_runs` + `scan_diagnostics` +
+        // `tessera_meta` rows matching `active_generation:%` (preserving
+        // `source_registry`, `schema_version`, `tessera_migrations_applied`,
+        // and any other `tessera_meta` key), then re-scans every Confirmed
+        // Source by reusing the existing scan pipeline. Returns 409
+        // `rebuild_failed` when a scan is currently in-flight across ANY
+        // source (the primary race guard).
+        (Method::Post, "/api/index/rebuild") => {
+            respond_result(request, start_rebuild(state))
+        }
         (Method::Post, "/api/sources/rescan") => {
             let source_id = match read_source_id_body(&mut request) {
                 Ok(id) => id,
@@ -638,9 +649,8 @@ fn respond_result<T: serde::Serialize>(
             let status = match error.code.as_str() {
                 "bad_request" => StatusCode(400),
                 "source_not_found" | "record_not_found" => StatusCode(404),
-                "confirm_failed" | "scan_failed" | "cursor_stale" | "open_failed" => {
-                    StatusCode(409)
-                }
+                "confirm_failed" | "scan_failed" | "cursor_stale" | "open_failed"
+                | "rebuild_failed" => StatusCode(409),
                 _ => StatusCode(500),
             };
             request.respond(json_response(status, &error))
