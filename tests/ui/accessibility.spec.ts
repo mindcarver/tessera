@@ -1024,6 +1024,237 @@ test("browse surfaces partial-unavailability banner and recovers from cursor_sta
 });
 
 /**
+ * Story 4.4 — the rebuild action is keyboard-reachable (AD-21) and is
+ * preceded by a clear warning BEFORE the destructive call. Activating the
+ * "Rebuild index" button reveals an inline confirm region (no modal infra
+ * exists in the app) carrying a `role="alert"` warning that names exactly
+ * what is and is not deleted (only Tessera-derived index data; Confirmed
+ * sources + project mappings are kept; source files are never modified).
+ *
+ * The destructive call ("Rebuild now") is a SEPARATE explicit activation —
+ * the warning is announced BEFORE the call, and Esc / "Cancel" closes the
+ * region without firing it. After "Rebuild now", a polite `aria-live`
+ * `data-testid="rebuild-status"` region announces "Rebuilding…", and the
+ * inventory re-fetches so the post-rebuild state renders.
+ *
+ * Keyboard contract (AD-21): every step is keyboard-reachable (focus the
+ * button → Enter → focus moves into the confirm region → Tab to "Rebuild
+ * now" → Enter → observe status + post-rebuild inventory).
+ */
+test("rebuild action is keyboard-reachable with a clear warning before the destructive call", async ({ page }) => {
+  // Mock empty discover + inventory so the Sources view renders without
+  // depending on the host filesystem. The rebuild flow runs entirely against
+  // the rebuild endpoint mock.
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: [
+          {
+            source_id: "src_1",
+            provider: "codex",
+            lifecycle_state: "confirmed",
+            root: "/fixture/codex",
+            native_project: null,
+            coverage_level: "full",
+            health_state: "healthy",
+            last_successful_scan: 100,
+            complete_record_count: 1,
+            latest_error: null,
+          },
+        ],
+      }),
+    }),
+  );
+
+  let rebuildCalls = 0;
+  await page.route("**/api/index/rebuild", async (route) => {
+    rebuildCalls += 1;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: { sources_rescanning: 1 } }),
+    });
+  });
+
+  await page.goto("/");
+
+  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
+
+  // The "Rebuild index" button is keyboard-reachable.
+  const rebuildButton = inventoryRegion.getByRole("button", { name: "Rebuild index", exact: true });
+  await expect(rebuildButton).toBeVisible();
+  await rebuildButton.focus();
+  await page.keyboard.press("Enter");
+
+  // The inline confirm region renders with a `role="alert"` warning BEFORE
+  // any destructive call is dispatched. The warning names exactly what is
+  // and is not deleted.
+  const confirmRegion = inventoryRegion.getByRole("group", { name: "Rebuild index confirmation" });
+  await expect(confirmRegion).toBeVisible();
+  const warning = confirmRegion.getByRole("alert");
+  await expect(warning).toBeVisible();
+  await expect(warning).toContainText("Tessera-derived index data");
+  await expect(warning).toContainText("Confirmed sources");
+  await expect(warning).toContainText("project mappings");
+  await expect(warning).toContainText("Source files are never modified");
+  // Focus moved into the confirm region so a keyboard user lands on the
+  // warning before reaching the destructive action.
+  await expect(confirmRegion).toBeFocused();
+
+  // The destructive "Rebuild now" button is a SEPARATE explicit activation —
+  // pressing it (NOT the outer "Rebuild index") is what fires the call. Pin
+  // zero calls before this activation.
+  expect(rebuildCalls).toBe(0);
+  const rebuildNow = confirmRegion.getByRole("button", { name: "Rebuild now", exact: true });
+  await rebuildNow.focus();
+  const rebuildResponse = page.waitForResponse(
+    (response) => response.url().endsWith("/api/index/rebuild") && response.request().method() === "POST",
+  );
+  await page.keyboard.press("Enter");
+  expect((await rebuildResponse).status()).toBe(200);
+
+  // The polite rebuild-status region announces "Rebuilding…".
+  await expect(page.getByTestId("rebuild-status")).toContainText("Rebuilding");
+
+  // The "Rebuild now" activation dispatched exactly one rebuild call.
+  expect(rebuildCalls).toBe(1);
+});
+
+/**
+ * Story 4.4 (Esc closes the confirm region) — the keyboard exit contract.
+ * After opening the confirm region, Esc closes it without firing the
+ * destructive call. Belt-and-suspenders with the explicit "Cancel" button.
+ */
+test("rebuild confirm region closes on Escape without firing the destructive call", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: [
+          {
+            source_id: "src_1",
+            provider: "codex",
+            lifecycle_state: "confirmed",
+            root: "/fixture/codex",
+            native_project: null,
+            coverage_level: "full",
+            health_state: "healthy",
+            last_successful_scan: 100,
+            complete_record_count: 1,
+            latest_error: null,
+          },
+        ],
+      }),
+    }),
+  );
+  let rebuildCalls = 0;
+  await page.route("**/api/index/rebuild", async (route) => {
+    rebuildCalls += 1;
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: { sources_rescanning: 1 } }) });
+  });
+  await page.goto("/");
+
+  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
+  const rebuildButton = inventoryRegion.getByRole("button", { name: "Rebuild index", exact: true });
+  await rebuildButton.focus();
+  await page.keyboard.press("Enter");
+
+  const confirmRegion = inventoryRegion.getByRole("group", { name: "Rebuild index confirmation" });
+  await expect(confirmRegion).toBeVisible();
+
+  // Esc closes the confirm region.
+  await page.keyboard.press("Escape");
+  await expect(confirmRegion).toHaveCount(0);
+
+  // The destructive call was NOT fired.
+  expect(rebuildCalls).toBe(0);
+
+  // The explicit Cancel button also closes the region without firing the call.
+  await rebuildButton.focus();
+  await page.keyboard.press("Enter");
+  await expect(confirmRegion).toBeVisible();
+  const cancelButton = inventoryRegion.getByRole("button", { name: "Cancel", exact: true });
+  await cancelButton.focus();
+  await page.keyboard.press("Enter");
+  await expect(confirmRegion).toHaveCount(0);
+  expect(rebuildCalls).toBe(0);
+});
+
+/**
+ * Story 4.4 — a 409 `rebuild_failed` envelope surfaces as a `role="alert"`
+ * safe message so the user knows to wait or cancel the in-flight scan before
+ * retrying. The safe message is the structured envelope's `message`, NOT a
+ * raw diagnostic; no source path / body / query / credential leak.
+ */
+test("rebuild 409 surfaces a safe rebuild_failed alert", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: [
+          {
+            source_id: "src_1",
+            provider: "codex",
+            lifecycle_state: "confirmed",
+            root: "/fixture/codex",
+            native_project: null,
+            coverage_level: "full",
+            health_state: "healthy",
+            last_successful_scan: 100,
+            complete_record_count: 1,
+            latest_error: null,
+          },
+        ],
+      }),
+    }),
+  );
+  await page.route("**/api/index/rebuild", async (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        code: "rebuild_failed",
+        message: "A scan is in progress. Wait for it to finish or cancel it, then rebuild again.",
+        source_id: null,
+        phase: "rebuild",
+      }),
+    }),
+  );
+  await page.goto("/");
+
+  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
+  const rebuildButton = inventoryRegion.getByRole("button", { name: "Rebuild index", exact: true });
+  await rebuildButton.focus();
+  await page.keyboard.press("Enter");
+
+  const confirmRegion = inventoryRegion.getByRole("group", { name: "Rebuild index confirmation" });
+  await expect(confirmRegion).toBeVisible();
+  const rebuildNow = confirmRegion.getByRole("button", { name: "Rebuild now", exact: true });
+  await rebuildNow.focus();
+  await page.keyboard.press("Enter");
+
+  // The 409 surfaces as a `role="alert"` with the safe envelope message. No
+  // raw diagnostic / body / credential leak.
+  const alert = inventoryRegion.getByRole("alert").last();
+  await expect(alert).toContainText("scan is in progress");
+  const body = (await alert.textContent()) ?? "";
+  expect(body.toLowerCase()).not.toContain("credential");
+});
+
+/**
  * Story 3.2 — Browse's memory-type filter is keyboard-reachable (AD-21):
  * enter Browse from the Inventory via keyboard, focus + selectOption the
  * memory-type filter, assert the narrowed `listitem` count and the

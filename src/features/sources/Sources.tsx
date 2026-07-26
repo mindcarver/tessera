@@ -9,6 +9,7 @@ import {
   type SourceInventory,
 } from "../../api/sources";
 import { cancelRescan, getRescanProgress, startRescan, type RescanProgress } from "../../api/scan";
+import { rebuildIndex } from "../../api/index";
 import { readTesseraErrorMessage } from "../../api/errors";
 import { providerDisplayName } from "../../components/providerDisplayName";
 
@@ -43,6 +44,24 @@ export function Sources({ onBrowse }: SourcesProps = {}): ReactElement {
   const [inventory, setInventory] = useState<LoadState<SourceInventory[]>>({ kind: "loading" });
   const [progress, setProgress] = useState<Record<string, RescanProgress>>({});
   const [message, setMessage] = useState("");
+  // Story 4.4 — Rebuild confirm region + in-flight status. `rebuildConfirm`
+  // toggles the inline confirm region (no modal infra exists). `rebuildStatus`
+  // is the polite `aria-live` announcement ("Rebuilding…"); `rebuildError`
+  // surfaces a `rebuild_failed` (409) envelope so the user knows to wait or
+  // cancel the in-flight scan. `rebuilding` disables the button while in
+  // flight so a double-click cannot race the dispatch.
+  const [rebuildConfirm, setRebuildConfirm] = useState(false);
+  const [rebuildStatus, setRebuildStatus] = useState<string>("");
+  const [rebuildError, setRebuildError] = useState<string>("");
+  const rebuilding = rebuildStatus !== "";
+  // Patch UI — the rebuild settle-poll uses a `pollToken` to break the
+  // setTimeout chain when the user is done. Lifted into a ref + cleared on
+  // unmount so the per-tick inventory fetch + setTimeout chain stop when the
+  // component unmounts (otherwise a slow post-unmount tick would call
+  // setInventory/setRebuildStatus on an unmounted component, a React warning
+  // + a leaked fetch).
+  const rebuildPollTokenRef = useRef<{ stop: boolean }>({ stop: false });
+  const rebuildConfirmRef = useRef<HTMLDivElement>(null);
   const timers = useRef<Record<string, number>>({});
 
   const refresh = useCallback(() => {
@@ -103,6 +122,125 @@ export function Sources({ onBrowse }: SourcesProps = {}): ReactElement {
     request.then(() => refresh()).catch((error: unknown) => setMessage(readTesseraErrorMessage(error)));
   }, [refresh]);
 
+  // Story 4.4 — open the rebuild confirm region (focus moves into it so the
+  // keyboard user hears the warning before any destructive call). a11y
+  // contract (AD-21): the warning is `role="alert"`, the region is
+  // keyboard-reachable, and the destructive action is a separate explicit
+  // "Rebuild now" activation (no implicit confirm).
+  const openRebuildConfirm = useCallback(() => {
+    setRebuildConfirm(true);
+    setRebuildError("");
+    // Move focus into the confirm region on the next tick (after render).
+    window.setTimeout(() => rebuildConfirmRef.current?.focus(), 0);
+  }, []);
+
+  const cancelRebuildConfirm = useCallback(() => {
+    setRebuildConfirm(false);
+    setRebuildError("");
+  }, []);
+
+  // Story 4.4 — confirm the rebuild. The wipe runs server-side; once the
+  // response arrives, the per-source re-scans have been dispatched. Clear
+  // "Rebuilding…" status after a bounded number of inventory refreshes so a
+  // slow re-scan cannot wedge the indicator forever. Per-source progress is
+  // visible via the existing inventory row's `last_successful_scan` /
+  // `latest_error` columns and via the per-source rescan SSE if the user
+  // starts a separate rescan (the rebuild's worker threads emit progress
+  // into the same `rescan_jobs` map, but the rebuild UI intentionally does
+  // not subscribe to every source's SSE channel — the inventory refresh is
+  // the cross-source "settled" signal the spec Design Names).
+  const confirmRebuild = useCallback(() => {
+    setRebuildError("");
+    setRebuildStatus("Rebuilding…");
+    setRebuildConfirm(false);
+    // Patch UI — reset the poll token; the unmount effect (or the next
+    // confirmRebuild) is responsible for stopping any prior poll chain.
+    rebuildPollTokenRef.current = { stop: false };
+    const pollToken = rebuildPollTokenRef.current;
+    rebuildIndex()
+      .then((outcome) => {
+        // If the component unmounted (or a new rebuild started) while we
+        // were waiting on the response, bail before touching state.
+        if (pollToken.stop) return;
+        const expected = outcome.payload.sources_rescanning;
+        // No re-scans to wait for: clear status immediately after refreshing
+        // inventory (the wipe still ran, clearing any leaked disabled /
+        // rejected records — the inventory refresh shows the empty index).
+        if (expected === 0) {
+          refresh();
+          // Keep the "Rebuilding…" announcement visible briefly so the
+          // screen-reader user hears the operation ran, then clear.
+          window.setTimeout(() => {
+            if (!pollToken.stop) setRebuildStatus("");
+          }, 800);
+          return;
+        }
+        // Poll inventory at a bounded cadence. After a small number of
+        // refreshes, clear the status indicator regardless of whether every
+        // re-scan has reached a terminal state — the per-source rows surface
+        // their own health / latest_error, so the user can see ongoing
+        // failures there. This avoids the indicator wedging forever on a
+        // slow / stuck re-scan.
+        const POLL_INTERVAL_MS = 500;
+        const POLL_MAX_TICKS = 20; // ~10 seconds at 500ms
+        let ticks = 0;
+        const tick = () => {
+          if (pollToken.stop) return;
+          ticks += 1;
+          getSourceInventory()
+            .then((result) => {
+              if (pollToken.stop) return;
+              setInventory({ kind: "ok", value: result.payload });
+            })
+            .catch(() => {
+              // Inventory fetch failed mid-rebuild — keep the rebuild
+              // status visible so the user knows the operation may still
+              // be in flight; they can manually refresh.
+            })
+            .finally(() => {
+              if (pollToken.stop) return;
+              if (ticks >= POLL_MAX_TICKS) {
+                pollToken.stop = true;
+                setRebuildStatus("");
+                return;
+              }
+              window.setTimeout(tick, POLL_INTERVAL_MS);
+            });
+        };
+        // Refresh once immediately so the wipe is reflected, then poll.
+        refresh();
+        window.setTimeout(tick, POLL_INTERVAL_MS);
+      })
+      .catch((error: unknown) => {
+        if (pollToken.stop) return;
+        setRebuildStatus("");
+        setRebuildError(readTesseraErrorMessage(error));
+      });
+  }, [refresh]);
+
+  // Patch UI — stop the rebuild poll chain on unmount so a slow tick + its
+  // inventory fetch do not fire after the component is gone (React warning +
+  // leaked fetch).
+  useEffect(() => {
+    return () => {
+      rebuildPollTokenRef.current.stop = true;
+    };
+  }, []);
+
+  // Esc closes the rebuild confirm region (a11y contract — keyboard exit).
+  useEffect(() => {
+    if (!rebuildConfirm) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setRebuildConfirm(false);
+        setRebuildError("");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [rebuildConfirm]);
+
   return <section aria-label="Tessera sources">
     <h2>Sources</h2>
     <p aria-live="polite" data-testid="rescan-progress" className="visually-hidden-text">{message}</p>
@@ -115,6 +253,50 @@ export function Sources({ onBrowse }: SourcesProps = {}): ReactElement {
     </section>
     <section aria-label="Source inventory" aria-busy={inventory.kind === "loading"}>
       <h3>Inventory</h3>
+      {/*
+        Story 4.4 — keyboard-reachable "Rebuild index" button in the inventory
+        header. Activating it opens an INLINE confirm region (no modal infra
+        exists in the app — `grep -r 'role="dialog"' src/` returns zero). The
+        region carries a `role="alert"` warning so the user is clearly told
+        BEFORE the destructive call that only Tessera-derived data is deleted
+        (Confirmed sources and project mappings are kept, source files are
+        never modified). The destructive action is a separate explicit
+        "Rebuild now" activation; Esc / "Cancel" closes the region.
+        Disabled while a rebuild is in flight so a double-click cannot race
+        the dispatch (the server's race guard already rejects concurrent
+        rebuilds with 409 `rebuild_failed`; this is belt-and-suspenders).
+      */}
+      <p>
+        <button
+          type="button"
+          onClick={openRebuildConfirm}
+          disabled={rebuilding}
+          aria-expanded={rebuildConfirm}
+          aria-controls="rebuild-confirm-region"
+        >Rebuild index</button>
+      </p>
+      {rebuildConfirm ? (
+        <div
+          id="rebuild-confirm-region"
+          ref={rebuildConfirmRef}
+          tabIndex={-1}
+          role="group"
+          aria-label="Rebuild index confirmation"
+        >
+          <p role="alert">
+            Deletes only Tessera-derived index data. Confirmed sources and project mappings are kept. Source files are never modified.
+          </p>
+          <button type="button" onClick={confirmRebuild}>Rebuild now</button>
+          {" "}
+          <button type="button" onClick={cancelRebuildConfirm}>Cancel</button>
+        </div>
+      ) : null}
+      {rebuildStatus ? (
+        <p data-testid="rebuild-status" role="status" aria-live="polite">{rebuildStatus}</p>
+      ) : null}
+      {rebuildError ? (
+        <p role="alert">{rebuildError}</p>
+      ) : null}
       {inventory.kind === "loading" ? <p>Loading source inventory…</p> : null}
       {inventory.kind === "error" ? <p role="alert">{inventory.message}</p> : null}
       {inventory.kind === "ok" && inventory.value.length === 0 ? <p>No sources have been confirmed yet.</p> : null}

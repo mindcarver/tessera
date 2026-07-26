@@ -185,6 +185,23 @@ impl ErrorEnvelope {
             "scan",
         )
     }
+
+    /// Story 4.4 — construct a `rebuild_failed` envelope for the in-flight
+    /// rejection (the primary race guard: a scan is already mid-flight across
+    /// any source, so the wipe cannot proceed safely). Stable code per AD-13;
+    /// the safe message never includes body / query text / credentials or any
+    /// source file path. Maps to HTTP 409 via the existing `respond_result`
+    /// convention at `server.rs` (alongside `scan_failed` / `confirm_failed` /
+    /// `cursor_stale`). The UI tells the user to wait for or cancel the
+    /// in-flight scan, then retry the rebuild.
+    pub fn rebuild_failed() -> Self {
+        Self::new(
+            "rebuild_failed",
+            "A scan is in progress. Wait for it to finish or cancel it, then rebuild again.",
+            None,
+            "rebuild",
+        )
+    }
 }
 
 #[cfg(test)]

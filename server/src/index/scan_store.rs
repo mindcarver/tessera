@@ -478,6 +478,86 @@ impl<'a> ScanStore<'a> {
         Ok(count > 0)
     }
 
+    /// True iff at least one run ACROSS ALL sources is currently in a non-
+    /// terminal state (`queued`/`running`/`staging`/`committing`). Story 4.4's
+    /// rebuild uses this as its primary race guard: a rebuild is rejected with
+    /// `rebuild_failed` (409) when any source has an in-flight run, preventing
+    /// a wipe mid-pipeline (a scan that has already staged data would otherwise
+    /// find its `scan_runs` row deleted and its staged rows reclaimed). Sibling
+    /// to [`Self::has_in_flight_run`]: that enforces the per-source single-
+    /// owner gate; this enforces the global "no scan is mid-flight" gate.
+    pub fn any_in_flight_run(&self) -> rusqlite::Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM scan_runs
+             WHERE state IN (?1, ?2, ?3, ?4)",
+            params![
+                ScanRunState::Queued.as_str(),
+                ScanRunState::Running.as_str(),
+                ScanRunState::Staging.as_str(),
+                ScanRunState::Committing.as_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Story 4.4 — wipe exactly the Tessera-derived tables in ONE transaction
+    /// (the AD-29 reset boundary promoted to a repeatable runtime operation).
+    /// Mirrors the v3 schema-migration wipe at `migrations::v3_canonical_memory_records`
+    /// (`migrations.rs:270-272`), but ADDS `scan_diagnostics` (which v3
+    /// predates) and is callable at runtime (no migration id, no audit row).
+    ///
+    /// Deletes EXACTLY:
+    /// - every `memory_records` row,
+    /// - every `scan_runs` row,
+    /// - every `scan_diagnostics` row,
+    /// - every `tessera_meta` row whose key matches `active_generation:%`.
+    ///
+    /// Preserves (MUST NOT touch):
+    /// - `source_registry` (Confirmed / Disabled / Rejected rows carry the
+    ///   user's confirmation decisions and must survive a rebuild),
+    /// - `tessera_meta.schema_version` (the migration state — touching it
+    ///   would re-run every migration),
+    /// - `tessera_migrations_applied` (the migration audit log),
+    /// - any other `tessera_meta` key (e.g. `schema_version`, and any future
+    ///   Tessera Project mapping revision).
+    ///
+    /// `tessera_meta` is a MIXED table (it carries the schema version AND
+    /// active-generation pointers AND future mapping revisions); a blanket
+    /// `DELETE FROM tessera_meta` would destroy the schema version, so the
+    /// WHERE clause is keyed on the `active_generation:` prefix.
+    ///
+    /// Patch D: the prefix match uses `substr(key, 1, ?) = ?` bound to the
+    /// literal `ACTIVE_GENERATION_KEY_PREFIX` (length + string). A `LIKE
+    /// 'active_generation:%'` would treat `_` as a single-char wildcard, so a
+    /// hypothetical `activeXgeneration:1` key would be wrongly deleted.
+    /// substr-based prefix equality matches the prefix LITERALLY (the spec's
+    /// "EXACTLY `active_generation:%`"). Stays one statement inside the same
+    /// transaction.
+    ///
+    /// Returns `Ok(())` on a successful wipe. A SQLite error (e.g. disk-full)
+    /// surfaces as `Err(_)` and rolls the whole transaction back — the index
+    /// is unchanged.
+    pub fn reset_derived_data(&self) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM memory_records", [])?;
+        tx.execute("DELETE FROM scan_runs", [])?;
+        tx.execute("DELETE FROM scan_diagnostics", [])?;
+        // Patch D — literal prefix match. The bound pair `(prefix_len,
+        // prefix_str)` makes SQLite compare the first N characters of `key`
+        // against the prefix string with NO wildcard interpretation. `_`
+        // (underscore) is no longer special-cased.
+        tx.execute(
+            "DELETE FROM tessera_meta WHERE substr(key, 1, ?1) = ?2",
+            params![
+                i64::try_from(ACTIVE_GENERATION_KEY_PREFIX.len()).unwrap_or(i64::MAX),
+                ACTIVE_GENERATION_KEY_PREFIX
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Cancel this exact reserved run. Job cancellation must never target a
     /// later rescan for the same Source, even if a stale UI action arrives.
     pub fn cancel_run(&self, scan_id: i64, source_rowid: i64) -> rusqlite::Result<bool> {

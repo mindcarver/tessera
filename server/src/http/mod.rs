@@ -437,6 +437,221 @@ pub fn start_rescan(
     })
 }
 
+/// Story 4.4 — `POST /api/index/rebuild` payload. Carries the number of
+/// Confirmed Sources being re-scanned (`0` when the registry has no
+/// Confirmed Sources — the wipe still ran, clearing any leaked disabled /
+/// rejected records). Mirrors the spec's `200 {sources_rescanning: N}`
+/// response shape.
+#[derive(Debug, serde::Serialize)]
+pub struct RebuildOutcome {
+    /// Count of Confirmed Sources the rebuild dispatched a re-scan for.
+    pub sources_rescanning: u32,
+}
+
+/// Story 4.4 — full Derived Index rebuild (AD-29 reset boundary promoted to a
+/// repeatable runtime operation).
+///
+/// Critical section (spec Boundaries — "Reserve the rebuild's per-source runs
+/// UNDER the IndexState mutex ... so reconcile cannot grab any Confirmed
+/// source between the wipe and the rebuild's dispatch"):
+/// 1. Acquire the synchronous request mutex.
+/// 2. `application::rebuild_index(&conn)` — race guard (`any_in_flight_run` →
+///    409 `rebuild_failed`), atomic four-target wipe (`memory_records` +
+///    `scan_runs` + `scan_diagnostics` + `tessera_meta` rows matching
+///    `active_generation:%`), enumerate Confirmed Source ids. Preserves
+///    `source_registry`, `tessera_meta.schema_version`,
+///    `tessera_migrations_applied`, and any other `tessera_meta` key.
+/// 3. Reserve a run per Confirmed Source via `ScanStore::begin_run` UNDER the
+///    same mutex (the post-wipe `scan_runs` is empty so the single-owner gate
+///    is trivially satisfied; reconcile cannot grab any of these sources
+///    between the wipe and the dispatch).
+/// 4. Release the mutex BEFORE spawning workers (NFR-12: queries stay
+///    available during the rebuild — the synchronous request mutex is held
+///    only for the wipe + reservation, not for the FS work).
+///
+/// Worker fan-out: each reservation spawns a thread that opens its own
+/// `rusqlite::Connection` and reuses [`application::scan_reserved_source`] —
+/// exactly the [`start_rescan`] pattern. Per-source progress flows through the
+/// existing `rescan_jobs` map so the existing `GET /api/sources/rescan/events`
+/// SSE surface works with no new transport (spec Design Notes — "Why reuse
+/// `rescan_jobs` + existing SSE, not a new channel"). Existing 4.2 source-
+/// scoped error isolation applies: a source that fails to re-scan is marked
+/// degraded/error + cause + last-success + stale per 4.2; other sources still
+/// rebuild.
+pub fn start_rebuild(
+    state: &std::sync::Arc<IndexState>,
+) -> Result<Envelope<RebuildOutcome>, ErrorEnvelope> {
+    // Critical section: hold the synchronous request mutex for the wipe + the
+    // per-source begin_run reservations. Releasing the mutex before spawning
+    // workers keeps queries available during the per-source FS work (NFR-12).
+    let reservations: Vec<(SourceId, i64, i64, crate::domain::scan::Generation)> = {
+        let conn = lock_conn(state)?;
+        // Race guard + atomic wipe + collect Confirmed ids. The race guard is
+        // the primary correctness check: any in-flight scan would race with
+        // the wipe, so we reject up front with a 409 the UI can act on.
+        let confirmed = application::rebuild_index(&conn).map_err(|err| match err {
+            application::RebuildError::InFlight => ErrorEnvelope::rebuild_failed(),
+            application::RebuildError::Internal => {
+                ErrorEnvelope::internal_for(None, "rebuild")
+            }
+        })?;
+        // Reserve a run for each Confirmed Source UNDER the same mutex. The
+        // registry was just enumerated by `rebuild_index`, so each id is
+        // known to exist and be Confirmed; `has_in_flight_run` is trivially
+        // false after the wipe (`scan_runs` is empty), so we skip the choke-
+        // point check and call `begin_run` directly. `reserve_run` would re-
+        // acquire the mutex (deadlock under std::Mutex), so we inline its
+        // body minus the redundant checks.
+        //
+        // Patch A — on `begin_run` Err, BEFORE returning the error, clean up
+        // every previously-reserved `queued` row in this same critical
+        // section. Without this, the wipe already committed but the
+        // already-reserved rows stay `queued` with no worker ever spawned →
+        // `any_in_flight_run()` returns true forever → every later rebuild
+        // rejects 409 until process reboot (`recover_stale_runs` is boot-
+        // only). Cleanup is best-effort (a clean failure here just leaves
+        // the row for the next boot's recovery, matching the existing
+        // "transient failures stay queued until boot" posture in
+        // `application::reconcile::fail_reserved_run_from_main_conn`).
+        let store = ScanStore::new(&conn);
+        let mut reserved = Vec::with_capacity(confirmed.len());
+        let mut reservation_failed: Option<SourceId> = None;
+        for source_id in &confirmed {
+            let Some(rowid) = ScanStore::source_rowid(source_id) else {
+                continue;
+            };
+            match store.begin_run(rowid, "pending") {
+                Ok((scan_id, fencing_token, generation)) => {
+                    reserved.push((source_id.clone(), scan_id, fencing_token, generation));
+                }
+                Err(_) => {
+                    reservation_failed = Some(source_id.clone());
+                    break;
+                }
+            }
+        }
+        if let Some(failed_id) = reservation_failed {
+            // Best-effort cleanup of every `queued` row this loop reserved.
+            // `fail_run` is the right primitive (vs. raw DELETE) because it
+            // also clears any in-flight staging rows the reservation may have
+            // produced — but post-wipe `scan_runs` is empty before
+            // `begin_run`, so a queued reservation has not yet staged any
+            // rows; `fail_run` is still the canonical "this run is dead"
+            // transition and stays correct if a future change adds staging
+            // before spawn. The accumulated scan_ids are the only ones ever
+            // produced by this rebuild dispatch; no other run is touched.
+            for (_, scan_id, _, _) in &reserved {
+                let _ = store.fail_run(*scan_id, "internal");
+            }
+            return Err(ErrorEnvelope::internal_for(
+                Some(&failed_id.0),
+                "rebuild",
+            ));
+        }
+        reserved
+    }; // Synchronous request mutex released here.
+
+    let sources_rescanning = u32::try_from(reservations.len()).unwrap_or(u32::MAX);
+
+    // Pre-populate `rescan_jobs` with a `queued` event per Confirmed Source so
+    // the existing SSE surface works with no new transport. Workers append
+    // `running`/`succeeded`/`failed`/`cancelled` events as they run. Matches
+    // the `start_rescan` pattern.
+    let mut jobs = state
+        .rescan_jobs
+        .lock()
+        .map_err(|_| ErrorEnvelope::internal_for(None, "rebuild"))?;
+    for (source_id, scan_id, _, _) in &reservations {
+        let job_id = format!("job_{scan_id}");
+        let queued = RescanEvent {
+            api_version: API_VERSION,
+            job_id: job_id.clone(),
+            source_id: source_id.0.clone(),
+            sequence: 1,
+            state: "queued".to_string(),
+            message: "Rebuild rescan queued.".to_string(),
+        };
+        jobs.insert(
+            source_id.0.clone(),
+            RescanJob {
+                scan_id: *scan_id,
+                job_id,
+                events: vec![queued],
+                terminal: false,
+            },
+        );
+    }
+    drop(jobs);
+
+    // Fan out: spawn one worker per reservation. Each opens its OWN connection
+    // and reuses `application::scan_reserved_source` — exactly the
+    // `start_rescan` worker pattern. The synchronous request mutex is NOT held
+    // for the FS work (NFR-12).
+    for (source_id, scan_id, fencing_token, generation) in reservations {
+        let worker_state = std::sync::Arc::clone(state);
+        std::thread::spawn(move || {
+            append_rescan_event(
+                &worker_state,
+                &source_id,
+                scan_id,
+                "running",
+                "Rebuild rescan running.",
+            );
+            let result = (|| -> Result<ScanOutcome, ScanError> {
+                let conn = rusqlite::Connection::open(&worker_state.db_path)
+                    .map_err(|_| ScanError::Internal)?;
+                conn.execute_batch("PRAGMA foreign_keys = ON;")
+                    .map_err(|_| ScanError::Internal)?;
+                let registry = SourceRegistry::new(&conn);
+                application::scan_reserved_source(
+                    &registry,
+                    &conn,
+                    &source_id,
+                    scan_id,
+                    fencing_token,
+                    generation,
+                )
+            })();
+            match result {
+                Ok(_) => append_rescan_event(
+                    &worker_state,
+                    &source_id,
+                    scan_id,
+                    "succeeded",
+                    "Rebuild rescan complete.",
+                ),
+                Err(ScanError::Cancelled) => append_rescan_event(
+                    &worker_state,
+                    &source_id,
+                    scan_id,
+                    "cancelled",
+                    "Rebuild rescan cancelled.",
+                ),
+                Err(_) => append_rescan_event(
+                    &worker_state,
+                    &source_id,
+                    scan_id,
+                    "failed",
+                    // Patch C — rebuild-specific failure message. The
+                    // start_rescan worker's "The previous index is
+                    // unchanged." is FALSE in the rebuild context: the wipe
+                    // already cleared every derived row, so a failed re-scan
+                    // leaves this source with NO indexed records until a
+                    // later scan succeeds. Honest about the post-rebuild
+                    // state; the failure cause surfaces on the source's
+                    // inventory row via 4.2's `cause + last_success`.
+                    "Rebuild rescan failed. This source has no indexed records until a later scan succeeds.",
+                ),
+            }
+        });
+    }
+
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: RebuildOutcome { sources_rescanning },
+    })
+}
+
 pub fn cancel_rescan_request(
     source_id: &SourceId,
     state: &IndexState,
