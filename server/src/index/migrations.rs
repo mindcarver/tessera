@@ -69,6 +69,15 @@ pub static MIGRATIONS: &[Migration] = &[
         name: "v5_source_health_cause",
         apply: v5_source_health_cause,
     },
+    // Story 5.1 — Tessera Project mapping layer (local-only explicit
+    // association of provider-native projects into a cross-Agent view). Lives
+    // entirely in Tessera's own SQLite; provider directories/files are never
+    // read-for-write or written.
+    Migration {
+        id: 7,
+        name: "v6_tessera_projects",
+        apply: v6_tessera_projects,
+    },
 ];
 
 /// Ensure the meta tables exist on a fresh DB so [`apply`] can read
@@ -311,6 +320,68 @@ fn v5_source_health_cause(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("ALTER TABLE source_registry ADD COLUMN health_cause TEXT;")
 }
 
+/// v6 (Story 5.1) — Tessera Project mapping layer.
+///
+/// Two new local-only tables record the user-authored explicit association of
+/// provider-native projects into a cross-Agent Tessera Project view:
+/// - `tessera_projects` — the user-created project (`name`, `created_at`,
+///   `updated_at`, all NOT NULL). `id` is AUTOINCREMENT so a deleted project's
+///   `proj_<n>` handle is never reused.
+/// - `project_mappings` — explicit `(provider, native_project)` pairs mapped to
+///   a project. `native_project` is `NULL` for Codex's global store (mirroring
+///   the Source Registry's `native_project` column). The mapping key is the
+///   same native identity already carried on Sources and canonical records, so
+///   projection (Story 5.2) can filter records with a direct
+///   `(provider, native_project) IN (...)` predicate — no copy of canonical
+///   rows, no native-identity change (AD-2).
+///
+/// AD-27 cardinality backstop: the `project_mappings_scope_unique` index
+/// collapses `NULL` (Codex global) to `''` via `COALESCE` so NULL scopes are
+/// unique too, and enforces "within one mapping scope `(provider,
+/// native_project)`, a Native Project belongs to at most one active Tessera
+/// Project" at the storage layer. The application layer pre-checks the scope
+/// inside the transaction to return `mapping_conflict` naming the owning
+/// project (rather than surfacing a raw constraint violation); the index is the
+/// concurrency backstop. Same-project idempotent re-add is the same index: a
+/// duplicate `(provider, COALESCE(native_project,''))` row is the same scope,
+/// so the pre-check returns the existing project's id and the application layer
+/// returns the unchanged view without INSERTing.
+///
+/// Both tables are `STRICT` with snake_case columns, matching the Phase 0
+/// convention. `project_mappings.tessera_project_id` carries
+/// `ON DELETE CASCADE` so deleting a project atomically removes its mappings
+/// (the project store counts the removed mappings inside the same transaction
+/// to satisfy the `delete` I/O matrix row's `removed_mappings` response field).
+/// `PRAGMA foreign_keys = ON` is set on every connection at boot, so the
+/// cascade actually fires.
+fn v6_tessera_projects(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE tessera_projects (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT    NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        ) STRICT;
+
+        CREATE TABLE project_mappings (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            tessera_project_id INTEGER NOT NULL REFERENCES tessera_projects(id) ON DELETE CASCADE,
+            provider           TEXT    NOT NULL,
+            native_project     TEXT,
+            created_at         INTEGER NOT NULL
+        ) STRICT;
+
+        -- AD-27: at most one active project per (provider, native_project).
+        -- COALESCE collapses NULL (Codex global) to '' so NULL scopes are
+        -- unique too. Same-project idempotent re-add is the same index (same
+        -- scope row → application pre-check returns the existing view).
+        CREATE UNIQUE INDEX project_mappings_scope_unique
+            ON project_mappings (provider, COALESCE(native_project, ''));
+        "#,
+    )
+}
+
 /// Apply all pending migrations atomically (AD-29).
 ///
 /// Semantics:
@@ -418,10 +489,11 @@ mod tests {
         // v0_meta (id 1) so schema_version was 1; Story 1.3 appended
         // v1_source_registry (id 2) and Story 1.4 appended v2_scan_generations
         // (id 3), Story 1.5 appended v3_canonical_memory_records (id 4),
-        // Story 1.8 appended durable rescan cancellation (id 5), and Story 4.2
-        // appended the structured source health cause (id 6).
+        // Story 1.8 appended durable rescan cancellation (id 5), Story 4.2
+        // appended the structured source health cause (id 6), and Story 5.1
+        // appended the Tessera Project mapping layer (id 7).
         // The `0` value remains reserved as the pre-migration sentinel.
-        assert_eq!(v, "6");
+        assert_eq!(v, "7");
     }
 
     #[test]
@@ -455,8 +527,8 @@ mod tests {
         // v1_source_registry and Story 1.4 appended v2_scan_generations, so the
         // v3_canonical_memory_records and v4_rescan_cancellation make the
         // idempotent baseline five audit rows; Story 4.2's v5_source_health_cause
-        // brings it to six.
-        assert_eq!(count, 6, "exactly six audit rows after idempotent re-run");
+        // brings it to six; Story 5.1's v6_tessera_projects brings it to seven.
+        assert_eq!(count, 7, "exactly seven audit rows after idempotent re-run");
     }
 
     /// AD-29 / A-7: migration is atomic. If a later migration fails mid-batch,
@@ -467,15 +539,15 @@ mod tests {
     ///
     /// The current shipping migrations are v0_meta (id 1), v1_source_registry
     /// (id 2), v2_scan_generations (id 3), v3_canonical_memory_records (id 4),
-    /// v4_rescan_cancellation (id 5), and v5_source_health_cause (id 6). This
-    /// test starts from a fully-migrated DB and simulates a failing migration
-    /// id 7.
+    /// v4_rescan_cancellation (id 5), v5_source_health_cause (id 6), and
+    /// v6_tessera_projects (id 7). This test starts from a fully-migrated DB
+    /// and simulates a failing migration id 8.
     #[test]
     fn failed_migration_batch_rolls_back_atomically() {
         let mut conn = Connection::open_in_memory().expect("open db");
         apply(&mut conn).expect("all shipping migrations apply on first boot");
 
-        // After all shipping migrations: schema_version = 6, six audit rows.
+        // After all shipping migrations: schema_version = 7, seven audit rows.
         let pre_version: String = conn
             .query_row(
                 "SELECT value FROM tessera_meta WHERE key = 'schema_version'",
@@ -483,7 +555,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema_version readable");
-        assert_eq!(pre_version, "6");
+        assert_eq!(pre_version, "7");
 
         // Simulate a failing follow-up migration. The failing migration
         // writes a sentinel table first, then errors; the atomic batch must
@@ -530,6 +602,11 @@ mod tests {
             },
             Migration {
                 id: 7,
+                name: "v6_tessera_projects",
+                apply: v6_tessera_projects,
+            },
+            Migration {
+                id: 8,
                 name: "partial_then_fail",
                 apply: partial_then_fail,
             },
@@ -586,7 +663,7 @@ mod tests {
             )
             .expect("schema_version still readable after rollback");
         assert_eq!(
-            post_version, "6",
+            post_version, "7",
             "schema_version must not advance on failure"
         );
 
@@ -598,7 +675,7 @@ mod tests {
             )
             .expect("count");
         assert_eq!(
-            audit_count, 6,
+            audit_count, 7,
             "no audit row recorded for the failed migration"
         );
 

@@ -7,7 +7,11 @@
  * with disable) alongside the ping section so the API contract round-trip
  * remains visible. Story 1.6 adds `<Search />` and Story 3.1 adds `<Browse />`
  * — the latter entered from a Source Inventory card via hand-rolled view
- * state (no router, per the spec's "no router" constraint).
+ * state (no router, per the spec's "no router" constraint). Story 5.1 adds
+ * `<Projects />` (Tessera Project create / rename / delete + explicit
+ * `(provider, native_project)` add-mapping / remove-mapping) as a peer
+ * section; the reserved `tessera_project` filter in `<Search />` stays
+ * disabled until Story 5.2 fills the projection slot.
  *
  * Architecture invariants honored here:
  * - AD-1: the shell only calls the versioned loopback HTTP API. It never
@@ -29,6 +33,7 @@ import { ping, type Pong } from "./api/ping";
 import { Sources } from "./features/sources/Sources";
 import { Search } from "./features/search/Search";
 import { Browse } from "./features/browse/Browse";
+import { Projects } from "./features/projects/Projects";
 import { readTesseraErrorMessage } from "./api/errors";
 import { providerDisplayName } from "./components/providerDisplayName";
 
@@ -117,6 +122,7 @@ export function App(): ReactElement {
           })
         }
       />
+      <Projects />
       <Search />
       <section aria-label="API ping status">{renderPingState(state)}</section>
     </main>

@@ -1078,7 +1078,7 @@ fn excerpt(title: &str, body: &str) -> String {
 /// Unix epoch seconds as an `i64`, or `0` if the system clock is before the
 /// epoch (broken RTC). Mirrors the `migrations::unix_seconds_now` style — the
 /// audit column is for human inspection; correctness never depends on it.
-fn unix_seconds_now_i64() -> i64 {
+pub(crate) fn unix_seconds_now_i64() -> i64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_secs() as i64,
         Err(_) => 0,

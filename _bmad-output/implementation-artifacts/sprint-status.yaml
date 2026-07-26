@@ -86,7 +86,7 @@ development_status:
   epic-4-retrospective: optional
 
   # === Epic 5: Tessera Project 跨 Agent 项目联邦视图 ===
-  epic-5: backlog
-  5-1-project-mapping: backlog              # Tessera Project 创建与 Native Project 显式映射
+  epic-5: in-progress
+  5-1-project-mapping: done                 # Tessera Project 创建与 Native Project 显式映射
   5-2-project-projection: backlog           # 按 Tessera Project 浏览与搜索（projection）
   epic-5-retrospective: optional
