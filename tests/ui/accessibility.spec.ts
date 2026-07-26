@@ -373,7 +373,7 @@ test("filter controls narrow results by AND and Clear restores full scope", asyn
   // Story 5.2 — the Tessera-project filter (was a disabled reserved slot in
   // 2.4) is now a live, keyboard-reachable `<select>` populated by
   // `listProjects()`. AD-21 / NFR-13 contract holds with the slot active.
-  const tesseraSlot = page.getByLabel("Tessera project");
+  const tesseraSlot = page.getByLabel("Tessera project", { exact: true });
   await expect(tesseraSlot).toBeVisible();
   await expect(tesseraSlot).toBeEnabled();
   // Keyboard-reachability: focus the select; it claims focus.
@@ -686,8 +686,12 @@ test("multi-provider inventory groups cards by provider with a health summary", 
   // The `error`-health source (one source down) carries its `latest_error`;
   // the `degraded` source carries its own. Both render — the panorama reflects
   // real registry state.
-  await expect(inventoryRegion.getByText("Tessera could not read this source.")).toBeVisible();
-  await expect(inventoryRegion.getByText("Tessera could not access this source.")).toBeVisible();
+  await expect(
+    inventoryRegion.getByText("Tessera could not read this source.", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    inventoryRegion.getByText("Tessera could not access this source.", { exact: true }),
+  ).toBeVisible();
 
   // Within-group attention-first health sort: in the multi-card `codex` group
   // the worse-health (`error`) card precedes the `healthy` card in DOM order.
@@ -1912,7 +1916,7 @@ test("projects region is keyboard-reachable for create rename add remove delete"
   await page.route("**/api/projects", async (route) =>
     route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
   );
-  const tesseraSlot = page.getByLabel("Tessera project");
+  const tesseraSlot = page.getByLabel("Tessera project", { exact: true });
   await expect(tesseraSlot).toBeVisible();
   await expect(tesseraSlot).toBeEnabled();
 

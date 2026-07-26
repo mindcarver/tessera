@@ -41,7 +41,7 @@ import { useCallback, useEffect, useRef, useState, type ReactElement, type RefOb
 import { readTesseraErrorMessage } from "../../api/errors";
 import { openOriginalLocation } from "../../api/open";
 import { browseMemories, PROVIDER_MEMORY_TYPES, type BrowseEmptyState, type ProviderMemoryType, type SearchResult, type SourceQueryStatus } from "../../api/browse";
-import { EmptyState } from "../../components/EmptyState";
+import { EmptyState, type EmptyTone } from "../../components/EmptyState";
 import { LoadMore } from "../../components/LoadMore";
 import { ResultCard } from "../../components/ResultCard";
 import { providerDisplayName } from "../../components/providerDisplayName";
@@ -234,8 +234,8 @@ export function Browse({ sourceId, providerLabel, nativeProject, onBack }: Brows
   const currentSourceStatus = sidecarSources?.find((s) => s.source_id === sourceId);
 
   return (
-    <section aria-label="Memory browse" role="region">
-      <h2>Browse memories</h2>
+    <section aria-label="Memory browse" role="region" className="tsr-section">
+      <h2 className="tsr-section__title">Browse memories</h2>
       {renderBreadcrumb(providerLabel, nativeProject, onBack, sourcesButton)}
       {renderFilterControls(memoryType, setMemoryType)}
       {/*
@@ -304,10 +304,10 @@ function renderBreadcrumb(
   // caller could pass "" — the inline fallback keeps the hierarchy legible.
   const providerText = providerLabel || "(unknown provider)";
   return (
-    <nav aria-label="Breadcrumb">
-      <ol>
-        <li>
-          <button type="button" onClick={onBack} ref={sourcesButtonRef}>
+    <nav aria-label="Breadcrumb" className="tsr-crumb">
+      <ol className="tsr-crumb__list">
+        <li className="tsr-crumb__item">
+          <button type="button" className="tsr-crumb__back" onClick={onBack} ref={sourcesButtonRef}>
             {/* PATCH 8 — visible back cue for sighted users; aria-hidden so the
                 accessible name stays "Sources" (name-based selectors survive). */}
             <span aria-hidden="true">← </span>Sources
@@ -316,8 +316,8 @@ function renderBreadcrumb(
         {/* PATCH 5 — no aria-hidden here (the default is false; an explicit
             value is dead code that suggests an abandoned decision to hide the
             Provider segment). */}
-        <li><span>{providerText}</span></li>
-        <li><span aria-current="location">{leafLabel}</span></li>
+        <li className="tsr-crumb__item"><span className="tsr-crumb__seg">{providerText}</span></li>
+        <li className="tsr-crumb__item"><span className="tsr-crumb__leaf" aria-current="location">{leafLabel}</span></li>
       </ol>
     </nav>
   );
@@ -335,7 +335,7 @@ function renderBreadcrumb(
  * communicate "recent".
  */
 function renderOrderReadout(): ReactElement {
-  return <p data-testid="browse-effective-order">Recent scan first</p>;
+  return <p data-testid="browse-effective-order" className="tsr-readout">Recent scan first</p>;
 }
 
 /**
@@ -362,7 +362,7 @@ function renderHealthReadout(
     ? "Loading…"
     : (currentSourceStatus?.status ?? "unknown");
   return (
-    <p>
+    <p className="tsr-readout">
       <span data-testid="browse-source-health">Source health: {healthLabel}</span>
     </p>
   );
@@ -386,17 +386,19 @@ function renderFilterControls(
   setMemoryType: (next: string) => void,
 ): ReactElement {
   return (
-    <fieldset aria-label="Browse filters">
-      <legend>Filter memories</legend>
-      <label htmlFor="browse-filter-type">Memory type</label>
-      <select
-        id="browse-filter-type"
-        value={memoryType}
-        onChange={(event) => setMemoryType(event.target.value)}
-      >
-        <option value="">All types</option>
-        {PROVIDER_MEMORY_TYPES.map((id) => <option key={id} value={id}>{id}</option>)}
-      </select>
+    <fieldset aria-label="Browse filters" className="tsr-filters">
+      <legend className="tsr-filters__legend">Filter memories</legend>
+      <div className="tsr-filter">
+        <label htmlFor="browse-filter-type">Memory type</label>
+        <select
+          id="browse-filter-type"
+          value={memoryType}
+          onChange={(event) => setMemoryType(event.target.value)}
+        >
+          <option value="">All types</option>
+          {PROVIDER_MEMORY_TYPES.map((id) => <option key={id} value={id}>{id}</option>)}
+        </select>
+      </div>
     </fieldset>
   );
 }
@@ -433,14 +435,14 @@ function renderState(
       <>
         {partialUnavailableBanner(state.sources, true)}
         <p ref={alert} tabIndex={-1} role="alert">{state.message}</p>
-        <button type="button" onClick={restartFromFreshSnapshot}>Restart from the new snapshot</button>
+        <button type="button" className="tsr-btn" onClick={restartFromFreshSnapshot}>Restart from the new snapshot</button>
         {renderResults(state.results, null, loadMore, openRecord, false, openingRecordId)}
       </>
     );
   }
   // ready
   if (state.empty) {
-    return <EmptyState message={emptyCopy(state.empty)} />;
+    return <EmptyState message={emptyCopy(state.empty)} tone={browseEmptyTone(state.empty)} />;
   }
   return (
     <>
@@ -462,7 +464,7 @@ function partialUnavailableBanner(sources: SourceQueryStatus[], hasResults: bool
   const flagged = sources.filter((source) => source.status !== "available");
   if (flagged.length === 0) return null;
   return (
-    <p role="status" data-testid="browse-source-status">
+    <p role="status" data-testid="browse-source-status" className="tsr-banner tsr-banner--bad">
       {flagged.map((source, index) => {
         const label = source.status === "unavailable"
           ? `Source ${providerDisplayName(source.provider)} was unreachable at last scan.`
@@ -486,7 +488,7 @@ function renderResults(
   // via the natural tab order (list items carry `tabIndex={0}` in ResultCard).
   return (
     <>
-      <p>{results.length} memor{results.length === 1 ? "y" : "ies"}.</p>
+      <p className="tsr-res-hero">{results.length} memor{results.length === 1 ? "y" : "ies"}</p>
       {/*
         Story 3.3 — the results `<ol>` carries an `aria-label` so it is
         distinguishable from the Breadcrumb's `<ol>` (two lists now coexist in
@@ -495,7 +497,7 @@ function renderResults(
         region; duplicating it would make SR users hear it twice and make
         by-name navigation ambiguous).
       */}
-      <ol aria-label="Browse results">
+      <ol aria-label="Browse results" className="tsr-res-list">
         {results.map((result) => (
           <ResultCard
             key={result.record_id}
@@ -548,4 +550,11 @@ function emptyCopy(state: BrowseEmptyState): string {
     case "source_unavailable":
       return "This source is currently unavailable; its stored health was not changed.";
   }
+}
+
+/** Map the browse empty-state reason onto the three-state tone (mute/blue/red). */
+function browseEmptyTone(state: BrowseEmptyState): EmptyTone {
+  if (state === "source_unavailable") return "red";
+  if (state === "not_yet_scanned") return "blue";
+  return "mute";
 }

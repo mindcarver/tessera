@@ -16,7 +16,7 @@ import {
   type SourceQueryStatus,
 } from "../../api/search";
 import { listProjects, type TesseraProjectView } from "../../api/projects";
-import { EmptyState } from "../../components/EmptyState";
+import { EmptyState, type EmptyTone } from "../../components/EmptyState";
 import { LoadMore } from "../../components/LoadMore";
 import { ResultCard } from "../../components/ResultCard";
 import { providerDisplayName } from "../../components/providerDisplayName";
@@ -267,15 +267,17 @@ export function Search(): ReactElement {
     updateFilter(EMPTY_FILTERS);
   }, [updateFilter]);
   const filtersActive = !isEmptyFilterState(filters);
-  return <section aria-label="Memory search" role="region">
-    <h2>Search memories</h2>
-    <form onSubmit={submit}>
-      <label htmlFor="memory-search">Keyword</label>
-      <input id="memory-search" value={query} onChange={(event) => { ++request.current; ++openRequest.current; setQuery(event.target.value); setState({ kind: "idle" }); setOpenState({ kind: "idle" }); }} />
-      <button type="submit">Search</button>
+  return <section aria-label="Memory search" role="region" id="tessera-search" className="tsr-section">
+    <h2 className="tsr-section__title">Search memories</h2>
+    <form className="tsr-query" onSubmit={submit}>
+      <label className="tsr-query__label" htmlFor="memory-search">Keyword</label>
+      <div className="tsr-query__field">
+        <input id="memory-search" className="tsr-query__input" placeholder="Search across confirmed sources…" value={query} onChange={(event) => { ++request.current; ++openRequest.current; setQuery(event.target.value); setState({ kind: "idle" }); setOpenState({ kind: "idle" }); }} />
+        <button type="submit" className="tsr-btn tsr-btn--primary">Search</button>
+      </div>
     </form>
     {renderFilterControls(filters, updateFilter, clearFilters, filtersActive, confirmedSources, projects)}
-    <p role="status" data-testid="search-effective-range">{effectiveRangeText(filters, confirmedProviders, projects)}</p>
+    <p role="status" data-testid="search-effective-range" className="tsr-effective-range">{effectiveRangeText(filters, confirmedProviders, projects)}</p>
     <div aria-live="polite">{renderOpenState(openState)}{renderState(state, loadMore, openRecord, openState, resultList, alert, filters, filtersActive, confirmedProviders, projects)}</div>
   </section>;
 }
@@ -298,62 +300,72 @@ function renderFilterControls(
   confirmedSources: ConfirmedSource[],
   projects: TesseraProjectView[],
 ): ReactElement {
-  return <fieldset aria-label="Search filters">
-    <legend>Filter memories</legend>
-    <label htmlFor="memory-filter-provider">Provider</label>
-    <select
-      id="memory-filter-provider"
-      value={filters.provider}
-      onChange={(event) => updateFilter({ provider: event.target.value })}
-    >
-      <option value="">All providers</option>
-      {KNOWN_PROVIDER_IDS.map((id) => <option key={id} value={id}>{providerDisplayName(id)}</option>)}
-    </select>
-    <label htmlFor="memory-filter-source">Source</label>
-    <select
-      id="memory-filter-source"
-      value={filters.source}
-      onChange={(event) => updateFilter({ source: event.target.value })}
-    >
-      <option value="">All sources</option>
-      {confirmedSources
-        // Patch 3 — scope the Source options by the active provider filter.
-        // Without this, `provider=codex` + `source=src_2` (a Claude source)
-        // is offered and always yields zero rows. Only show sources whose
-        // provider matches when a provider filter is set.
-        .filter((src) => filters.provider === "" || src.provider === filters.provider)
-        .map((src) => (
-          <option key={src.source_id} value={src.source_id}>{sourceLabel(src)}</option>
+  return <fieldset aria-label="Search filters" className="tsr-filters">
+    <legend className="tsr-filters__legend">Filter memories</legend>
+    <div className="tsr-filter">
+      <label htmlFor="memory-filter-provider">Provider</label>
+      <select
+        id="memory-filter-provider"
+        value={filters.provider}
+        onChange={(event) => updateFilter({ provider: event.target.value })}
+      >
+        <option value="">All providers</option>
+        {KNOWN_PROVIDER_IDS.map((id) => <option key={id} value={id}>{providerDisplayName(id)}</option>)}
+      </select>
+    </div>
+    <div className="tsr-filter">
+      <label htmlFor="memory-filter-source">Source</label>
+      <select
+        id="memory-filter-source"
+        value={filters.source}
+        onChange={(event) => updateFilter({ source: event.target.value })}
+      >
+        <option value="">All sources</option>
+        {confirmedSources
+          // Patch 3 — scope the Source options by the active provider filter.
+          // Without this, `provider=codex` + `source=src_2` (a Claude source)
+          // is offered and always yields zero rows. Only show sources whose
+          // provider matches when a provider filter is set.
+          .filter((src) => filters.provider === "" || src.provider === filters.provider)
+          .map((src) => (
+            <option key={src.source_id} value={src.source_id}>{sourceLabel(src)}</option>
+          ))}
+      </select>
+    </div>
+    <div className="tsr-filter">
+      <label htmlFor="memory-filter-type">Memory type</label>
+      <select
+        id="memory-filter-type"
+        value={filters.memory_type}
+        onChange={(event) => updateFilter({ memory_type: event.target.value })}
+      >
+        <option value="">All types</option>
+        {PROVIDER_MEMORY_TYPES.map((id) => <option key={id} value={id}>{id}</option>)}
+      </select>
+    </div>
+    <div className="tsr-filter">
+      <label htmlFor="memory-filter-project">Native project</label>
+      <input
+        id="memory-filter-project"
+        type="text"
+        placeholder="Exact native project id"
+        value={filters.native_project}
+        onChange={(event) => updateFilter({ native_project: event.target.value })}
+      />
+    </div>
+    <div className="tsr-filter">
+      <label htmlFor="memory-filter-time">Observed</label>
+      <select
+        id="memory-filter-time"
+        value={filters.timePreset}
+        onChange={(event) => updateFilter({ timePreset: event.target.value })}
+      >
+        <option value="all">All time</option>
+        {SEARCH_TIME_PRESETS.filter((preset) => preset !== "all").map((preset) => (
+          <option key={preset} value={preset}>Last {preset === "7d" ? "7" : "30"} days</option>
         ))}
-    </select>
-    <label htmlFor="memory-filter-type">Memory type</label>
-    <select
-      id="memory-filter-type"
-      value={filters.memory_type}
-      onChange={(event) => updateFilter({ memory_type: event.target.value })}
-    >
-      <option value="">All types</option>
-      {PROVIDER_MEMORY_TYPES.map((id) => <option key={id} value={id}>{id}</option>)}
-    </select>
-    <label htmlFor="memory-filter-project">Native project</label>
-    <input
-      id="memory-filter-project"
-      type="text"
-      placeholder="Exact native project id"
-      value={filters.native_project}
-      onChange={(event) => updateFilter({ native_project: event.target.value })}
-    />
-    <label htmlFor="memory-filter-time">Observed</label>
-    <select
-      id="memory-filter-time"
-      value={filters.timePreset}
-      onChange={(event) => updateFilter({ timePreset: event.target.value })}
-    >
-      <option value="all">All time</option>
-      {SEARCH_TIME_PRESETS.filter((preset) => preset !== "all").map((preset) => (
-        <option key={preset} value={preset}>Last {preset === "7d" ? "7" : "30"} days</option>
-      ))}
-    </select>
+      </select>
+    </div>
     {/*
       Story 5.2 — Tessera-project filter (was a disabled reserved slot in 2.4).
       Now a live `<select>` populated by `listProjects()`. When a project is
@@ -362,18 +374,20 @@ function renderFilterControls(
       project" — Q1=A). The cursor-clearing on change is handled by
       `updateFilter`'s idle reset, the same pattern every other filter uses.
     */}
-    <label htmlFor="memory-filter-tessera-project">Tessera project</label>
-    <select
-      id="memory-filter-tessera-project"
-      value={filters.tessera_project}
-      onChange={(event) => updateFilter({ tessera_project: event.target.value })}
-    >
-      <option value="">All projects</option>
-      {projects.map((p) => (
-        <option key={p.project_id} value={p.project_id}>{p.name}</option>
-      ))}
-    </select>
-    <button type="button" onClick={clearFilters} disabled={!filtersActive}>Clear filters</button>
+    <div className="tsr-filter">
+      <label htmlFor="memory-filter-tessera-project">Tessera project</label>
+      <select
+        id="memory-filter-tessera-project"
+        value={filters.tessera_project}
+        onChange={(event) => updateFilter({ tessera_project: event.target.value })}
+      >
+        <option value="">All projects</option>
+        {projects.map((p) => (
+          <option key={p.project_id} value={p.project_id}>{p.name}</option>
+        ))}
+      </select>
+    </div>
+    <button type="button" className="tsr-btn tsr-filter__clear" onClick={clearFilters} disabled={!filtersActive}>Clear filters</button>
   </fieldset>;
 }
 
@@ -492,7 +506,7 @@ function renderState(
   if (state.kind === "error") return <>{partialUnavailableBanner(state.sources ?? [], Boolean(state.results))}{state.results ? renderResults(state.results, null, loadMore, openRecord, openingId, resultList) : null}<p ref={alert} tabIndex={-1} role="alert">{state.message}</p></>;
   if (state.kind === "stale") return <>{partialUnavailableBanner(state.sources, true)}<p ref={alert} tabIndex={-1} role="alert">{state.message}</p>{renderResults(state.results, null, loadMore, openRecord, openingId, resultList)}</>;
   // ready
-  if (state.empty) return <EmptyState message={emptyCopy(state.empty, filters, filtersActive, confirmedProviders, projects)} />;
+  if (state.empty) return <EmptyState message={emptyCopy(state.empty, filters, filtersActive, confirmedProviders, projects)} tone={emptyTone(state.empty)} />;
   return <>{partialUnavailableBanner(state.sources, state.results.length > 0)}{renderResults(state.results, state.cursor, loadMore, openRecord, openingId, resultList)}</>;
 }
 
@@ -517,7 +531,7 @@ function partialUnavailableBanner(sources: SourceQueryStatus[], hasResults: bool
   if (!hasResults) return null;
   const flagged = sources.filter((source) => source.status !== "available");
   if (flagged.length === 0) return null;
-  return <p role="status" data-testid="search-source-status">
+  return <p role="status" data-testid="search-source-status" className="tsr-banner tsr-banner--bad">
     {flagged.map((source, index) => {
       const label = source.status === "unavailable"
         ? `Source ${source.provider} was unreachable at last scan; its memories may be absent from these results.`
@@ -532,7 +546,7 @@ function renderResults(results: SearchResult[], cursor: string | null, loadMore:
   // and Load-more button are shared with Browse via `src/components/`. Search
   // stays the canonical consumer of these components; the extraction does not
   // change the wire shape or the existing accessibility contract.
-  return <><p>{results.length} result{results.length === 1 ? "" : "s"}.</p><ol ref={resultList}>{results.map((result) => (
+  return <><p className="tsr-res-hero">{results.length} hit{results.length === 1 ? "" : "s"}</p><ol ref={resultList} className="tsr-res-list">{results.map((result) => (
     <ResultCard
       key={result.record_id}
       result={result}
@@ -582,4 +596,11 @@ function emptyCopy(state: SearchEmptyState, filters: FilterState, filtersActive:
     case "source_not_indexed": return "Confirmed sources have not been indexed yet.";
     case "source_unavailable": return "A confirmed source is currently unavailable; its stored health was not changed.";
   }
+}
+
+/** Map the empty-state reason onto the three-state tone (mute/blue/red). */
+function emptyTone(state: SearchEmptyState): EmptyTone {
+  if (state === "source_unavailable") return "red";
+  if (state === "source_not_indexed") return "blue";
+  return "mute";
 }

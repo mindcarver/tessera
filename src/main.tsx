@@ -11,6 +11,13 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+// Bundled Inter + Geist Mono (variable, upright weight axis). Local-first /
+// fully offline: the woff2 files are Vite-bundled into dist/assets, so there
+// are zero runtime external font requests (BG-3). unicode-range means only the
+// latin subset is fetched at runtime for English content.
+import "@fontsource-variable/inter/wght.css";
+import "@fontsource-variable/geist-mono/wght.css";
+import "./index.css";
 
 const rootElement = document.getElementById("root");
 if (!rootElement) {
