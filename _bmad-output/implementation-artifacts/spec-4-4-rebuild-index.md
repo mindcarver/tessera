@@ -6,6 +6,7 @@ status: 'done'
 review_loop_iteration: 0
 followup_review_recommended: true
 baseline_revision: 'bcd590f92643e7c9e259a61536206d5f64235edb'
+final_revision: '0f1549883f736307fbbc1e4b966201ffc9139cbe'
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/epic-4-context.md'
   - '{project-root}/_bmad-output/implementation-artifacts/spec-4-3-path-change-degraded.md'
