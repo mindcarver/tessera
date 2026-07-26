@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-21
-last_updated: 2026-07-25
+last_updated: 2026-07-26
 project: tessera
 project_key: NOKEY
 tracking_system: file-system
@@ -78,10 +78,10 @@ development_status:
   epic-3-retrospective: optional
 
   # === Epic 4: 健康诊断、失败隔离与索引重建 ===
-  epic-4: backlog
-  4-1-watcher-reconcile: backlog            # 文件变化 watcher hint 与 reconcile 自动刷新
-  4-2-failure-isolation: backlog            # Connector 失败隔离与 stale 上一成功结果
-  4-3-path-change-degraded: backlog         # 路径/权限/身份变化的重发现与 degraded 处理
+  epic-4: in-progress
+  4-1-watcher-reconcile: done               # 文件变化 watcher hint 与 reconcile 自动刷新
+  4-2-failure-isolation: done               # Connector 失败隔离与 stale 上一成功结果
+  4-3-path-change-degraded: done            # 路径/权限/身份变化的重发现与 degraded 处理
   4-4-rebuild-index: backlog                # Derived Index 整体重建
   epic-4-retrospective: optional
 

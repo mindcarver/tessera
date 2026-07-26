@@ -194,6 +194,70 @@ impl<'a> SourceRegistry<'a> {
             None => Ok(None),
         }
     }
+
+    /// Story 4.3 — transactional seam. Runs `body` against a temporary
+    /// [`SourceRegistry`] view bound to a single SQLite transaction. On `Ok`
+    /// the transaction commits; on `Err` it rolls back. This is the atomic
+    /// boundary the spec's Boundaries mandate for rebind's disable-old +
+    /// insert-or-wake-new pair: a crash/error between the two writes rolls the
+    /// disable back so the old row returns to its prior lifecycle state (no
+    /// window exists where the old row is `Disabled` with no new `Confirmed`
+    /// Source).
+    ///
+    /// Reuses `Connection::unchecked_transaction` (the same primitive
+    /// [`crate::index::scan_store::ScanStore`] uses for its CAS commit):
+    /// exclusivity is guaranteed by the caller holding the `IndexState` mutex
+    /// for the whole command, and each command runs a single transaction at a
+    /// time. The body sees the same `SourceRegistry` API (`set_lifecycle`,
+    /// `set_health_and_cause`, `upsert_by_fingerprint`, `find_by_fingerprint`,
+    /// `get`) because `Transaction` derefs to `Connection`.
+    ///
+    /// The error type must convert from [`rusqlite::Error`] so commit/begin
+    /// failures surface through the same path as body failures.
+    ///
+    /// Rollback-failure handling: `Transaction::rollback` consumes `self` (so
+    /// no `Drop` runs after it — the doc comment's earlier claim about
+    /// "implicit rollback on drop" was wrong). On the rare rollback `Err`,
+    /// this method logs the rusqlite error and returns the body's original
+    /// error. The pooled `IndexState` connection is then suspect (it may
+    /// still be in `BEGINNED` state), but the `IndexState` mutex means the
+    /// next caller re-acquires it sequentially — there is no concurrent
+    /// corruption window. The operator-visible `eprintln!` matches the
+    /// existing error-logging posture in `application::reconcile.rs`.
+    pub fn with_transaction<T, E, F>(&self, body: F) -> Result<T, E>
+    where
+        E: From<rusqlite::Error>,
+        F: FnOnce(&SourceRegistry<'_>) -> Result<T, E>,
+    {
+        let tx = self.conn.unchecked_transaction().map_err(E::from)?;
+        let view = SourceRegistry::new(&tx);
+        let result = body(&view);
+        // `view`'s borrow on `tx` ends here via NLL; the binding stays in
+        // scope until this point so the borrow does not overlap with
+        // `tx.commit()` / `tx.rollback()` below.
+        match result {
+            Ok(value) => {
+                tx.commit().map_err(E::from)?;
+                Ok(value)
+            }
+            Err(err) => {
+                // Rollback is best-effort; the body's original error is what
+                // the caller sees. `tx.rollback()` consumes `tx`, so there is
+                // no Drop-driven implicit rollback — a rollback `Err` leaves
+                // the connection suspect, logged for operator visibility.
+                // (The IndexState mutex guarantees no concurrent caller can
+                // observe the suspect connection; the next caller blocks on
+                // the same mutex until this method returns.)
+                if let Err(rollback_err) = tx.rollback() {
+                    eprintln!(
+                        "tessera: source_registry transaction rollback failed: {rollback_err:?}; \
+                         connection may be in BEGINNED state — next caller re-acquires the IndexState mutex sequentially"
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
 }
 
 /// Fields needed to insert a new Source row. Kept as a borrowed-arg struct so

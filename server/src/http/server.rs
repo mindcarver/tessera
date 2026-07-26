@@ -43,8 +43,8 @@ use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
     browse, cancel_rescan_request, confirm_source, disable_source, discover_sources,
-    get_scan_status, list_sources, open_original_location, ping, reject_source, rescan_events,
-    scan_source, search, source_inventory, start_rescan,
+    get_scan_status, list_sources, open_original_location, ping, rebind_source, reject_source,
+    rescan_events, scan_source, search, source_inventory, start_rescan,
 };
 use crate::IndexState;
 
@@ -163,6 +163,18 @@ fn route(
                 Err(response) => return request.respond(response),
             };
             respond_result(request, disable_source(&source_id, state))
+        }
+        // Story 4.3 — explicit rebind: the recovery path for a Confirmed
+        // Source whose root moved / lost permissions / changed filesystem
+        // identity. Body is `{ source_id, root_path }`; the application layer
+        // canonicalizes + fingerprints the new root and disables-old +
+        // inserts-or-wakes-new inside ONE transaction.
+        (Method::Post, "/api/sources/rebind") => {
+            let rebind_request = match read_json_body::<crate::http::RebindRequest>(&mut request) {
+                Ok(body) => body,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, rebind_source(rebind_request, state))
         }
         (Method::Get, "/api/sources") => respond_result(request, list_sources(state)),
         (Method::Get, "/api/sources/inventory") => respond_result(request, source_inventory(state)),

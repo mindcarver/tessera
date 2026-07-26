@@ -28,7 +28,8 @@ pub mod source;
 // Re-export so IPC and lib.rs can name `application::discover_sources` etc.
 // without a path change from 1.2.
 pub use source::{
-    confirm_source, disable_source, discover_sources, list_sources, reject_source, SourceError,
+    confirm_source, disable_source, discover_sources, list_sources, native_project_for_root,
+    rebind_source, reject_source, SourceError,
 };
 
 // Story 1.4 scan orchestration (AD-1). Re-exported so IPC and the boot path

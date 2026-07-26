@@ -20,6 +20,8 @@
 //! double-source risk by treating the adapter as authoritative at confirm
 //! time.
 
+use std::path::Path;
+
 use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::codex::CodexAdapter;
 use crate::domain::ports::provider_adapter::{CandidateSource, ProviderAdapter};
@@ -47,6 +49,17 @@ pub enum SourceError {
     /// An unexpected internal error from the registry (SQLite failure). Maps
     /// to the existing stable code `internal`.
     Internal,
+}
+
+/// Map a registry/transaction error (SQLite failure) to
+/// [`SourceError::Internal`]. Required by
+/// [`SourceRegistry::with_transaction`]'s `E: From<rusqlite::Error>` bound so
+/// the transaction's begin/commit/rollback failures surface through the same
+/// `Internal` mapping the rest of the application layer uses for DB errors.
+impl From<rusqlite::Error> for SourceError {
+    fn from(_: rusqlite::Error) -> Self {
+        SourceError::Internal
+    }
 }
 
 /// Resolve the provider adapter for a provider id. Story 2.1 widens this from
@@ -223,6 +236,214 @@ pub fn disable_source(
     source_id: &SourceId,
 ) -> Result<Source, SourceError> {
     flip_lifecycle(registry, source_id, SourceLifecycle::Disabled)
+}
+
+/// Story 4.3 — re-derive the provider-native project id from a root path.
+/// This mirrors the project-key derivation [`ClaudeCodeAdapter::discover`]
+/// performs, so rebind does not duplicate adapter parsing.
+///
+/// For Codex (global store) this is `None` — same value Codex's `discover()`
+/// emits.
+///
+/// For Claude Code, the adapter emits TWO candidate shapes from the same
+/// `discover()` call (see `adapters/claude_code.rs`):
+/// - **Project-keyed shape** (`project_memory_dirs`): root path is
+///   `<config>/projects/<project>/memory`, and the encoded `<project>` key is
+///   the LEXICAL `entry.file_name()` of the `<project>` directory (NOT the
+///   canonicalized target's name — so a symlinked project dir keeps the
+///   symlink's name, not the target's).
+/// - **`autoMemoryDirectory` shape** (`auto_memory_candidate`): root is
+///   whatever absolute path the user configured, and `native_project = None`
+///   regardless of what its parent directory happens to be named.
+///
+/// Re-derivation must be faithful to BOTH emission paths. The previous
+/// implementation returned `Some(parent_dir_name)` for every Claude root,
+/// silently mutating `native_project` from `None` to `Some(<garbage parent>)`
+/// for an autoMemoryDirectory-shaped source — exactly the corruption F7 was
+/// filed to prevent. The fix: only return `Some(project_key)` when the path
+/// matches the project-keyed shape `<…>/projects/<project>/memory` (its
+/// `file_name()` is `memory` AND its grandparent's name is `projects`); in
+/// all other shapes return `None`, matching `auto_memory_candidate`'s
+/// emission.
+///
+/// `lexical_root_path` is the USER-SUPPLIED (pre-canonicalize) path string
+/// the adapter would have seen at discover time. We extract the project key
+/// from it (NOT from the canonicalized path) so a symlinked project dir
+/// yields the SAME project_key at rebind that the adapter emitted at confirm
+/// — the adapter's `entry.file_name()` reads the lexical name. P2: this
+/// closes the symlink divergence between adapter and rebind.
+///
+/// Re-derivation (NOT copying the old row's `native_project`) is the spec's
+/// binding Always rule: copying the OLD project id to a DIFFERENT physical
+/// root would mis-identify the new Source as belonging to a project it does
+/// not belong to, corrupting any future Epic-5 mapping keyed off
+/// `native_project`.
+pub fn native_project_for_root(provider: &str, lexical_root_path: &str) -> Option<String> {
+    if provider != ClaudeCodeAdapter::PROVIDER_ID {
+        // Codex (and any future provider that does not encode a native
+        // project in the root path): None, mirroring that adapter's
+        // discover() output.
+        return None;
+    }
+    // Claude Code project-keyed shape: `<…>/projects/<project>/memory`. We
+    // accept ONLY this exact trailing shape; an autoMemoryDirectory root
+    // (any other absolute path) falls through and returns None, matching
+    // `auto_memory_candidate`'s `native_project: None` emission. Operate on
+    // the user-supplied lexical path so symlinked project dirs keep their
+    // symlink's name (the adapter's `entry.file_name()` is lexical, too).
+    let path = Path::new(lexical_root_path);
+    if path.file_name().and_then(|n| n.to_str()) != Some("memory") {
+        return None;
+    }
+    let project_dir = path.parent()?;
+    let project_key = project_dir.file_name()?.to_str()?.to_string();
+    let projects_dir = project_dir.parent()?;
+    if projects_dir.file_name().and_then(|n| n.to_str()) != Some("projects") {
+        return None;
+    }
+    Some(project_key)
+}
+
+/// Story 4.3 — rebind a Confirmed Source whose root moved / lost permissions /
+/// changed filesystem identity to a NEW root path. The explicit recovery path
+/// for the "path/permission/identity change" AC: 4.2 marks the old Source
+/// `Degraded + cause + last-success + stale` and preserves the previous
+/// generation; rebind is the user-supplied action that points at the new
+/// location.
+///
+/// Steps (spec Boundaries — "fail-closed on the new root BEFORE disabling the
+/// old, AND why disable+insert must be ONE transaction"):
+/// 1. Look up the old Source. Fail-closed: `SourceNotFound` if the id matches
+///    no row; `ConfirmFailed` if the old row's lifecycle is not Confirmed
+///    (rebind requires a confirmed-or-degraded old source — the I/O matrix
+///    rejects Rejected/Disabled old rows with 409).
+/// 2. Canonicalize + fingerprint the new root FIRST (fail-closed BEFORE
+///    touching the old row): `ConfirmFailed` if the new root is missing /
+///    not-a-dir / not-absolute, leaving the old Source UNCHANGED.
+/// 3. No-op short-circuit: if the new fingerprint equals the old Source's
+///    fingerprint, the move is a no-op. Leave the old row `Confirmed`, return
+///    it, no new row.
+/// 4. Disable-old + insert-or-wake-new INSIDE ONE SQLite transaction
+///    ([`SourceRegistry::with_transaction`]). On a fingerprint collision with
+///    an existing row, the wake-up branch sets that row to `Confirmed` AND
+///    resets its `health_state`/`health_cause` to `Unknown`/`None` (a
+///    resurrected previously-degraded row must surface as freshly-confirmed,
+///    not stale-degraded — spec I/O matrix row 2). On any error between the
+///    disable and the insert/wake, the transaction rolls the disable back so
+///    the old row returns to its prior state (no catastrophic window).
+/// 5. `native_project` for the new Source is RE-DERIVED from the new root
+///    ([`native_project_for_root`]) — never copied from the old row.
+///
+/// Coverage for the new Source comes from the adapter (single source of
+/// truth), matching `confirm_source`.
+pub fn rebind_source(
+    registry: &SourceRegistry<'_>,
+    old_source_id: &SourceId,
+    new_root_path: &str,
+) -> Result<Source, SourceError> {
+    // Step 1: load + validate the old source's state. Fail-closed BEFORE
+    // canonicalizing the new root: an unknown id or a bad old lifecycle yields
+    // no state change.
+    let old = registry
+        .get(old_source_id)
+        .map_err(|_| SourceError::Internal)?
+        .ok_or(SourceError::SourceNotFound)?;
+    if !matches!(old.lifecycle_state, SourceLifecycle::Confirmed) {
+        // Rebind requires a Confirmed old source. A Degraded row is still
+        // Confirmed (degraded is a HealthState, not a Lifecycle), so a
+        // 4.2-marked Degraded+PathMissing row satisfies this. A Rejected or
+        // already-Disabled row does not.
+        return Err(SourceError::ConfirmFailed);
+    }
+
+    // Step 2: canonicalize + fingerprint the new root FIRST (fail-closed).
+    let root = policy::canonicalize_root(std::path::Path::new(new_root_path))
+        .map_err(|_| SourceError::ConfirmFailed)?;
+    let normalized_str = root
+        .normalized_path
+        .to_str()
+        .ok_or(SourceError::ConfirmFailed)?;
+    let new_fingerprint = build_fingerprint(
+        &old.provider,
+        ROOT_KIND_DIR,
+        &root.normalized_path,
+        root.identity,
+    );
+
+    // Step 3: no-op short-circuit (same fingerprint → the "move" didn't
+    // change identity). Leave the old row Confirmed, no new row.
+    if old.fingerprint == new_fingerprint {
+        return Ok(old);
+    }
+
+    // Coverage + native_project are derived from the NEW root + provider (the
+    // provider IS carried from old — same-provider-by-construction per the
+    // spec's "KEEP" note on the F7 amendment; only the project id is
+    // re-derived). `native_project` re-derivation uses the USER-SUPPLIED
+    // (lexical) path string — NOT the canonicalized path — so a symlinked
+    // project dir yields the SAME project_key at rebind that the adapter's
+    // `entry.file_name()` emitted at confirm (P2: closes the adapter/rebind
+    // symlink divergence).
+    let adapter = adapter_for(&old.provider).ok_or(SourceError::ConfirmFailed)?;
+    let coverage = adapter.coverage_level();
+    let native_project = native_project_for_root(&old.provider, new_root_path);
+    let native_project_ref: Option<&str> = native_project.as_deref();
+
+    // Capture fields the closure needs before moving into the transaction
+    // (the closure borrows `registry` via the with_transaction API; these
+    // owned values are captured by move).
+    let provider = old.provider.clone();
+
+    // Step 4: disable-old + insert-or-wake-new INSIDE ONE transaction. On any
+    // error between the two writes, the transaction rolls the disable back so
+    // the old row returns to Confirmed (the catastrophic state the fail-closed
+    // design exists to prevent).
+    registry.with_transaction(|tx| -> Result<Source, SourceError> {
+        // Disable the old row.
+        if tx
+            .set_lifecycle(old_source_id, SourceLifecycle::Disabled)
+            .map_err(|_| SourceError::Internal)?
+            .is_none()
+        {
+            return Err(SourceError::SourceNotFound);
+        }
+
+        // Insert-or-wake the new row at the new fingerprint.
+        if let Some(existing) = tx
+            .find_by_fingerprint(&new_fingerprint)
+            .map_err(|_| SourceError::Internal)?
+        {
+            // Wake-up branch: the new fingerprint already matches an
+            // existing row. Wake it to Confirmed AND reset its
+            // health_state/health_cause so a previously-degraded row
+            // surfaces as freshly-confirmed, NOT stale-degraded (spec I/O
+            // matrix row 2 + Design Notes "Why wake-up resets
+            // health/cause").
+            tx.set_lifecycle(&existing.source_id, SourceLifecycle::Confirmed)
+                .map_err(|_| SourceError::Internal)?
+                .ok_or(SourceError::Internal)?;
+            tx.set_health_and_cause(&existing.source_id, HealthState::Unknown, HealthCause::None)
+                .map_err(|_| SourceError::Internal)?
+                .ok_or(SourceError::Internal)
+        } else {
+            // Insert branch: no row at the new fingerprint yet. Insert a
+            // fresh Confirmed row. `native_project` was re-derived from the
+            // new root (NOT copied from the old row) — see
+            // [`native_project_for_root`].
+            tx.upsert_by_fingerprint(&SourceInsert {
+                provider: &provider,
+                source_kind: SourceKind::AgentMemory,
+                lifecycle_state: SourceLifecycle::Confirmed,
+                health_state: HealthState::Unknown,
+                coverage_level: coverage,
+                normalized_root_path: normalized_str,
+                fingerprint: &new_fingerprint,
+                native_project: native_project_ref,
+                health_cause: HealthCause::None,
+            })
+            .map_err(|_| SourceError::Internal)
+        }
+    })
 }
 
 /// List every registered Source (any lifecycle), ordered by id. Infallible at
