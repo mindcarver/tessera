@@ -17,6 +17,8 @@ export function providerDisplayName(provider: string): string {
       return "Codex";
     case "claude_code":
       return "Claude Code";
+    case "opencode":
+      return "OpenCode";
     default:
       return provider;
   }

@@ -103,6 +103,9 @@ fn validate_project_name(name: &str) -> Result<String, ProjectError> {
 /// - `claude_code`: must be `Some(non-empty, non-whitespace, ≤
 ///   MAX_NATIVE_PROJECT_LEN)`. An empty / whitespace string is rejected so
 ///   it cannot collide with the Codex `null` scope.
+/// - `opencode`: global instructions use `None`; project instructions use an
+///   exact provider id with no surrounding whitespace, bounded by
+///   `MAX_NATIVE_PROJECT_LEN`.
 ///
 /// `provider` is matched against [`KNOWN_PROVIDERS`] (lowercase, matching
 /// the adapter registry's provider ids exactly).
@@ -141,6 +144,17 @@ fn validate_mapping_scope(
             // global store. Reject so the wire shape cannot smuggle a Claude
             // source into the Codex-global scope.
             Err(ProjectError::BadRequest)
+        }
+        ("opencode", None) => Ok(("opencode".to_string(), None)),
+        ("opencode", Some(np)) => {
+            let trimmed = np.trim();
+            if trimmed.is_empty()
+                || trimmed != np
+                || np.len() > MAX_NATIVE_PROJECT_LEN
+            {
+                return Err(ProjectError::BadRequest);
+            }
+            Ok(("opencode".to_string(), Some(np.clone())))
         }
         _ => Err(ProjectError::BadRequest),
     }
@@ -388,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_mapping_scope_codex_null_and_claude_some_only() {
+    fn validate_mapping_scope_accepts_registered_provider_shapes() {
         // Codex global scope.
         let (p, np) = validate_mapping_scope("codex", &None).unwrap();
         assert_eq!(p, "codex");
@@ -402,6 +416,15 @@ mod tests {
         // Trim Claude whitespace.
         let (_, np) = validate_mapping_scope("claude_code", &Some("  key  ".to_string())).unwrap();
         assert_eq!(np.as_deref(), Some("key"));
+
+        // OpenCode has both global and exact project instruction scopes.
+        let (p, np) = validate_mapping_scope("opencode", &None).unwrap();
+        assert_eq!(p, "opencode");
+        assert!(np.is_none());
+        let (p, np) =
+            validate_mapping_scope("opencode", &Some("project-id".to_string())).unwrap();
+        assert_eq!(p, "opencode");
+        assert_eq!(np.as_deref(), Some("project-id"));
     }
 
     #[test]
@@ -430,6 +453,10 @@ mod tests {
         let long = "x".repeat(MAX_NATIVE_PROJECT_LEN + 1);
         assert!(matches!(
             validate_mapping_scope("claude_code", &Some(long)),
+            Err(ProjectError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_mapping_scope("opencode", &Some(" project-id ".to_string())),
             Err(ProjectError::BadRequest)
         ));
     }

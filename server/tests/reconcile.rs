@@ -542,7 +542,7 @@ fn supervisor_start_and_stop_watch_on_lifecycle_transitions() {
 
     // start_watch for the confirmed source's root.
     supervisor
-        .start_watch(&source.source_id, &memories)
+        .start_watch(&source.source_id, "codex", &memories)
         .expect("start watch");
 
     // Record a hint via the supervisor (mimics a notify event).
@@ -1902,7 +1902,7 @@ fn supervisor_drop_stops_the_loop_and_no_further_reconcile_fires() {
     // Manually install a watch via the supervisor we started (since we did not
     // route through the HTTP hook here).
     supervisor
-        .start_watch(&source.source_id, &memories)
+        .start_watch(&source.source_id, "codex", &memories)
         .expect("start watch");
 
     // Wait for the boot tick to commit gen_1.

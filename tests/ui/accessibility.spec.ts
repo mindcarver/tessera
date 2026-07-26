@@ -290,6 +290,54 @@ test("renders Claude Code candidates with each claude_* discovery basis", async 
   await expect(candidateRegion.getByRole("alert")).toHaveCount(0);
 });
 
+test("renders OpenCode discovery bases and exposes provider and instruction filters", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: [
+          {
+            provider: "opencode",
+            root_path: "/fixture/opencode/config",
+            basis: "opencode_global_config",
+            coverage_level: "full",
+            native_project: null,
+          },
+          {
+            provider: "opencode",
+            root_path: "/fixture/opencode/project",
+            basis: "opencode_project_database",
+            coverage_level: "full",
+            native_project: "project-1",
+          },
+        ],
+      }),
+    }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: [] }),
+    }),
+  );
+  await page.goto("/");
+
+  const candidateRegion = page.getByRole("region", {
+    name: "Discovered candidate sources",
+  });
+  await expect(candidateRegion.getByRole("listitem")).toHaveCount(2);
+  await expect(candidateRegion).toContainText("opencode");
+  await expect(candidateRegion.getByRole("alert")).toHaveCount(0);
+
+  await expect(
+    page.getByLabel("Provider").locator('option[value="opencode"]'),
+  ).toHaveText("OpenCode");
+  await expect(
+    page.getByLabel("Memory type").locator('option[value="agent_instruction"]'),
+  ).toHaveCount(1);
+});
+
 /**
  * Story 2.4 — keyboard-reachable filter controls (provider, memory-type)
  * narrow the result set with AND, the effective-range readout states the
@@ -1647,8 +1695,8 @@ test("browse breadcrumb surfaces provider and native-project hierarchy and is ke
  */
 test("projects region is keyboard-reachable for create rename add remove delete", async ({ page }) => {
   // Empty discover + inventory by default; the add-mapping picker is fed by
-  // the inventory, so we route it to return a Codex global + Claude per-
-  // project source when the test reaches that branch.
+  // the inventory, so we route it to return Codex/OpenCode global + Claude
+  // per-project sources when the test reaches that branch.
   await page.route("**/api/sources/discover", async (route) =>
     route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
   );
@@ -1675,6 +1723,18 @@ test("projects region is keyboard-reachable for create rename add remove delete"
         lifecycle_state: "confirmed",
         root: "/fixture/claude",
         native_project: "proj-claude",
+        coverage_level: "full",
+        health_state: "healthy",
+        last_successful_scan: 100,
+        complete_record_count: 1,
+        latest_error: null,
+      },
+      {
+        source_id: "src_opencode",
+        provider: "opencode",
+        lifecycle_state: "confirmed",
+        root: "/fixture/opencode",
+        native_project: null,
         coverage_level: "full",
         health_state: "healthy",
         last_successful_scan: 100,
@@ -1743,12 +1803,18 @@ test("projects region is keyboard-reachable for create rename add remove delete"
       body: JSON.stringify({ api_version: "1", payload: updated }),
     });
   });
+  const addMappingBodies: Array<{
+    project_id: string;
+    provider: string;
+    native_project: string | null;
+  }> = [];
   await page.route("**/api/projects/mappings/add", async (route) => {
     const body = JSON.parse(route.request().postData() ?? "{}") as {
       project_id: string;
       provider: string;
       native_project: string | null;
     };
+    addMappingBodies.push(body);
     // Cardinality check across the mock state: if another project already
     // owns this scope, return 409 mapping_conflict naming the owner.
     const owner = projectsState.list.find(
@@ -1868,14 +1934,20 @@ test("projects region is keyboard-reachable for create rename add remove delete"
   await page.keyboard.press("Enter");
   const addMappingSelect = projectsRegion.getByLabel("Native project to map");
   await addMappingSelect.focus();
-  // Pick the Codex global option by its value (the option's `key` is
-  // `codex::` because native_project is null). Value-based selection is more
-  // reliable than label-regex matching under React-controlled selects.
-  await addMappingSelect.selectOption("codex::");
+  const opencodeGlobalOption = addMappingSelect.locator('option[value="opencode::"]');
+  await expect(opencodeGlobalOption).toHaveText("OpenCode (global store)");
+  // Pick the OpenCode global option by its value. Its `key` ends in `::`
+  // because the submitted native_project must stay null.
+  await addMappingSelect.selectOption("opencode::");
   await projectsRegion.getByRole("button", { name: "Add", exact: true }).focus();
   await page.keyboard.press("Enter");
   // The mapping renders under the project.
-  await expect(projectsRegion.getByTestId("projects-item-mappings")).toContainText("Codex (global store)");
+  await expect(projectsRegion.getByTestId("projects-item-mappings")).toContainText("OpenCode (global store)");
+  expect(addMappingBodies).toHaveLength(1);
+  expect(addMappingBodies[0]).toMatchObject({
+    provider: "opencode",
+    native_project: null,
+  });
 
   // --- Remove the mapping via keyboard. ---
   const removeMappingButton = projectsRegion.getByRole("button", { name: "Remove mapping", exact: true }).first();

@@ -30,7 +30,7 @@ pub const MAX_SINCE: i64 = 999_999_999_999;
 /// fails if the two drift apart. Validation is a single source of truth here so
 /// `SearchRequest::new` rejects an unknown `provider` with a structured
 /// `bad_request` instead of letting the SQL silently return zero rows.
-pub const KNOWN_PROVIDER_IDS: &[&str] = &["codex", "claude_code"];
+pub const KNOWN_PROVIDER_IDS: &[&str] = &["codex", "claude_code", "opencode"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchRequest {

@@ -1364,6 +1364,7 @@ fn provider_memory_type_from_str_reverses_as_str_for_whole_vocabulary() {
         ProviderMemoryType::RawMemories,
         ProviderMemoryType::RolloutSummary,
         ProviderMemoryType::TopicMemory,
+        ProviderMemoryType::AgentInstruction,
     ] {
         assert_eq!(
             ProviderMemoryType::parse_str(variant.as_str()),
@@ -1387,7 +1388,12 @@ fn provider_memory_type_from_str_reverses_as_str_for_whole_vocabulary() {
 fn known_provider_ids_match_registered_adapters() {
     use tessera_lib::adapters::claude_code::ClaudeCodeAdapter;
     use tessera_lib::adapters::codex::CodexAdapter;
-    let adapter_ids = [CodexAdapter::PROVIDER_ID, ClaudeCodeAdapter::PROVIDER_ID];
+    use tessera_lib::adapters::opencode::OpenCodeAdapter;
+    let adapter_ids = [
+        CodexAdapter::PROVIDER_ID,
+        ClaudeCodeAdapter::PROVIDER_ID,
+        OpenCodeAdapter::PROVIDER_ID,
+    ];
     // Every registered adapter's id is in the allowlist.
     for id in adapter_ids.iter() {
         assert!(

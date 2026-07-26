@@ -27,6 +27,10 @@ export default defineConfig({
       // discover/confirm/scan to stay keyboard-reachable, which the Codex
       // fixture still exercises.
       CLAUDE_CONFIG_DIR: path.join(root, "tests", "fixtures", "e2e-claude-empty"),
+      // Keep OpenCode discovery off the host's real config/database. The
+      // dedicated route-mocked test below exercises both OpenCode bases.
+      OPENCODE_CONFIG_DIR: path.join(root, "tests", "fixtures", "e2e-opencode-empty"),
+      XDG_DATA_HOME: path.join(root, "tests", "fixtures", "e2e-opencode-data-empty"),
     },
   },
 });

@@ -179,7 +179,12 @@ pub fn confirm_source(
     // supervisor slot may be `None` (no supervisor installed, e.g. in tests
     // that exercise only the scan surface); in that case the periodic tick is
     // also absent, so the caller is responsible for triggering reconciles.
-    start_watch_best_effort(state, &source.source_id, &source.normalized_root_path);
+    start_watch_best_effort(
+        state,
+        &source.source_id,
+        &source.provider,
+        &source.normalized_root_path,
+    );
     Ok(wrap_source(source))
 }
 
@@ -299,12 +304,13 @@ pub fn rebind_source(
         .map_err(|err| map_source_error(err, Some(&request.source_id.0)))?;
     let old_source_id = request.source_id.clone();
     let new_source_id = new_source.source_id.clone();
+    let new_provider = new_source.provider.clone();
     let new_root = new_source.normalized_root_path.clone();
     drop(conn);
     // Stop the watcher on the old (now-Disabled) row; start a fresh watcher
     // on the new Confirmed row at its new canonical root.
     stop_watch_best_effort(state, &old_source_id);
-    start_watch_best_effort(state, &new_source_id, &new_root);
+    start_watch_best_effort(state, &new_source_id, &new_provider, &new_root);
     Ok(wrap_source(new_source))
 }
 
@@ -322,7 +328,12 @@ pub struct RebindRequest {
 /// Logs and swallows watcher errors: the HTTP request must not fail because a
 /// notify backend could not register a kernel watch (the periodic reconcile
 /// tick still covers the source — AD-8 self-heal).
-fn start_watch_best_effort(state: &IndexState, source_id: &SourceId, canonical_root: &str) {
+fn start_watch_best_effort(
+    state: &IndexState,
+    source_id: &SourceId,
+    provider: &str,
+    canonical_root: &str,
+) {
     let Ok(slot) = state.reconcile_supervisor.lock() else {
         eprintln!(
             "tessera: reconcile_supervisor mutex poisoned during start_watch for {source_id}"
@@ -332,7 +343,9 @@ fn start_watch_best_effort(state: &IndexState, source_id: &SourceId, canonical_r
     let Some(supervisor) = slot.as_ref() else {
         return;
     };
-    if let Err(e) = supervisor.start_watch(source_id, std::path::Path::new(canonical_root)) {
+    if let Err(e) =
+        supervisor.start_watch(source_id, provider, std::path::Path::new(canonical_root))
+    {
         eprintln!(
             "tessera: watcher start failed for {source_id} ({canonical_root}): {e:?}; periodic reconcile still covers it"
         );
@@ -1201,7 +1214,7 @@ mod tests {
         assert_eq!(env.api_version, API_VERSION);
         for c in &env.payload {
             assert!(
-                matches!(c.provider.as_str(), "codex" | "claude_code"),
+                matches!(c.provider.as_str(), "codex" | "claude_code" | "opencode"),
                 "unknown provider on the wire: {}",
                 c.provider
             );

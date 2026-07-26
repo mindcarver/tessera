@@ -1397,6 +1397,32 @@ fn search_rejects_unknown_memory_type_value_with_bad_request() {
     assert!(response.contains("\"code\":\"bad_request\""), "got:\n{response}");
 }
 
+#[test]
+fn search_accepts_opencode_provider_and_agent_instruction_vocabulary() {
+    let port = boot_filter_test_server();
+    for filter in ["provider=opencode", "memory_type=agent_instruction"] {
+        let response = raw_http(
+            port,
+            &format!(
+                "GET /api/search?q=federation&{filter}&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "valid OpenCode filter must be accepted: {response}"
+        );
+        let body = response.split("\r\n\r\n").nth(1).expect("body");
+        let json: serde_json::Value = serde_json::from_str(body).expect("json");
+        assert!(
+            json["payload"]["results"]
+                .as_array()
+                .expect("results")
+                .is_empty(),
+            "the Codex/Claude fixture contains no OpenCode instruction rows"
+        );
+    }
+}
+
 /// Story 5.2 — `tessera_project` param (was reserved in 2.4) now narrows the
 /// result set to records whose `(provider, native_project)` is in the
 /// project's mapping scope set. Replaces the 2.4 "accepted and ignored" wire
@@ -2438,5 +2464,4 @@ fn rebuild_per_source_progress_surfaces_via_rescan_events_sse() {
         seen_queued, seen_running, seen_terminal
     );
 }
-
 

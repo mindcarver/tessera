@@ -55,7 +55,9 @@ export type DiscoveryBasis =
   | "codex_home_env"
   | "claude_default_home"
   | "claude_config_dir_env"
-  | "claude_auto_memory_dir";
+  | "claude_auto_memory_dir"
+  | "opencode_global_config"
+  | "opencode_project_database";
 
 /**
  * Candidate Source metadata produced by discovery (AD-4 / Story 1.2).
@@ -93,6 +95,8 @@ const VALID_DISCOVERY_BASES: ReadonlySet<string> = new Set([
   "claude_default_home",
   "claude_config_dir_env",
   "claude_auto_memory_dir",
+  "opencode_global_config",
+  "opencode_project_database",
 ]);
 
 /**

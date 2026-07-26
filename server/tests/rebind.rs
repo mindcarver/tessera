@@ -86,6 +86,16 @@ fn claude_candidate(root: &std::path::Path, project_key: &str) -> CandidateSourc
     }
 }
 
+fn opencode_candidate(root: &std::path::Path, project_id: &str) -> CandidateSource {
+    CandidateSource {
+        provider: "opencode".to_string(),
+        root_path: root.to_string_lossy().into_owned(),
+        basis: DiscoveryBasis::OpencodeProjectDatabase,
+        coverage_level: CoverageLevel::Full,
+        native_project: Some(project_id.to_string()),
+    }
+}
+
 /// Create a memories-shaped directory and return its path.
 fn make_memories(parent: &std::path::Path) -> std::path::PathBuf {
     let memories = parent.join("memories");
@@ -992,4 +1002,63 @@ fn native_project_for_root_uses_lexical_path_so_symlinked_project_keeps_symlink_
         Some("real-project"),
         "P2: rebind does NOT use the canonicalized target name"
     );
+}
+
+#[test]
+fn rebind_re_derives_exact_current_opencode_metadata() {
+    let tmp = tempdir().expect("tempdir");
+    let old_root = tmp.path().join("old-opencode");
+    let new_root = tmp.path().join("new-opencode");
+    fs::create_dir_all(&old_root).expect("old root");
+    fs::create_dir_all(&new_root).expect("new root");
+
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let old = application::confirm_source(&registry, &opencode_candidate(&old_root, "old-project"))
+        .expect("confirm old opencode");
+
+    let new = application::rebind_source_with_opencode_identity_resolver(
+        &registry,
+        &old.source_id,
+        &new_root.to_string_lossy(),
+        |root| {
+            assert_eq!(root, new_root);
+            Some(Some("current-project".to_string()))
+        },
+    )
+    .expect("rebind");
+
+    assert_eq!(new.native_project.as_deref(), Some("current-project"));
+    assert_ne!(new.source_id, old.source_id);
+    let old_after = registry.get(&old.source_id).expect("db").expect("old");
+    assert_eq!(old_after.lifecycle_state, SourceLifecycle::Disabled);
+}
+
+#[test]
+fn rebind_missing_opencode_identity_fails_before_mutation() {
+    let tmp = tempdir().expect("tempdir");
+    let old_root = tmp.path().join("old-opencode");
+    let new_root = tmp.path().join("new-opencode");
+    fs::create_dir_all(&old_root).expect("old root");
+    fs::create_dir_all(&new_root).expect("new root");
+
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let old = application::confirm_source(&registry, &opencode_candidate(&old_root, "old-project"))
+        .expect("confirm old opencode");
+
+    let result = application::rebind_source_with_opencode_identity_resolver(
+        &registry,
+        &old.source_id,
+        &new_root.to_string_lossy(),
+        |_| None,
+    );
+
+    assert!(matches!(
+        result,
+        Err(application::SourceError::ConfirmFailed)
+    ));
+    let old_after = registry.get(&old.source_id).expect("db").expect("old");
+    assert_eq!(old_after.lifecycle_state, SourceLifecycle::Confirmed);
+    assert_eq!(registry.list().expect("list").len(), 1);
 }

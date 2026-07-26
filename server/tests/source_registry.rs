@@ -763,7 +763,10 @@ fn discover_sources_still_orchestrates_after_move() {
     // known provider (Story 2.1 adds Claude Code alongside Codex) with Full
     // coverage.
     for c in &candidates {
-        assert!(matches!(c.provider.as_str(), "codex" | "claude_code"));
+        assert!(matches!(
+            c.provider.as_str(),
+            "codex" | "claude_code" | "opencode"
+        ));
         assert_eq!(c.coverage_level, CoverageLevel::Full);
     }
 }

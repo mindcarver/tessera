@@ -10,6 +10,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod opencode;
 /// Shared, provider-agnostic Markdown canonicalizer + path/locator helpers
 /// (Story 2.2 extraction). Re-exported by `codex` for backward compat; new
 /// providers import from this module directly. One parser, many version tags.

@@ -24,6 +24,7 @@ use std::path::Path;
 
 use crate::adapters::claude_code::ClaudeCodeAdapter;
 use crate::adapters::codex::CodexAdapter;
+use crate::adapters::opencode::OpenCodeAdapter;
 use crate::domain::ports::provider_adapter::{CandidateSource, ProviderAdapter};
 use crate::domain::source::{
     build_fingerprint, HealthCause, HealthState, Source, SourceId, SourceKind, SourceLifecycle,
@@ -94,6 +95,7 @@ pub fn adapter_for(provider: &str) -> Option<Box<dyn ProviderAdapter>> {
         // which uses the same constant. See `CodexAdapter::PROVIDER_ID`.
         CodexAdapter::PROVIDER_ID => Some(Box::new(CodexAdapter)),
         ClaudeCodeAdapter::PROVIDER_ID => Some(Box::new(ClaudeCodeAdapter)),
+        OpenCodeAdapter::PROVIDER_ID => Some(Box::new(OpenCodeAdapter)),
         _ => None,
     }
 }
@@ -110,6 +112,7 @@ pub fn discover_sources() -> Vec<CandidateSource> {
     let mut all = Vec::new();
     all.extend(CodexAdapter.discover());
     all.extend(ClaudeCodeAdapter.discover());
+    all.extend(OpenCodeAdapter.discover());
     // Deterministic cross-provider ordering: stable by `(provider, root_path)`
     // so UI lists do not flicker between boots. Within a provider, each
     // adapter already emits sorted candidates.
@@ -285,9 +288,6 @@ pub fn disable_source(
 /// `native_project`.
 pub fn native_project_for_root(provider: &str, lexical_root_path: &str) -> Option<String> {
     if provider != ClaudeCodeAdapter::PROVIDER_ID {
-        // Codex (and any future provider that does not encode a native
-        // project in the root path): None, mirroring that adapter's
-        // discover() output.
         return None;
     }
     // Claude Code project-keyed shape: `<…>/projects/<project>/memory`. We
@@ -307,6 +307,21 @@ pub fn native_project_for_root(provider: &str, lexical_root_path: &str) -> Optio
         return None;
     }
     Some(project_key)
+}
+
+fn native_project_for_rebind<F>(
+    provider: &str,
+    lexical_root_path: &str,
+    opencode_identity_resolver: &F,
+) -> Result<Option<String>, SourceError>
+where
+    F: Fn(&Path) -> Option<Option<String>>,
+{
+    if provider == OpenCodeAdapter::PROVIDER_ID {
+        return opencode_identity_resolver(Path::new(lexical_root_path))
+            .ok_or(SourceError::ConfirmFailed);
+    }
+    Ok(native_project_for_root(provider, lexical_root_path))
 }
 
 /// Story 4.3 — rebind a Confirmed Source whose root moved / lost permissions /
@@ -346,6 +361,27 @@ pub fn rebind_source(
     old_source_id: &SourceId,
     new_root_path: &str,
 ) -> Result<Source, SourceError> {
+    rebind_source_with_opencode_identity_resolver(registry, old_source_id, new_root_path, |root| {
+        OpenCodeAdapter.native_project_for_current_root(root)
+    })
+}
+
+/// Test seam for metadata-backed OpenCode identity resolution.
+///
+/// Production calls [`rebind_source`], whose resolver always reads the
+/// current OpenCode environment. Integration tests inject the exact
+/// missing/ambiguous/current metadata result without mutating process-global
+/// environment variables.
+#[doc(hidden)]
+pub fn rebind_source_with_opencode_identity_resolver<F>(
+    registry: &SourceRegistry<'_>,
+    old_source_id: &SourceId,
+    new_root_path: &str,
+    opencode_identity_resolver: F,
+) -> Result<Source, SourceError>
+where
+    F: Fn(&Path) -> Option<Option<String>>,
+{
     // Step 1: load + validate the old source's state. Fail-closed BEFORE
     // canonicalizing the new root: an unknown id or a bad old lifecycle yields
     // no state change.
@@ -375,9 +411,28 @@ pub fn rebind_source(
         root.identity,
     );
 
+    // OpenCode identity is metadata-backed rather than path-encoded. Resolve
+    // it before the no-op branch so missing/ambiguous current metadata cannot
+    // silently preserve a stale project id on an unchanged filesystem root.
+    let opencode_native_project = if old.provider == OpenCodeAdapter::PROVIDER_ID {
+        Some(native_project_for_rebind(
+            &old.provider,
+            new_root_path,
+            &opencode_identity_resolver,
+        )?)
+    } else {
+        None
+    };
+
     // Step 3: no-op short-circuit (same fingerprint → the "move" didn't
     // change identity). Leave the old row Confirmed, no new row.
     if old.fingerprint == new_fingerprint {
+        if opencode_native_project
+            .as_ref()
+            .is_some_and(|identity| identity != &old.native_project)
+        {
+            return Err(SourceError::ConfirmFailed);
+        }
         return Ok(old);
     }
 
@@ -391,7 +446,12 @@ pub fn rebind_source(
     // symlink divergence).
     let adapter = adapter_for(&old.provider).ok_or(SourceError::ConfirmFailed)?;
     let coverage = adapter.coverage_level();
-    let native_project = native_project_for_root(&old.provider, new_root_path);
+    let native_project = match opencode_native_project {
+        Some(identity) => identity,
+        None => {
+            native_project_for_rebind(&old.provider, new_root_path, &opencode_identity_resolver)?
+        }
+    };
     let native_project_ref: Option<&str> = native_project.as_deref();
 
     // Capture fields the closure needs before moving into the transaction
@@ -703,6 +763,8 @@ mod tests {
         assert_eq!(codex.provider_id(), "codex");
         let claude = adapter_for("claude_code").expect("claude_code registered");
         assert_eq!(claude.provider_id(), "claude_code");
+        let opencode = adapter_for("opencode").expect("opencode registered");
+        assert_eq!(opencode.provider_id(), "opencode");
         assert!(adapter_for("unknown").is_none());
     }
 

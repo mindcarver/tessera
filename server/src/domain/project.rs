@@ -53,7 +53,7 @@ pub const MAX_NATIVE_PROJECT_LEN: usize = 1024;
 /// memory store (`native_project = null`); `claude_code` is per-project
 /// (`native_project` is a non-empty, non-whitespace string ≤
 /// `MAX_NATIVE_PROJECT_LEN`).
-pub const KNOWN_PROVIDERS: &[&str] = &["codex", "claude_code"];
+pub const KNOWN_PROVIDERS: &[&str] = &["codex", "claude_code", "opencode"];
 
 /// Opaque, stable Tessera Project handle — `proj_<n>` where `n` is the
 /// `tessera_projects` `INTEGER PRIMARY KEY AUTOINCREMENT` value.
@@ -245,11 +245,12 @@ mod tests {
     }
 
     #[test]
-    fn known_providers_are_lowercase_and_codex_claude_only() {
+    fn known_providers_are_lowercase_and_complete() {
         // Pin the provider vocabulary at the domain layer so the application
         // validation and the cardinality pre-check share one source of truth.
         assert!(KNOWN_PROVIDERS.contains(&"codex"));
         assert!(KNOWN_PROVIDERS.contains(&"claude_code"));
+        assert!(KNOWN_PROVIDERS.contains(&"opencode"));
         for p in KNOWN_PROVIDERS {
             assert_eq!(*p, p.to_lowercase(), "provider ids are lowercase");
             assert!(!p.is_empty());

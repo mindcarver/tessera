@@ -31,8 +31,9 @@ pub mod source;
 // without a path change from 1.2.
 pub use source::{
     confirm_knowledge_source, confirm_source, disable_source, discover_obsidian_vaults,
-    discover_sources, list_sources, native_project_for_root, rebind_source, reject_knowledge_source,
-    reject_source, request_existing_vault_picker, SourceError, VaultPickerOutcome,
+    discover_sources, list_sources, native_project_for_root, rebind_source,
+    rebind_source_with_opencode_identity_resolver, reject_knowledge_source, reject_source,
+    request_existing_vault_picker, SourceError, VaultPickerOutcome,
 };
 
 // Story 5.1 — Tessera Project orchestration. Re-exported so IPC and tests

@@ -57,6 +57,7 @@ export const PROVIDER_MEMORY_TYPES = [
   "raw_memories",
   "rollout_summary",
   "topic_memory",
+  "agent_instruction",
 ] as const;
 export type ProviderMemoryType = (typeof PROVIDER_MEMORY_TYPES)[number];
 
@@ -64,7 +65,7 @@ export type ProviderMemoryType = (typeof PROVIDER_MEMORY_TYPES)[number];
  * Story 2.4 — provider id vocabulary. Keep in lockstep with the Rust
  * `KNOWN_PROVIDER_IDS` constant in `server/src/domain/query.rs`.
  */
-export const KNOWN_PROVIDER_IDS = ["codex", "claude_code"] as const;
+export const KNOWN_PROVIDER_IDS = ["codex", "claude_code", "opencode"] as const;
 export type KnownProviderId = (typeof KNOWN_PROVIDER_IDS)[number];
 
 /**

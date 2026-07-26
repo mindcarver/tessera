@@ -63,6 +63,8 @@ pub enum ProviderMemoryType {
     /// Distinct from [`ProviderMemoryType::Memory`] so 2.3/2.4 filtering can
     /// separate the auto-managed index from user-shaped topic files.
     TopicMemory,
+    /// OpenCode's durable first-party instruction artifact (`AGENTS.md`).
+    AgentInstruction,
 }
 
 impl ProviderMemoryType {
@@ -73,6 +75,7 @@ impl ProviderMemoryType {
             Self::RawMemories => "raw_memories",
             Self::RolloutSummary => "rollout_summary",
             Self::TopicMemory => "topic_memory",
+            Self::AgentInstruction => "agent_instruction",
         }
     }
 
@@ -92,6 +95,7 @@ impl ProviderMemoryType {
             "raw_memories" => Some(Self::RawMemories),
             "rollout_summary" => Some(Self::RolloutSummary),
             "topic_memory" => Some(Self::TopicMemory),
+            "agent_instruction" => Some(Self::AgentInstruction),
             _ => None,
         }
     }
@@ -176,6 +180,11 @@ pub enum DiscoveryBasis {
     /// stable API (AD-37); a missing/corrupt registry produces a visible
     /// diagnostic rather than a silently-empty set.
     ObsidianVaultRegistry,
+    /// OpenCode global instruction file at `<config_dir>/AGENTS.md`.
+    OpencodeGlobalConfig,
+    /// OpenCode project instruction file discovered from the read-only
+    /// `project(id, worktree)` metadata in `opencode.db`.
+    OpencodeProjectDatabase,
 }
 
 /// Candidate Source metadata produced by discovery (AD-4 / Story 1.2).
@@ -615,6 +624,18 @@ mod tests {
         assert_eq!(
             EnumerateError::AllowlistedArtifactUnresolvable.to_string(),
             "allowlisted artifact unresolvable",
+        );
+    }
+
+    #[test]
+    fn opencode_discovery_basis_json_strings_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&DiscoveryBasis::OpencodeGlobalConfig).expect("serialize"),
+            "\"opencode_global_config\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DiscoveryBasis::OpencodeProjectDatabase).expect("serialize"),
+            "\"opencode_project_database\""
         );
     }
 }

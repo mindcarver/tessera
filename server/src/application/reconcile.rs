@@ -394,7 +394,9 @@ impl ReconcileSupervisor {
             }
             // The root is the persisted normalized (canonical) root path.
             let root_path = Path::new(&source.normalized_root_path);
-            if let Err(e) = self.start_watch_internal(&source.source_id, root_path) {
+            if let Err(e) =
+                self.start_watch_internal(&source.source_id, &source.provider, root_path)
+            {
                 eprintln!(
                     "tessera: reconcile supervisor: watcher start failed for {} ({}): {e:?}; periodic reconcile still covers it",
                     source.source_id, source.normalized_root_path
@@ -410,32 +412,43 @@ impl ReconcileSupervisor {
     pub fn start_watch(
         &self,
         source_id: &SourceId,
+        provider: &str,
         canonical_root: &Path,
     ) -> std::io::Result<()> {
-        self.start_watch_internal(source_id, canonical_root)
+        self.start_watch_internal(source_id, provider, canonical_root)
     }
 
     fn start_watch_internal(
         &self,
         source_id: &SourceId,
+        provider: &str,
         canonical_root: &Path,
     ) -> std::io::Result<()> {
         let queue = Arc::clone(&self.queue);
         let captured_source = source_id.clone();
+        let captured_provider = provider.to_string();
+        let captured_root = canonical_root.to_path_buf();
         // The notify callback runs on a notify-internal thread. It ONLY records
         // a hint — it never acquires the synchronous request mutex, never
         // touches canonical tables (A-12 by construction).
         let mut watcher = RecommendedWatcher::new(
             move |result: notify::Result<notify::Event>| {
-                if result.is_ok() {
-                    queue.record_hint(&captured_source);
+                if let Ok(event) = result {
+                    record_event_hint_if_relevant(
+                        &queue,
+                        &captured_source,
+                        &captured_provider,
+                        &captured_root,
+                        &event,
+                    );
                 }
             },
             notify::Config::default(),
         )
         .map_err(std::io::Error::other)?;
+        let recursive_mode = recursive_mode_for_provider(provider);
         watcher
-            .watch(canonical_root, RecursiveMode::Recursive)
+            .watch(canonical_root, recursive_mode)
             .map_err(std::io::Error::other)?;
         let entry = WatchEntry { _watcher: watcher };
         let mut watches = self.watches.lock().expect("watches lock");
@@ -478,6 +491,31 @@ impl ReconcileSupervisor {
     #[doc(hidden)]
     pub fn state(&self) -> &Arc<IndexState> {
         &self.state
+    }
+}
+
+fn recursive_mode_for_provider(provider: &str) -> RecursiveMode {
+    if provider == crate::adapters::opencode::OpenCodeAdapter::PROVIDER_ID {
+        RecursiveMode::NonRecursive
+    } else {
+        RecursiveMode::Recursive
+    }
+}
+
+fn record_event_hint_if_relevant(
+    queue: &HintQueue,
+    source_id: &SourceId,
+    provider: &str,
+    canonical_root: &Path,
+    event: &notify::Event,
+) {
+    let relevant = provider != crate::adapters::opencode::OpenCodeAdapter::PROVIDER_ID
+        || event
+            .paths
+            .iter()
+            .any(|path| path == &canonical_root.join("AGENTS.md"));
+    if relevant {
+        queue.record_hint(source_id);
     }
 }
 
@@ -992,5 +1030,38 @@ mod tests {
         let conn = state.conn.lock().expect("lock");
         let active = ScanStore::new(&conn).active_generation(rowid).expect("active");
         assert!(active.is_some(), "reconcile worker should have committed");
+    }
+
+    #[test]
+    fn opencode_watches_only_the_source_root() {
+        assert!(matches!(
+            recursive_mode_for_provider("opencode"),
+            RecursiveMode::NonRecursive
+        ));
+        assert!(matches!(
+            recursive_mode_for_provider("codex"),
+            RecursiveMode::Recursive
+        ));
+        assert!(matches!(
+            recursive_mode_for_provider("claude_code"),
+            RecursiveMode::Recursive
+        ));
+    }
+
+    #[test]
+    fn opencode_only_queues_direct_agents_event() {
+        let queue = HintQueue::new();
+        let source_id = SourceId("src_1".to_string());
+        let root = Path::new("/tmp/opencode-project");
+        let mut event = notify::Event::new(notify::EventKind::Any);
+        event.paths.push(root.join("nested").join("file.rs"));
+
+        record_event_hint_if_relevant(&queue, &source_id, "opencode", root, &event);
+        assert!(!queue.has_pending_hint(&source_id));
+
+        event.paths.clear();
+        event.paths.push(root.join("AGENTS.md"));
+        record_event_hint_if_relevant(&queue, &source_id, "opencode", root, &event);
+        assert!(queue.has_pending_hint(&source_id));
     }
 }

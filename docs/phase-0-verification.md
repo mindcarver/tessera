@@ -54,9 +54,11 @@
 
 **能力确认**：`rusqlite`（含 `bundled`）支持 `OpenFlags::SQLITE_OPEN_READ_ONLY` 与 WAL 模式；禁用 `immutable=1` 与 `nolock=1`（按 A-15 约束）的只读打开在栈上可行。
 
-**Phase 0 用法**：Tessera **不**消费外部 SQLite。Derived Index 是 Tessera 自有的 bundled DB（`app_data_dir/tessera-index.db`，读写、可重建，AD-2/AD-7）。Codex/Claude Code 的 Agent Memory 是 Markdown 文件，非 SQLite。外部只读 SQLite 仅对未来 remote/local Knowledge Source（`source_kind: local_knowledge | remote_knowledge`，A-19）有意义，不在 MVP Agent Memory 路径。
+**Phase 0 用法**：Derived Index 是 Tessera 自有的 bundled DB（`app_data_dir/tessera-index.db`，读写、可重建，AD-2/AD-7）。Codex/Claude Code 的 Agent Memory 是 Markdown 文件，非 SQLite。
 
-**是否提升为新 AD**：**暂不**。当前无消费者；能力存在即可。
+**OpenCode 只读例外（2026-07-26）**：OpenCode provider 仅以 `SQLITE_OPEN_READ_ONLY` 打开 `<data_dir>/opencode.db`，且只执行 `SELECT id, worktree FROM project`，用于定位项目根目录的直系 `AGENTS.md`。它不读取或依赖任何 `session`、`message`、`part`、`session_input`、`session_message`、prompt/body 字段，不写数据库，也不把数据库内容当作记忆正文；实际索引内容仍只来自只读 Markdown 文件。数据库缺失、锁定、损坏或 schema 不兼容时仅跳过项目候选，不能阻断全局 OpenCode `AGENTS.md`、Codex 或 Claude Code。
+
+**是否提升为新 AD**：**暂不**。OpenCode 已是该能力的唯一消费者，但边界仍限于只读项目定位元数据：固定查询 `project.id` / `project.worktree`，索引正文只来自 `AGENTS.md`，并由只读打开与失败隔离测试守护。若未来扩展到内容表、会话表或依赖新的 WAL/锁语义，再重新评估是否需要新 AD。
 
 ## 4. Exact toolchain build check
 

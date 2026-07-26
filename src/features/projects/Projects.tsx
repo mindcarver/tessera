@@ -24,9 +24,9 @@
  *
  * Mapping targets are `(provider, native_project)` pairs — the same native
  * identity already carried on Sources and canonical records — so the
- * add-mapping picker is fed by `getSourceInventory()`. The "Codex global"
- * branch surfaces as `(codex, null)`; Claude Code per-project branches
- * surface as `(claude_code, "<project key>")`.
+ * add-mapping picker is fed by `getSourceInventory()`. The Codex and OpenCode
+ * global branches surface as `(provider, null)`; Claude Code per-project
+ * branches surface as `(claude_code, "<project key>")`.
  */
 
 import {
@@ -73,19 +73,24 @@ interface MappingOption {
 }
 
 /**
- * Build the add-mapping picker options from the Source Inventory. Codex's
- * global store collapses to a single `(codex, null)` option (AD-27: at most
- * one active project per scope); Claude Code's per-project sources become
- * one option per distinct `native_project` key. Sources whose
- * `native_project` is null AND whose provider is not `codex` are skipped —
- * the backend rejects them as `bad_request` (only Codex's global store
- * carries null), so hiding them from the picker is honest.
+ * Build the add-mapping picker options from the Source Inventory. Codex and
+ * OpenCode global stores each collapse to one `(provider, null)` option
+ * (AD-27: at most one active project per scope); Claude Code's per-project
+ * sources become one option per distinct `native_project` key. Null native
+ * identities from other providers are skipped because the backend rejects
+ * them as `bad_request`.
  */
 function buildMappingOptions(inventory: SourceInventory[]): MappingOption[] {
   const seen = new Set<string>();
   const options: MappingOption[] = [];
   for (const item of inventory) {
-    if (item.native_project === null && item.provider !== "codex") continue;
+    if (
+      item.native_project === null &&
+      item.provider !== "codex" &&
+      item.provider !== "opencode"
+    ) {
+      continue;
+    }
     const key = `${item.provider}::${item.native_project ?? ""}`;
     if (seen.has(key)) continue;
     seen.add(key);
