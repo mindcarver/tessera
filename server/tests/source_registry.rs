@@ -116,8 +116,8 @@ fn migration_v1_source_registry_applies_and_sets_current_schema_version() {
         )
         .expect("schema_version readable");
     assert_eq!(
-        v, "6",
-        "schema_version must be 6 after Story 4.2 v5_source_health_cause migration"
+        v, "8",
+        "schema_version must be 8 after Story 5.2 v7_project_mapping_revision migration"
     );
 
     // The table + unique index exist.

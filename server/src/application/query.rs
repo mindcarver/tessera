@@ -1,10 +1,13 @@
 //! Read-side orchestration for confirmed Sources and their current active index.
 
+use std::collections::HashSet;
+
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::ports::provider_adapter::ProviderMemoryType;
 use crate::domain::ports::query_store::{BrowseCursorKey, QueryStore, SearchCursorKey};
+use crate::domain::project::ProjectId;
 use crate::domain::query::{
     BrowseEmptyState, BrowsePage, BrowseRequest, SearchEmptyState, SearchPage, SearchRequest,
     SourceQueryStatus, SourceQueryStatusKind, MAX_CURSOR_BYTES,
@@ -17,15 +20,18 @@ use crate::index::SourceRegistry;
 #[derive(Debug)]
 pub enum QueryError { BadRequest, CursorStale, Internal }
 
-/// Versioned cursor payload. Version 3 (Story 2.4) additionally binds the
-/// active cross-provider filters (`provider`, `memory_type`, `native_project`,
+/// Versioned cursor payload. Version 4 (Story 5.2) additionally binds the
+/// `tessera_project` filter so a project-filter change mid-pagination
+/// invalidates an in-flight cursor (mirrors the v3 filter-binding pattern at
+/// the project-projection boundary). Version 3 (Story 2.4) bound the active
+/// cross-provider filters (`provider`, `memory_type`, `native_project`,
 /// `since`) so a filter change mid-pagination invalidates an in-flight cursor.
 /// Version 2 (Story 2.3) carried the full relevance sort key of the last record
 /// on the previous page so the next-page predicate can perform a correct
 /// "strictly-after" comparison across all four ORDER BY keys — a `record_id`-
 /// only cursor would silently skip records whose id sorts below the cursor but
 /// whose relevance rank is worse. The hex-encoded envelope format
-/// (`v3.<hex>`) is unchanged; only the JSON payload and the version byte
+/// (`v4.<hex>`) is unchanged; only the JSON payload and the version byte
 /// change.
 #[derive(Debug, Serialize, Deserialize)]
 struct Cursor {
@@ -36,7 +42,7 @@ struct Cursor {
     /// Relevance sort-key components (added in cursor v2). For a v1 cursor
     /// supplied by an older client, `search` rejects it as `CursorStale`
     /// (HTTP 409 `cursor_stale`) so the UI's existing recovery path re-issues
-    /// the first page under v3 — there is no persistent cursor storage, so
+    /// the first page under v4 — there is no persistent cursor storage, so
     /// this is transparent to the user.
     last_title_match: bool,
     last_observed_at: i64,
@@ -47,20 +53,24 @@ struct Cursor {
     /// the wire string (`ProviderMemoryType::as_str`) so a future variant
     /// addition does not silently break cursor decode; round-tripped through
     /// `ProviderMemoryType::parse_str` on the comparison path. `source` is the
-    /// `src_<n>` handle string (round-trips through `SourceId` on the comparison
-    /// path); it is NOT bound into the cursor as the reserved
-    /// `tessera_project` slot (Epic 5 TODO: when Tessera-Project projection
-    /// gains a real SQL predicate, bind `tessera_project` here too so a project
-    /// change invalidates an in-flight cursor — see encode_cursor/decode_cursor
-    /// and `cursor_filters_match`).
+    /// `src_<n>` handle string (round-trips through `SourceId` on the
+    /// comparison path).
     provider: Option<String>,
     source: Option<String>,
     memory_type: Option<String>,
     native_project: Option<String>,
     since: Option<i64>,
+    /// Story 5.2 — Tessera-project filter bound into the cursor (added in
+    /// v4). For a v3 cursor supplied by an older client, `search` rejects it
+    /// as `CursorStale` (mirroring the v1/v2→v3 path). Stored as the
+    /// `proj_<n>` wire string so the cursor round-trips the same handle shape
+    /// the request carries; compared as a raw string (the SQL layer normalizes
+    /// through `ProjectId::to_rowid` at the predicate boundary, but a
+    /// mid-pagination project change is a string mismatch either way).
+    tessera_project: Option<String>,
 }
 
-const CURSOR_VERSION: u8 = 3;
+const CURSOR_VERSION: u8 = 4;
 
 pub fn search(
     registry: &SourceRegistry<'_>,
@@ -71,15 +81,16 @@ pub fn search(
     let revision = store.current_index_revision().map_err(|_| QueryError::Internal)?;
     let cursor = match request.cursor() {
         Some(raw) => {
-            // A `v1.<hex>` or `v2.<hex>` cursor comes from a pre-2.4 client
-            // (record_id-only / relevance-without-filters sort key). The
-            // cursor shape changed in 2.4 (filters bound in), so treat the
-            // older envelope as `CursorStale` (HTTP 409 `cursor_stale`) rather
-            // than `BadRequest`. The existing UI recovery path for
-            // `cursor_stale` re-runs the first page, which is the correct
-            // outcome; a generic contract error would surface an opaque
-            // `bad_request` instead. v3 decode logic is unchanged below.
-            if raw.starts_with("v1.") || raw.starts_with("v2.") {
+            // A `v1.<hex>`, `v2.<hex>`, or `v3.<hex>` cursor comes from a
+            // pre-5.2 client (record_id-only / relevance-without-filters /
+            // filters-without-tessera-project sort key). The cursor shape
+            // changed in 5.2 (tessera_project bound in), so treat the older
+            // envelope as `CursorStale` (HTTP 409 `cursor_stale`) rather than
+            // `BadRequest`. The existing UI recovery path for `cursor_stale`
+            // re-runs the first page, which is the correct outcome; a generic
+            // contract error would surface an opaque `bad_request` instead.
+            // v4 decode logic is unchanged below.
+            if raw.starts_with("v1.") || raw.starts_with("v2.") || raw.starts_with("v3.") {
                 return Err(QueryError::CursorStale);
             }
             let cursor = decode_cursor(raw).ok_or(QueryError::BadRequest)?;
@@ -126,12 +137,13 @@ pub fn search(
             memory_type: request.memory_type().map(ProviderMemoryType::as_str).map(str::to_string),
             native_project: request.native_project().map(str::to_string),
             since: request.since(),
-            // Epic 5 TODO: bind `tessera_project` once it has a SQL predicate
-            // (today it is accepted but ignored, so it does not invalidate the
-            // cursor). See the Cursor struct doc.
+            // Story 5.2 — bind the active tessera_project so a project-filter
+            // change mid-pagination invalidates the cursor (mirrors the v3
+            // filter-binding pattern).
+            tessera_project: request.tessera_project().map(str::to_string),
         }))
     } else { None };
-    let sources = source_status_sidecar(registry, &store)?;
+    let sources = source_status_sidecar(registry, &store, request.tessera_project())?;
     let empty_state = if results.is_empty() && cursor.is_none() {
         empty_state(registry, &store)?
     } else { None };
@@ -320,7 +332,7 @@ pub fn browse(
                 .map(str::to_string),
         }))
     } else { None };
-    let sources = source_status_sidecar(registry, &store)?;
+    let sources = source_status_sidecar(registry, &store, None)?;
     let empty_state = if results.is_empty() && cursor.is_none() {
         Some(browse_empty_state(&store, request.source())?)
     } else { None };
@@ -452,6 +464,7 @@ fn cursor_filters_match(cursor: &Cursor, request: &SearchRequest) -> bool {
         && cursor.native_project.as_deref() == request.native_project()
         && cursor.since == request.since()
         && cursor.memory_type.as_deref() == request.memory_type().map(ProviderMemoryType::as_str)
+        && cursor.tessera_project.as_deref() == request.tessera_project()
 }
 
 /// Build the FR-14 per-query availability sidecar: one row per **confirmed**
@@ -461,6 +474,15 @@ fn cursor_filters_match(cursor: &Cursor, request: &SearchRequest) -> bool {
 /// sidecar — the flag is informational (Design Notes: "the sidecar flags; it
 /// does not hide").
 ///
+/// Story 5.2 (Q3=A) — when `tessera_project` is `Some`, the sidecar NARROWS
+/// to only confirmed sources whose `(provider, COALESCE(native_project, ''))`
+/// is in that project's mapping scope set. Without narrowing, a project-
+/// filtered search would report Coverage/Health for sources whose records
+/// the project filter excludes — misleading. With `tessera_project == None`
+/// the sidecar is unchanged (all confirmed sources). An unknown / malformed
+/// `proj_<n>` resolves to an empty scope set → empty sidecar, matching the
+/// I/O matrix's "unknown project ⇒ empty results, not an error" posture.
+///
 /// FR-14 best-effort: a per-source status lookup failure (e.g. a corrupt
 /// `scan_runs.state` row or an unreadable active-generation marker) is logged
 /// and falls back to a conservative status for THAT source only — it NEVER
@@ -469,13 +491,63 @@ fn cursor_filters_match(cursor: &Cursor, request: &SearchRequest) -> bool {
 fn source_status_sidecar(
     registry: &SourceRegistry<'_>,
     store: &ScanStore<'_>,
+    tessera_project: Option<&str>,
 ) -> Result<Vec<SourceQueryStatus>, QueryError> {
     let sources = registry.list().map_err(|_| QueryError::Internal)?;
+    // Story 5.2 — resolve the project filter to its mapping scope set once.
+    // The three states MUST stay distinct so the sidecar matches the SQL
+    // layer's "unknown / malformed project ⇒ empty results, not an error"
+    // posture:
+    //   - `None`                       ⇒ no filter; do NOT narrow (all
+    //                                  confirmed sources listed).
+    //   - `Some(empty set)`            ⇒ filter present but resolves to no
+    //                                  mappings (malformed `proj_x` handle,
+    //                                  unknown id, or a project with zero
+    //                                  mappings); narrow to nothing.
+    //   - `Some({(provider, np), …})`  ⇒ narrow to the project's mapped
+    //                                  sources.
+    // Collapsing a malformed id to `None` (no narrowing) would list ALL
+    // confirmed sources for a query whose result set is empty — misleading
+    // and inconsistent with the SQL EXISTS predicate, which binds
+    // `tessera_project_id = NULL` and is therefore always false. The
+    // `COALESCE(native_project, '')` collapse on the value side mirrors the
+    // Story 5.1 uniqueness index's NULL handling so a Codex global mapping
+    // matches a confirmed Codex source (NULL `native_project`).
+    let scope_set: Option<HashSet<(String, String)>> = match tessera_project {
+        None => None,
+        Some(id) => {
+            let set = match ProjectId(id.to_string()).to_rowid() {
+                Some(rowid) => store
+                    .project_mapping_scope_set(rowid)
+                    .map_err(|_| QueryError::Internal)?
+                    .into_iter()
+                    .map(|(provider, native_project)| {
+                        (provider, native_project.unwrap_or_default())
+                    })
+                    .collect(),
+                // Malformed handle (e.g. "proj_x", "garbage"): the filter is
+                // present but matches nothing. Produce an EMPTY set (not None)
+                // so the sidecar narrows to nothing rather than listing every
+                // confirmed source for an empty result set.
+                None => HashSet::new(),
+            };
+            Some(set)
+        }
+    };
     let mut out = Vec::new();
     for source in sources
         .into_iter()
         .filter(|source| source.lifecycle_state == SourceLifecycle::Confirmed)
     {
+        // Story 5.2 — when narrowing, skip sources whose scope is not in the
+        // project's mapping set. The collapse matches the scope set's
+        // `COALESCE(..., '')` shape.
+        if let Some(set) = &scope_set {
+            let key = (source.provider.clone(), source.native_project.clone().unwrap_or_default());
+            if !set.contains(&key) {
+                continue;
+            }
+        }
         let Some(rowid) = source.source_id.to_rowid() else { continue };
         let status = match source_status(store, rowid, source.health_state) {
             Ok(status) => status,
@@ -579,13 +651,13 @@ fn empty_state(
 fn encode_cursor(cursor: &Cursor) -> String {
     let json = serde_json::to_vec(cursor).expect("cursor DTO serialization is total");
     let mut encoded = String::with_capacity(3 + json.len() * 2);
-    encoded.push_str("v3.");
+    encoded.push_str("v4.");
     for byte in json { encoded.push_str(&format!("{byte:02x}")); }
     encoded
 }
 
 fn decode_cursor(raw: &str) -> Option<Cursor> {
-    let hex = raw.strip_prefix("v3.")?;
+    let hex = raw.strip_prefix("v4.")?;
     if hex.is_empty() || hex.len() % 2 != 0 || raw.len() > MAX_CURSOR_BYTES { return None; }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for pair in hex.as_bytes().chunks_exact(2) {
@@ -616,6 +688,11 @@ fn decode_cursor(raw: &str) -> Option<Cursor> {
     //   - `memory_type` must round-trip through `ProviderMemoryType::parse_str`,
     //   - `source` must be a well-formed `src_<n>` handle (`to_rowid().is_some()`),
     //   - `since` must be in `[0, MAX_SINCE]`.
+    // Story 5.2 — `tessera_project` is bounded by `MAX_FILTER_BYTES` (no
+    // vocabulary check; an unknown / malformed `proj_<n>` is honestly compared
+    // via `cursor_filters_match` and surfaces `CursorStale` if it differs from
+    // the request, mirroring the SQL layer's "unknown ⇒ matches nothing"
+    // posture).
     if cursor.provider.as_ref().is_some_and(|value| {
         value.len() > crate::domain::query::MAX_FILTER_BYTES
             || !crate::domain::query::KNOWN_PROVIDER_IDS.contains(&value.as_str())
@@ -627,6 +704,7 @@ fn decode_cursor(raw: &str) -> Option<Cursor> {
         || cursor.native_project.as_ref().is_some_and(|value| value.len() > crate::domain::query::MAX_FILTER_BYTES)
         || cursor.memory_type.as_ref().is_some_and(|value| ProviderMemoryType::parse_str(value).is_none())
         || cursor.since.is_some_and(|value| !(0..=crate::domain::query::MAX_SINCE).contains(&value))
+        || cursor.tessera_project.as_ref().is_some_and(|value| value.len() > crate::domain::query::MAX_FILTER_BYTES)
     {
         return None;
     }
@@ -651,10 +729,11 @@ mod tests {
             memory_type: Some("memory".into()),
             native_project: None,
             since: Some(1_700_000_000),
+            tessera_project: Some("proj_7".into()),
         };
         let encoded = encode_cursor(&cursor);
         assert!(!encoded.contains("记忆"));
-        assert!(encoded.starts_with("v3."));
+        assert!(encoded.starts_with("v4."));
         let back = decode_cursor(&encoded).unwrap();
         assert_eq!(back.query, "记忆");
         assert_eq!(back.last_record_id, "rec_2");
@@ -666,6 +745,8 @@ mod tests {
         assert_eq!(back.memory_type.as_deref(), Some("memory"));
         assert!(back.native_project.is_none());
         assert_eq!(back.since, Some(1_700_000_000));
+        // Story 5.2 — tessera_project round-trips through the v4 envelope.
+        assert_eq!(back.tessera_project.as_deref(), Some("proj_7"));
     }
 
     #[test]
@@ -734,6 +815,7 @@ mod tests {
             memory_type: None,
             native_project: None,
             since: None,
+            tessera_project: None,
         };
         let equivalent = crate::domain::query::SearchRequest::new_with_filters(
             "q".into(),
@@ -787,15 +869,18 @@ mod tests {
     /// field; `decode_cursor` must reject it as `None`.
     #[test]
     fn decode_cursor_rejects_tampered_bound_filters() {
-        // Hex-encode a JSON cursor body and wrap it in the v3 envelope. Building
+        // Hex-encode a JSON cursor body and wrap it in the v4 envelope. Building
         // the cursor by hand (not via encode_cursor) lets us inject values that
         // SearchRequest/encode_cursor would reject upstream.
         fn envelope(json: &str) -> String {
             let hex: String = json.bytes().map(|byte| format!("{byte:02x}")).collect();
-            format!("v3.{hex}")
+            format!("v4.{hex}")
         }
         // Build a cursor JSON body with the bound filters parameterized; every
         // other field is a fixed valid baseline. `null` means "filter absent".
+        // Story 5.2 — the body includes `tessera_project` (added in v4); the
+        // rejection cases below mutate the OTHER bound filters, and the
+        // baseline stays `tessera_project:null`.
         fn body(
             provider: Option<&str>,
             source: Option<&str>,
@@ -813,7 +898,7 @@ mod tests {
                 None => "\"since\":null".to_string(),
             };
             format!(
-                r#"{{"version":3,"query":"q","revision":"rev","last_record_id":"rec_1","last_title_match":false,"last_observed_at":0,"last_coverage_full":false,{provider},{source},{memory_type},"native_project":null,{since}}}"#,
+                r#"{{"version":4,"query":"q","revision":"rev","last_record_id":"rec_1","last_title_match":false,"last_observed_at":0,"last_coverage_full":false,{provider},{source},{memory_type},"native_project":null,{since},"tessera_project":null}}"#,
                 provider = str_field("provider", provider),
                 source = str_field("source", source),
                 memory_type = str_field("memory_type", memory_type),
@@ -870,6 +955,67 @@ mod tests {
         assert!(
             decode_cursor(&envelope(&body(Some("codex"), Some("src_1"), Some("memory"), Some(0)))).is_some(),
             "valid bound filters must decode"
+        );
+
+        // P7 — an over-length `tessera_project` (mirrors the provider/source
+        // length-cap cases above). `body(...)` hardcodes
+        // `"tessera_project":null`; splice in a 5000-char value to exceed
+        // `MAX_FILTER_BYTES` and confirm `decode_cursor` rejects it as None.
+        // The hex envelope grows proportionally but stays well under
+        // `MAX_CURSOR_BYTES`, so the rejection must come from the
+        // tessera_project length check, not the overall cursor cap.
+        let overlong_tp = "x".repeat(5000);
+        let overlong_tp_body = body(None, None, None, None)
+            .replace("\"tessera_project\":null", &format!("\"tessera_project\":\"{overlong_tp}\""));
+        assert!(
+            decode_cursor(&envelope(&overlong_tp_body)).is_none(),
+            "over-length tessera_project (5000 chars) must be rejected"
+        );
+    }
+
+    /// P4 — the in-body `version` byte is load-bearing on decode. The envelope
+    /// prefix (`v4.<hex>`) only gates the OUTER envelope shape; a hand-edited
+    /// `v4.` envelope whose JSON body claims `"version":3` must still be
+    /// rejected by `decode_cursor` (returning `None`), so a same-prefix tampered
+    /// cursor cannot sneak past the version check. Pins the source-side check at
+    /// the top of `decode_cursor` (`cursor.version != CURSOR_VERSION`) so a
+    /// future refactor that moves / drops the check fails this test loudly.
+    #[test]
+    fn decode_cursor_rejects_tampered_version_byte() {
+        fn envelope(json: &str) -> String {
+            let hex: String = json.bytes().map(|byte| format!("{byte:02x}")).collect();
+            format!("v4.{hex}")
+        }
+        // Baseline body shape mirroring `decode_cursor_rejects_tampered_bound_filters`,
+        // with version=4 (CURSOR_VERSION) so the baseline decodes cleanly.
+        fn body(version: u8) -> String {
+            format!(
+                r#"{{"version":{version},"query":"q","revision":"rev","last_record_id":"rec_1","last_title_match":false,"last_observed_at":0,"last_coverage_full":false,"provider":null,"source":null,"memory_type":null,"native_project":null,"since":null,"tessera_project":null}}"#
+            )
+        }
+        // Baseline (version=4) decodes — guards against the rejection below
+        // passing due to a typo in the helper.
+        assert!(
+            decode_cursor(&envelope(&body(CURSOR_VERSION))).is_some(),
+            "baseline v4 cursor must decode"
+        );
+        // Tampered version byte (3) inside a `v4.` envelope → rejected. The
+        // prefix gate only inspects the envelope, so the in-body byte is the
+        // version-tampering backstop.
+        assert!(
+            decode_cursor(&envelope(&body(3))).is_none(),
+            "tampered version byte (3) inside a v4 envelope must be rejected"
+        );
+        // Other tampered version bytes are also rejected (pins the check is
+        // an equality compare, not a `> CURSOR_VERSION` or `< CURSOR_VERSION`
+        // half-check that would let a lower version slip through).
+        assert!(
+            decode_cursor(&envelope(&body(99))).is_none(),
+            "tampered version byte (99) must be rejected"
+        );
+        assert!(
+            decode_cursor(&envelope(&body(0))).is_none(),
+            "tampered version byte (0) must be rejected"
         );
     }
 }

@@ -506,8 +506,11 @@ fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
                         .map_err(|_| ())?,
                 );
             }
-            // Reserved for Epic 5 — accepted on the wire so Epic 5 can fill the
-            // slot without a contract change; ignored at the SQL layer.
+            // Story 5.2 — Tessera-project projection filter (was reserved in
+            // 2.4). Accepted on the wire as `proj_<n>` and forwarded to
+            // SearchFilters; resolved to the project rowid at the SQL
+            // boundary. An unknown / malformed id honestly matches nothing
+            // (treated as a filter, NOT an error).
             "tessera_project" if tessera_project.is_none() => {
                 tessera_project = Some(percent_decode_bounded(raw_value, MAX_FILTER_BYTES).ok_or(())?);
             }

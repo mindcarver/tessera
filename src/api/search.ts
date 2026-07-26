@@ -100,6 +100,15 @@ export interface SearchFilters {
    * pagination session by the UI; the server never computes relative time.
    */
   since?: number;
+  /**
+   * Story 5.2 — Tessera Project filter (`proj_<n>` handle). Narrows the
+   * result set to records whose `(provider, native_project)` is in the
+   * project's mapping scope set. Unknown / malformed ids honestly match
+   * nothing (treated as a filter that excludes all rows, NOT an error).
+   * Bound into the cursor (v4) so a project-filter change mid-pagination
+   * surfaces `cursor_stale`.
+   */
+  tessera_project?: string;
 }
 
 /**
@@ -123,6 +132,7 @@ export function buildSearchParams(
     if (filters.memory_type) params.set("memory_type", filters.memory_type);
     if (filters.native_project) params.set("native_project", filters.native_project);
     if (filters.since !== undefined) params.set("since", String(filters.since));
+    if (filters.tessera_project) params.set("tessera_project", filters.tessera_project);
   }
   return params;
 }

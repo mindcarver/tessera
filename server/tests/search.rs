@@ -868,27 +868,468 @@ fn source_filter_binds_into_cursor_and_round_trips() {
     assert!(matches!(err, QueryError::CursorStale), "source filter change must be CursorStale, got {err:?}");
 }
 
-/// Story 2.4 I/O matrix — `tessera_project` is accepted but produces NO
-/// predicate (reserved for Epic 5). A request carrying it returns the same
-/// result set as one without it.
+/// Story 5.2 — `tessera_project` (was reserved in 2.4) now narrows the result
+/// set to records whose `(provider, native_project)` is in the project's
+/// mapping scope set. Replaces the 2.4 "accepted but ignored" test: the slot
+/// is now live. Uses the `build_filter_fixture` Codex (NULL native_project) +
+/// Claude (proj-claude) sources, creates a project mapping the Codex global
+/// scope, and asserts only Codex records return.
 #[test]
-fn tessera_project_filter_is_accepted_but_ignored_at_sql_layer() {
+fn tessera_project_filter_narrows_to_mapped_scope() {
+    use tessera_lib::application::{add_mapping, create_project};
+    use tessera_lib::domain::project::{CreateProjectRequest, MappingRequest};
     let conn = build_filter_fixture();
     let registry = SourceRegistry::new(&conn);
-    let with_reserved = application::search(
+    let project_store = tessera_lib::index::ProjectStore::new(&conn);
+    // Create a project and map the Codex global scope to it.
+    let project = create_project(
+        &project_store,
+        &CreateProjectRequest { name: "Codex-only".to_string() },
+    )
+    .unwrap();
+    add_mapping(
+        &project_store,
+        &MappingRequest {
+            project_id: project.project_id.clone(),
+            provider: "codex".to_string(),
+            native_project: None,
+        },
+    )
+    .unwrap();
+
+    // Search by the project → only Codex records match (the Codex global
+    // scope maps via COALESCE(native_project, '') = '').
+    let project_filter = SearchFilters {
+        tessera_project: Some(project.project_id.0.clone()),
+        ..Default::default()
+    };
+    let narrowed = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters("federation".into(), None, Some(20), project_filter).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        narrowed.results().len(),
+        2,
+        "tessera_project must narrow to the 2 Codex records"
+    );
+    let providers: std::collections::HashSet<&str> =
+        narrowed.results().iter().map(|r| r.provider()).collect();
+    assert!(providers.contains("codex"), "only Codex records match: {providers:?}");
+    assert!(!providers.contains("claude_code"), "Claude records must be excluded");
+
+    // Unknown project id → empty results (treated as a filter that matches
+    // nothing, NOT an error).
+    let unknown = application::search(
         &registry,
         &conn,
         SearchRequest::new_with_filters(
             "federation".into(),
             None,
             Some(20),
-            SearchFilters { tessera_project: Some("epic-5-future".into()), ..Default::default() },
-        ).unwrap(),
-    ).unwrap();
-    // Same result set as the unfiltered default scope — no predicate applied.
-    assert_eq!(with_reserved.results().len(), 4, "tessera_project must not narrow results");
-    let providers: std::collections::HashSet<&str> = with_reserved.results().iter().map(|r| r.provider()).collect();
-    assert!(providers.contains("codex") && providers.contains("claude_code"));
+            SearchFilters { tessera_project: Some("proj_999".into()), ..Default::default() },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(unknown.results().is_empty(), "unknown project id must yield no rows");
+
+    // The sidecar narrows to the project's mapped sources (only Codex here).
+    assert_eq!(narrowed.sources().len(), 1, "sidecar must narrow to the 1 mapped source");
+    assert_eq!(narrowed.sources()[0].provider, "codex");
+}
+
+/// Story 5.2 (P1 regression) — a MALFORMED `tessera_project` id
+/// (`ProjectId::to_rowid()` returns None, e.g. "proj_x" / "garbage") must
+/// collapse to an EMPTY scope set, NOT to "no narrowing". The SQL layer
+/// already binds `tessera_project_id = NULL` (which makes the EXISTS
+/// predicate always false → empty results); the sidecar MUST match that
+/// posture or it would mis-list every confirmed source as in-scope for a
+/// query whose result set is empty. Distinct from the `proj_999` case in
+/// `tessera_project_filter_narrows_to_mapped_scope` (well-formed handle,
+/// unknown rowid → SQL returns no mappings → empty set), this case covers
+/// the malformed-handle path where `to_rowid()` itself returns None.
+#[test]
+fn malformed_tessera_project_id_yields_empty_results_and_empty_sidecar() {
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    // Two confirmed sources in the fixture (Codex global + Claude proj-claude);
+    // a malformed project id must NOT list them in the sidecar.
+    for malformed in ["proj_x", "garbage", "proj_", "proj_abc"] {
+        let page = application::search(
+            &registry,
+            &conn,
+            SearchRequest::new_with_filters(
+                "federation".into(),
+                None,
+                Some(20),
+                SearchFilters {
+                    tessera_project: Some(malformed.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            page.results().is_empty(),
+            "malformed tessera_project {malformed:?} must yield zero results"
+        );
+        assert!(
+            page.sources().is_empty(),
+            "malformed tessera_project {malformed:?} must yield zero sidecar sources \
+             (collapse to empty set, NOT no-narrowing)"
+        );
+    }
+}
+
+/// Story 5.2 — Codex global (`native_project IS NULL`) records ARE returned
+/// when the project maps `(codex, null)`. The COALESCE collapse in the EXISTS
+/// predicate mirrors the Story 5.1 uniqueness index, so NULL matches NULL.
+#[test]
+fn tessera_project_codex_null_scope_matches_via_coalesce() {
+    use tessera_lib::application::{add_mapping, create_project};
+    use tessera_lib::domain::project::{CreateProjectRequest, MappingRequest};
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    let project_store = tessera_lib::index::ProjectStore::new(&conn);
+    let project = create_project(
+        &project_store,
+        &CreateProjectRequest { name: "Codex-global".to_string() },
+    )
+    .unwrap();
+    add_mapping(
+        &project_store,
+        &MappingRequest {
+            project_id: project.project_id.clone(),
+            provider: "codex".to_string(),
+            native_project: None,
+        },
+    )
+    .unwrap();
+
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters {
+                tessera_project: Some(project.project_id.0.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Both Codex records (rec_codex_old, rec_codex_summary) have
+    // native_project IS NULL — both MUST match via COALESCE.
+    let ids: std::collections::HashSet<&str> =
+        page.results().iter().map(|r| r.record_id()).collect();
+    assert!(ids.contains("rec_codex_old"));
+    assert!(ids.contains("rec_codex_summary"));
+    // The Claude records have native_project = "proj-claude" — excluded.
+    assert!(!ids.contains("rec_claude_mem"));
+    assert!(!ids.contains("rec_claude_topic"));
+}
+
+/// Story 5.2 — empty `q=` + `tessera_project` returns every in-scope record
+/// (browse-by-project via Search). The instr predicate matches every row when
+/// the needle is empty. Without a tessera_project filter, an empty query is
+/// still rejected (2.x contract). Also covers a newly-created project (zero
+/// mappings) → empty results + `SearchEmptyState::NoMatch` on page 1.
+#[test]
+fn tessera_project_empty_query_returns_all_in_scope_records() {
+    use tessera_lib::application::{add_mapping, create_project};
+    use tessera_lib::domain::project::{CreateProjectRequest, MappingRequest};
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    let project_store = tessera_lib::index::ProjectStore::new(&conn);
+
+    // Empty query with NO project filter → still rejected (2.x contract).
+    assert!(SearchRequest::new_with_filters(
+        "".into(),
+        None,
+        Some(20),
+        SearchFilters::default(),
+    )
+    .is_err());
+
+    // A project with zero mappings (newly created) → empty results, NoMatch.
+    let empty_project = create_project(
+        &project_store,
+        &CreateProjectRequest { name: "Empty".to_string() },
+    )
+    .unwrap();
+    let empty_page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "".into(),
+            None,
+            Some(20),
+            SearchFilters {
+                tessera_project: Some(empty_project.project_id.0.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(empty_page.results().is_empty());
+    assert_eq!(empty_page.empty_state(), Some(SearchEmptyState::NoMatch));
+
+    // A project mapped to both Codex and Claude Code scopes → empty query
+    // returns every in-scope record (4 in the fixture).
+    let full_project = create_project(
+        &project_store,
+        &CreateProjectRequest { name: "Full".to_string() },
+    )
+    .unwrap();
+    add_mapping(
+        &project_store,
+        &MappingRequest {
+            project_id: full_project.project_id.clone(),
+            provider: "codex".to_string(),
+            native_project: None,
+        },
+    )
+    .unwrap();
+    add_mapping(
+        &project_store,
+        &MappingRequest {
+            project_id: full_project.project_id.clone(),
+            provider: "claude_code".to_string(),
+            native_project: Some("proj-claude".to_string()),
+        },
+    )
+    .unwrap();
+    let page = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "".into(),
+            None,
+            Some(20),
+            SearchFilters {
+                tessera_project: Some(full_project.project_id.0.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // The fixture's 4 records all match: 2 Codex (NULL) + 2 Claude (proj-claude).
+    assert_eq!(page.results().len(), 4, "empty q + project returns every in-scope record");
+    assert!(page.empty_state().is_none());
+}
+
+/// Story 5.2 — a search cursor binds `tessera_project`, so changing the
+/// project filter mid-pagination surfaces `cursor_stale` (mirrors the v3
+/// filter-binding pattern).
+#[test]
+fn tessera_project_filter_change_mid_pagination_is_cursor_stale() {
+    use tessera_lib::application::{add_mapping, create_project};
+    use tessera_lib::domain::project::{CreateProjectRequest, MappingRequest};
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    let project_store = tessera_lib::index::ProjectStore::new(&conn);
+
+    let project_a = create_project(
+        &project_store,
+        &CreateProjectRequest { name: "A".to_string() },
+    )
+    .unwrap();
+    add_mapping(
+        &project_store,
+        &MappingRequest {
+            project_id: project_a.project_id.clone(),
+            provider: "codex".to_string(),
+            native_project: None,
+        },
+    )
+    .unwrap();
+    let project_b = create_project(
+        &project_store,
+        &CreateProjectRequest { name: "B".to_string() },
+    )
+    .unwrap();
+    add_mapping(
+        &project_store,
+        &MappingRequest {
+            project_id: project_b.project_id.clone(),
+            provider: "claude_code".to_string(),
+            native_project: Some("proj-claude".to_string()),
+        },
+    )
+    .unwrap();
+
+    // Page 1 under project A.
+    let first = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(1),
+            SearchFilters {
+                tessera_project: Some(project_a.project_id.0.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let cursor = first.next_cursor().expect("page-1 cursor").to_string();
+
+    // Continue with project B's filter → CursorStale (cursor bound project A).
+    let err = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            Some(cursor),
+            Some(1),
+            SearchFilters {
+                tessera_project: Some(project_b.project_id.0.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, QueryError::CursorStale),
+        "mid-pagination project change must be CursorStale, got {err:?}"
+    );
+}
+
+/// Story 5.2 — the AC's headline combination: a mapping-change mid-pagination
+/// invalidates an outstanding cursor EVEN WHEN the request repeats the SAME
+/// `tessera_project` filter. Distinct from
+/// `tessera_project_filter_change_mid_pagination_is_cursor_stale` (which pins
+/// the filter-change path: cursor bound project A, request project B): here
+/// the cursor is bound to project A's pre-bump `current_index_revision`, and
+/// the add-mapping bumps the shared `project_mapping_revision` (which folds
+/// into `current_index_revision`), so the replayed cursor's bound revision
+/// mismatches the live revision even though the project filter is unchanged.
+/// This pins mapping-change × project-filter-set, the AC's load-bearing case
+/// for AD-31 cursor invalidation under the Story 5.2 project projection.
+#[test]
+fn mapping_change_invalidates_cursor_with_same_project_filter() {
+    use tessera_lib::application::{add_mapping, create_project};
+    use tessera_lib::domain::project::{CreateProjectRequest, MappingRequest};
+    let conn = build_filter_fixture();
+    let registry = SourceRegistry::new(&conn);
+    let project_store = tessera_lib::index::ProjectStore::new(&conn);
+
+    // Create project A and map the Codex global scope (2 Codex records in
+    // scope, so limit=1 leaves a page-2 cursor).
+    let project_a = create_project(
+        &project_store,
+        &CreateProjectRequest { name: "A".to_string() },
+    )
+    .unwrap();
+    add_mapping(
+        &project_store,
+        &MappingRequest {
+            project_id: project_a.project_id.clone(),
+            provider: "codex".to_string(),
+            native_project: None,
+        },
+    )
+    .unwrap();
+
+    // Page 1 under project A (limit 1 → has more, captures cursor).
+    let first = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(1),
+            SearchFilters {
+                tessera_project: Some(project_a.project_id.0.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first.results().len(), 1, "page 1 returns one in-scope Codex record");
+    assert!(
+        first.results()[0].provider() == "codex",
+        "the in-scope record is a Codex record"
+    );
+    let cursor = first.next_cursor().expect("page-1 cursor").to_string();
+
+    // Add a SECOND mapping to project A (the Codex global scope is already
+    // mapped, so this is a genuine scope-set change, not an idempotent re-add).
+    // The bump_project_mapping_revision call inside `add_mapping`'s
+    // transaction bumps the shared revision that folds into
+    // `current_index_revision`.
+    add_mapping(
+        &project_store,
+        &MappingRequest {
+            project_id: project_a.project_id.clone(),
+            provider: "claude_code".to_string(),
+            native_project: Some("proj-claude".to_string()),
+        },
+    )
+    .unwrap();
+
+    // Replay the cursor REPEATING THE SAME project A filter → CursorStale.
+    // The cursor's bound revision predates the add-mapping bump, so the
+    // revision mismatch surfaces — independent of the project filter, which
+    // is unchanged. This is the AC's headline combination.
+    let err = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            Some(cursor),
+            Some(1),
+            SearchFilters {
+                tessera_project: Some(project_a.project_id.0.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, QueryError::CursorStale),
+        "mapping-change mid-pagination with the SAME project filter must be CursorStale, got {err:?}"
+    );
+
+    // A fresh page-1 under the same project A filter still succeeds and now
+    // returns the expanded scope (Codex + Claude = 4 records). This confirms
+    // the cursor was rejected for a revision mismatch, not for any request
+    // shape issue, and that the mapping change took effect on the live view.
+    let fresh = application::search(
+        &registry,
+        &conn,
+        SearchRequest::new_with_filters(
+            "federation".into(),
+            None,
+            Some(20),
+            SearchFilters {
+                tessera_project: Some(project_a.project_id.0.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let providers: std::collections::HashSet<&str> =
+        fresh.results().iter().map(|r| r.provider()).collect();
+    assert!(
+        providers.contains("codex") && providers.contains("claude_code"),
+        "fresh page-1 under project A must include both providers after the mapping add: {providers:?}"
+    );
+    assert_eq!(fresh.results().len(), 4, "expanded scope has all 4 records");
 }
 
 /// Story 2.4 I/O matrix — unknown provider / memory_type / negative `since`

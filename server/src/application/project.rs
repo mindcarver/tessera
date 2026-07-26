@@ -201,6 +201,12 @@ pub fn rename_project(
 /// project delete run inside ONE transaction (the store's
 /// [`ProjectStore::with_transaction`]) so a crash between them cannot leave a
 /// project row present with its mappings already gone.
+///
+/// Story 5.2 — bumps `project_mapping_revision` inside the same transaction
+/// when at least one mapping was removed. Deleting a project with zero
+/// mappings (an empty project) leaves the projection's result set unchanged,
+/// so it does NOT bump. A project with N>0 mappings removes N scope rows,
+/// which is a scope-set change → bump (AD-26/AD-31).
 pub fn delete_project(
     store: &ProjectStore<'_>,
     request: &DeleteProjectRequest,
@@ -209,6 +215,12 @@ pub fn delete_project(
         let removed = tx
             .delete(&request.project_id)?
             .ok_or(ProjectError::ProjectNotFound)?;
+        // Story 5.2 — only bump when at least one mapping was actually
+        // removed. Deleting an empty project leaves the scope set unchanged,
+        // so no cursor needs to invalidate.
+        if removed > 0 {
+            tx.bump_project_mapping_revision()?;
+        }
         Ok(DeleteProjectResponse {
             project_id: request.project_id.clone(),
             removed_mappings: removed,
@@ -253,14 +265,20 @@ pub fn add_mapping(
         // Cardinality pre-check (AD-27).
         match tx.find_mapping_owner(&provider, native_ref)? {
             None => {
-                // Scope is free — insert the new mapping.
+                // Scope is free — insert the new mapping. Story 5.2 — a new
+                // mapping changes the project's scope set, so bump the
+                // `project_mapping_revision` inside the same transaction.
                 tx.insert_mapping(project_rowid, &provider, native_ref)?;
+                tx.bump_project_mapping_revision()?;
             }
             Some(owner_rowid) if owner_rowid == project_rowid => {
                 // Idempotent re-add: the scope is already owned by THIS
                 // project. No INSERT — the unique index would reject a
                 // duplicate anyway, and the I/O matrix requires "no
-                // duplicate row, return the unchanged view".
+                // duplicate row, return the unchanged view". Story 5.2 —
+                // idempotent re-add does NOT bump the revision: the scope
+                // set is unchanged, so every outstanding cursor's snapshot
+                // is still accurate.
             }
             Some(owner_rowid) => {
                 // Scope is owned by ANOTHER project — return
@@ -287,6 +305,15 @@ pub fn add_mapping(
 /// distinguishes "no such project" (404 `project_not_found`) from "project
 /// exists, no such mapping" (404 `mapping_not_found`). Both are 404 but
 /// carry different stable codes so the UI can surface the right copy.
+///
+/// Story 5.2 — the remove now runs inside [`ProjectStore::with_transaction`]
+/// so the `bump_project_mapping_revision` (only when a row was actually
+/// deleted) commits atomically with the DELETE. The previous "no transaction
+/// needed" posture was correct when the remove was a single DELETE; bumping
+/// the revision makes it a two-step write, so the transaction now covers
+/// both. The `Some(false)` / `None` cases (nothing deleted) return `Err` and
+/// the transaction rolls back the no-op bump; the `Some(true)` case bumps
+/// and the commit makes both durable together.
 pub fn remove_mapping(
     store: &ProjectStore<'_>,
     request: &MappingRequest,
@@ -295,20 +322,22 @@ pub fn remove_mapping(
         validate_mapping_scope(&request.provider, &request.native_project)?;
     let native_ref = native_project.as_deref();
 
-    // Validation rejects Codex-non-null and Claude-null upstream, so the
-    // `COALESCE`-based DELETE in the store never accidentally matches the
-    // wrong scope. The remove runs WITHOUT a transaction: a single DELETE is
-    // already atomic, and the response view re-reads the post-delete state.
-    match store.remove_mapping(&request.project_id, &provider, native_ref)? {
-        None => Err(ProjectError::ProjectNotFound),
-        Some(false) => Err(ProjectError::MappingNotFound),
-        Some(true) => {
-            let project = store
-                .get(&request.project_id)?
-                .ok_or(ProjectError::Internal)?;
-            Ok(store.view_for(&project)?)
+    store.with_transaction(|tx| -> Result<TesseraProjectView, ProjectError> {
+        match tx.remove_mapping(&request.project_id, &provider, native_ref)? {
+            None => return Err(ProjectError::ProjectNotFound),
+            Some(false) => return Err(ProjectError::MappingNotFound),
+            Some(true) => {
+                // A mapping row was actually deleted — the scope set
+                // changed, so bump the revision inside this transaction
+                // (AD-26/AD-31). The bump + the DELETE commit atomically.
+                tx.bump_project_mapping_revision()?;
+            }
         }
-    }
+        let project = tx
+            .get(&request.project_id)?
+            .ok_or(ProjectError::Internal)?;
+        Ok(tx.view_for(&project)?)
+    })
 }
 
 #[cfg(test)]

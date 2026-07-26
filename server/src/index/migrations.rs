@@ -78,6 +78,19 @@ pub static MIGRATIONS: &[Migration] = &[
         name: "v6_tessera_projects",
         apply: v6_tessera_projects,
     },
+    // Story 5.2 — project_mapping_revision scalar (seeds 0). Bumped inside the
+    // existing `ProjectStore::with_transaction` whenever a Tessera Project's
+    // mapped scope set changes (insert_mapping new / remove_mapping row
+    // deleted / delete project with mappings). Folded into
+    // `current_index_revision` so any mapping change invalidates every
+    // outstanding search AND browse cursor (AD-26/AD-31). Survives Reset Index
+    // (AD-29): the reset wipe keys on the `active_generation:` prefix only, so
+    // this `tessera_meta` key is untouched.
+    Migration {
+        id: 8,
+        name: "v7_project_mapping_revision",
+        apply: v7_project_mapping_revision,
+    },
 ];
 
 /// Ensure the meta tables exist on a fresh DB so [`apply`] can read
@@ -382,6 +395,36 @@ fn v6_tessera_projects(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v7 (Story 5.2) — seed the `project_mapping_revision` scalar in `tessera_meta`.
+///
+/// This is the single monotonic integer bumped (+1) inside the existing
+/// `ProjectStore::with_transaction` on every operation that changes a Tessera
+/// Project's mapped scope set: a successful new `insert_mapping`, a
+/// `remove_mapping` that deleted a row, and a `delete` that removed mappings.
+/// It is NOT bumped by `create`, `rename`, or idempotent re-add (those leave
+/// the scope set — and therefore every projection result — unchanged). The
+/// revision is folded into `current_index_revision()` (Story 5.2) so any
+/// mapping change makes every outstanding search AND browse cursor return
+/// `cursor_stale` (HTTP 409); the caller restarts from page 1 under the new
+/// snapshot (AD-26/AD-31).
+///
+/// `INSERT OR IGNORE` keeps the migration idempotent: the apply runner also
+/// bumps the schema_version, but the seed guards against any caller that runs
+/// `v7_project_mapping_revision` standalone in a fixture. The value `0` is the
+/// pre-mapping baseline; the first mapping op raises it to `1`.
+///
+/// No new table — the key lives in the existing `tessera_meta` key/value store
+/// (created by `v0_meta`). Strictly additive: a database that already has
+/// mappings (impossible today, but defense-in-depth) keeps them and simply
+/// starts the revision at `0`; the first scope-set-changing op bumps to `1`.
+fn v7_project_mapping_revision(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO tessera_meta(key, value) VALUES ('project_mapping_revision', '0')",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Apply all pending migrations atomically (AD-29).
 ///
 /// Semantics:
@@ -490,10 +533,11 @@ mod tests {
         // v1_source_registry (id 2) and Story 1.4 appended v2_scan_generations
         // (id 3), Story 1.5 appended v3_canonical_memory_records (id 4),
         // Story 1.8 appended durable rescan cancellation (id 5), Story 4.2
-        // appended the structured source health cause (id 6), and Story 5.1
-        // appended the Tessera Project mapping layer (id 7).
+        // appended the structured source health cause (id 6), Story 5.1
+        // appended the Tessera Project mapping layer (id 7), and Story 5.2
+        // appended the project_mapping_revision seed (id 8).
         // The `0` value remains reserved as the pre-migration sentinel.
-        assert_eq!(v, "7");
+        assert_eq!(v, "8");
     }
 
     #[test]
@@ -527,8 +571,9 @@ mod tests {
         // v1_source_registry and Story 1.4 appended v2_scan_generations, so the
         // v3_canonical_memory_records and v4_rescan_cancellation make the
         // idempotent baseline five audit rows; Story 4.2's v5_source_health_cause
-        // brings it to six; Story 5.1's v6_tessera_projects brings it to seven.
-        assert_eq!(count, 7, "exactly seven audit rows after idempotent re-run");
+        // brings it to six; Story 5.1's v6_tessera_projects brings it to seven;
+        // Story 5.2's v7_project_mapping_revision brings it to eight.
+        assert_eq!(count, 8, "exactly eight audit rows after idempotent re-run");
     }
 
     /// AD-29 / A-7: migration is atomic. If a later migration fails mid-batch,
@@ -539,15 +584,16 @@ mod tests {
     ///
     /// The current shipping migrations are v0_meta (id 1), v1_source_registry
     /// (id 2), v2_scan_generations (id 3), v3_canonical_memory_records (id 4),
-    /// v4_rescan_cancellation (id 5), v5_source_health_cause (id 6), and
-    /// v6_tessera_projects (id 7). This test starts from a fully-migrated DB
-    /// and simulates a failing migration id 8.
+    /// v4_rescan_cancellation (id 5), v5_source_health_cause (id 6),
+    /// v6_tessera_projects (id 7), and v7_project_mapping_revision (id 8).
+    /// This test starts from a fully-migrated DB and simulates a failing
+    /// migration id 9.
     #[test]
     fn failed_migration_batch_rolls_back_atomically() {
         let mut conn = Connection::open_in_memory().expect("open db");
         apply(&mut conn).expect("all shipping migrations apply on first boot");
 
-        // After all shipping migrations: schema_version = 7, seven audit rows.
+        // After all shipping migrations: schema_version = 8, eight audit rows.
         let pre_version: String = conn
             .query_row(
                 "SELECT value FROM tessera_meta WHERE key = 'schema_version'",
@@ -555,7 +601,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema_version readable");
-        assert_eq!(pre_version, "7");
+        assert_eq!(pre_version, "8");
 
         // Simulate a failing follow-up migration. The failing migration
         // writes a sentinel table first, then errors; the atomic batch must
@@ -607,6 +653,11 @@ mod tests {
             },
             Migration {
                 id: 8,
+                name: "v7_project_mapping_revision",
+                apply: v7_project_mapping_revision,
+            },
+            Migration {
+                id: 9,
                 name: "partial_then_fail",
                 apply: partial_then_fail,
             },
@@ -663,7 +714,7 @@ mod tests {
             )
             .expect("schema_version still readable after rollback");
         assert_eq!(
-            post_version, "7",
+            post_version, "8",
             "schema_version must not advance on failure"
         );
 
@@ -675,7 +726,7 @@ mod tests {
             )
             .expect("count");
         assert_eq!(
-            audit_count, 7,
+            audit_count, 8,
             "no audit row recorded for the failed migration"
         );
 
