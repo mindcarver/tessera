@@ -2,8 +2,9 @@
 title: 'Story 5.2: Browse and Search by Tessera Project (Projection)'
 type: 'feature'
 created: '2026-07-26'
-status: 'in-review'
+status: 'done'
 baseline_revision: '6f8b69d'
+final_revision: '36358d6f89ab3753524720d760ef5088a60d5373'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
