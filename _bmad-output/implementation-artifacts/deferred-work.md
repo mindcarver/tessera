@@ -195,3 +195,9 @@ Tauri 移除、传输改为 loopback-only HTTP（tiny_http）后，上述条目�
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-7-open-original-location.md`
   summary: The UI fires N host opens under rapid clicks (no `AbortController`; only stale UI updates are suppressed), opening multiple files with a single visible success message.
   evidence: `src/features/search/Search.tsx:41-50/67-90` (adversarial F11). Abort the prior open + disable other cards' Open buttons while one is in flight.
+
+## Deferred from: Windows runtime verification (2026-07-26)
+
+- source_spec: `(runtime — Windows host adaptation, not story-scoped)`
+  summary: On Windows the Codex/Claude adapters default to `$HOME/.codex` and `$HOME/.claude`, but a Git Bash shell exports `HOME=/c/Users/...` (Unix-style) which the Rust Windows binary cannot resolve → both adapters resolve a non-existent path and discover ZERO Candidate Sources. Only an explicit `CODEX_HOME` / `CLAUDE_CONFIG_DIR` with a Windows-style path works around it.
+  evidence: `server/src/adapters/codex.rs` (`env::var("CODEX_HOME")` / `HOME`) and `server/src/adapters/claude_code.rs:172-173` (`env::var("CLAUDE_CONFIG_DIR")` / `env::var("HOME")`). Verified at runtime: default boot → empty `/api/sources/inventory`; `CODEX_HOME='C:/Users/Administrator/.codex' CLAUDE_CONFIG_DIR='C:/Users/Administrator/.claude'` → discover finds Codex (419 records) + 2 Claude memory sources (67 + 3). Fix: resolve the home dir via `dirs::home_dir()` (which honors `USERPROFILE` on Windows) instead of raw `$HOME`, so the default discovery path works on Windows without per-launch env overrides.
