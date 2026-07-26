@@ -4,7 +4,8 @@
 //! envelope crosses HTTP end-to-end.
 //!
 //! These tests pin the AC's wire-level behavior:
-//! - migration applies + `schema_version == "7"` post-boot;
+//! - migration applies + `schema_version == "8"` post-boot (Story 5.2 bumped
+//!   the schema version to seed `project_mapping_revision`);
 //! - create / list / rename / delete round-trip the versioned envelope;
 //! - add-mapping cardinality conflict surfaces 409 `mapping_conflict` naming
 //!   the owning project and creates no row;
@@ -84,7 +85,7 @@ fn get(port: u16, path: &str) -> String {
 }
 
 #[test]
-fn schema_version_is_seven_after_boot() {
+fn schema_version_is_eight_after_boot() {
     let (_port, state) = boot_projects_server();
     let conn = state.conn.lock().expect("conn lock");
     let v: String = conn
@@ -94,9 +95,19 @@ fn schema_version_is_seven_after_boot() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(v, "7");
-    // The two new tables exist and have the expected STRICT shape (a CREATE
-    // TABLE IF NOT EXISTS that finds them already present is a no-op).
+    assert_eq!(v, "8");
+    // Story 5.2 — the project_mapping_revision key is seeded to "0" by
+    // migration id 8. Read it back so a missing / mis-seeded key fails loudly.
+    let pmr: String = conn
+        .query_row(
+            "SELECT value FROM tessera_meta WHERE key = 'project_mapping_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("project_mapping_revision readable");
+    assert_eq!(pmr, "0", "project_mapping_revision seeded to 0 by migration id 8");
+    // The two project tables exist and have the expected STRICT shape (a
+    // CREATE TABLE IF NOT EXISTS that finds them already present is a no-op).
     let tables: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tessera_projects', 'project_mappings')",
@@ -671,4 +682,355 @@ fn shape_validation_branches_rejected_at_wire_level() {
     assert!(over.starts_with("HTTP/1.1 400"), "over-length name: got {over}");
     assert!(over.contains("\"code\":\"bad_request\""));
     assert!(over.contains("\"phase\":\"project\""));
+}
+
+// ---------------------------------------------------------------------------
+// Story 5.2 — `project_mapping_revision` bump semantics (AD-26 / AD-31).
+//
+// The revision is the single monotonic scalar bumped inside the existing
+// `ProjectStore::with_transaction` on every scope-set-changing op. It is the
+// signal that folds into `current_index_revision` so any mapping change
+// invalidates every outstanding search/browse cursor. These tests pin the
+// bump-on-add/remove/delete and the no-bump-on-create/rename/idempotent-re-add
+// branches directly against SQLite (the boot helper returns the IndexState so
+// the test can read `tessera_meta` without going through HTTP).
+// ---------------------------------------------------------------------------
+
+/// Read the `project_mapping_revision` scalar from the live connection.
+fn project_mapping_revision(state: &tessera_lib::IndexState) -> i64 {
+    let conn = state.conn.lock().expect("conn lock");
+    conn.query_row(
+        "SELECT value FROM tessera_meta WHERE key = 'project_mapping_revision'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .expect("project_mapping_revision readable")
+    .parse::<i64>()
+    .unwrap_or(0)
+}
+
+/// Story 5.2 — bump on first add-mapping (a new mapping row inserts +
+/// `bump_project_mapping_revision`), and on remove-mapping that deletes a
+/// row. Idempotent re-add does NOT bump.
+#[test]
+fn project_mapping_revision_bumps_on_add_remove_and_idempotent_no_bump() {
+    let (port, state) = boot_projects_server();
+    let baseline = project_mapping_revision(&state);
+    assert_eq!(baseline, 0, "fresh DB seeds project_mapping_revision to 0");
+
+    // Create a project (no mappings) — does NOT bump.
+    let a_resp = post_json(port, "/api/projects/create", r#"{"name":"A"}"#);
+    assert!(a_resp.starts_with("HTTP/1.1 200"));
+    assert_eq!(
+        project_mapping_revision(&state),
+        0,
+        "create must NOT bump (no scope-set change)"
+    );
+
+    let a_id = a_resp
+        .split("\"project_id\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("project_id")
+        .to_string();
+
+    // Add a (codex, null) mapping — bumps 0 → 1.
+    let add_resp = post_json(
+        port,
+        "/api/projects/mappings/add",
+        &format!(r#"{{"project_id":"{a_id}","provider":"codex","native_project":null}}"#),
+    );
+    assert!(add_resp.starts_with("HTTP/1.1 200"), "add mapping: {add_resp}");
+    assert_eq!(project_mapping_revision(&state), 1, "first add must bump to 1");
+
+    // Idempotent re-add of the SAME scope to the SAME project — does NOT bump.
+    let re_add = post_json(
+        port,
+        "/api/projects/mappings/add",
+        &format!(r#"{{"project_id":"{a_id}","provider":"codex","native_project":null}}"#),
+    );
+    assert!(re_add.starts_with("HTTP/1.1 200"), "idempotent re-add: {re_add}");
+    assert_eq!(
+        project_mapping_revision(&state),
+        1,
+        "idempotent re-add must NOT bump (scope set unchanged)"
+    );
+
+    // Rename the project — does NOT bump (rename leaves the scope set unchanged).
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let rename = post_json(
+        port,
+        "/api/projects/rename",
+        &format!(r#"{{"project_id":"{a_id}","name":"A2"}}"#),
+    );
+    assert!(rename.starts_with("HTTP/1.1 200"), "rename: {rename}");
+    assert_eq!(
+        project_mapping_revision(&state),
+        1,
+        "rename must NOT bump (scope set unchanged)"
+    );
+
+    // Remove the mapping — bumps 1 → 2 (a row was actually deleted).
+    let remove = post_json(
+        port,
+        "/api/projects/mappings/remove",
+        &format!(r#"{{"project_id":"{a_id}","provider":"codex","native_project":null}}"#),
+    );
+    assert!(remove.starts_with("HTTP/1.1 200"), "remove mapping: {remove}");
+    assert_eq!(project_mapping_revision(&state), 2, "remove must bump to 2");
+
+    // Removing a non-existent mapping (no row deleted) — does NOT bump.
+    let no_op_remove = post_json(
+        port,
+        "/api/projects/mappings/remove",
+        &format!(r#"{{"project_id":"{a_id}","provider":"codex","native_project":null}}"#),
+    );
+    assert!(no_op_remove.starts_with("HTTP/1.1 404"), "no-op remove 404: {no_op_remove}");
+    assert_eq!(
+        project_mapping_revision(&state),
+        2,
+        "no-op remove (no row deleted) must NOT bump"
+    );
+}
+
+/// Story 5.2 — delete bumps when the project had mappings (their removal is a
+/// scope-set change) and does NOT bump for an empty project.
+#[test]
+fn project_mapping_revision_bumps_on_delete_with_mappings_only() {
+    let (port, state) = boot_projects_server();
+    let baseline = project_mapping_revision(&state);
+    assert_eq!(baseline, 0);
+
+    // Create an EMPTY project A.
+    let a_resp = post_json(port, "/api/projects/create", r#"{"name":"A-empty"}"#);
+    let a_id = a_resp
+        .split("\"project_id\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("project_id")
+        .to_string();
+    // Delete the empty project — no mappings removed → NO bump.
+    let del_empty = post_json(
+        port,
+        "/api/projects/delete",
+        &format!(r#"{{"project_id":"{a_id}"}}"#),
+    );
+    assert!(del_empty.starts_with("HTTP/1.1 200"), "delete empty: {del_empty}");
+    assert_eq!(
+        project_mapping_revision(&state),
+        0,
+        "delete of an empty project must NOT bump"
+    );
+
+    // Create a project B and add a mapping.
+    let b_resp = post_json(port, "/api/projects/create", r#"{"name":"B-mapped"}"#);
+    let b_id = b_resp
+        .split("\"project_id\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("project_id")
+        .to_string();
+    post_json(
+        port,
+        "/api/projects/mappings/add",
+        &format!(r#"{{"project_id":"{b_id}","provider":"codex","native_project":null}}"#),
+    );
+    assert_eq!(project_mapping_revision(&state), 1);
+
+    // Delete B (with 1 mapping) — bumps 1 → 2 (1 mapping removed).
+    let del_mapped = post_json(
+        port,
+        "/api/projects/delete",
+        &format!(r#"{{"project_id":"{b_id}"}}"#),
+    );
+    assert!(del_mapped.starts_with("HTTP/1.1 200"), "delete mapped: {del_mapped}");
+    // The response carries removed_mappings: 1.
+    assert!(del_mapped.contains("\"removed_mappings\":1"));
+    assert_eq!(
+        project_mapping_revision(&state),
+        2,
+        "delete of a project with mappings must bump"
+    );
+}
+
+/// Story 5.2 — a mapping change mid-pagination invalidates every outstanding
+/// SEARCH cursor via the shared `current_index_revision`. Page-1 search,
+/// bump the revision (add a mapping to any project), then continue with the
+/// page-1 cursor → 409 `cursor_stale`.
+#[test]
+fn search_cursor_goes_stale_after_project_mapping_change() {
+    let (port, state) = boot_projects_server();
+    // Seed two confirmed sources with records so search has data to paginate.
+    {
+        let conn = state.conn.lock().expect("conn lock");
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (1, 'codex', 'agent_memory', 'confirmed', 'healthy', 'full', '/codex', 'fp-c', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (1, 'gen_1', 'succeeded', 1, 'gen_1', 'mr')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')",
+            [],
+        )
+        .unwrap();
+        for (id, observed) in [("rec_a", 100), ("rec_b", 200)] {
+            conn.execute(
+                "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+                 VALUES (?1, 1, 'gen_1', 'codex', 'section', ?1, 'file:///f#x', 'h', 'v1', 'federation record', 'body', NULL, 'memory', 'full', ?2, 'r', 'file:///f#L1')",
+                rusqlite::params![id, observed],
+            )
+            .unwrap();
+        }
+    }
+
+    // Page 1 (limit 1) — has more, returns a cursor.
+    let page1 = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(page1.starts_with("HTTP/1.1 200"));
+    let body = page1.split("\r\n\r\n").nth(1).expect("body");
+    let json: serde_json::Value = serde_json::from_str(body).expect("json");
+    let cursor = json["payload"]["next_cursor"]
+        .as_str()
+        .expect("page-1 cursor")
+        .to_string();
+    assert!(cursor.starts_with("v4."), "cursor envelope is v4: {cursor:?}");
+
+    // Bump the revision via the HTTP API (create + add a mapping). Either
+    // insert_mapping new OR remove_mapping row-deleted bumps; we use add.
+    let proj = post_json(port, "/api/projects/create", r#"{"name":"P"}"#);
+    let pid = proj
+        .split("\"project_id\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("project_id")
+        .to_string();
+    let add = post_json(
+        port,
+        "/api/projects/mappings/add",
+        &format!(r#"{{"project_id":"{pid}","provider":"codex","native_project":null}}"#),
+    );
+    assert!(add.starts_with("HTTP/1.1 200"));
+
+    // Page-2 with the now-stale cursor → 409 cursor_stale.
+    let page2 = raw_http(
+        port,
+        &format!(
+            "GET /api/search?q=federation&cursor={cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(
+        page2.starts_with("HTTP/1.1 409"),
+        "mapping change must invalidate the cursor: got:\n{page2}"
+    );
+    assert!(page2.contains("\"code\":\"cursor_stale\""));
+}
+
+/// Story 5.2 — a mapping change mid-pagination invalidates every outstanding
+/// BROWSE cursor too. `BrowseCursor` is structurally unchanged (b4 retained);
+/// its `revision` simply now carries mapping state via the shared
+/// `current_index_revision`, so a mapping change → revision mismatch → 409.
+#[test]
+fn browse_cursor_goes_stale_after_project_mapping_change() {
+    let (port, state) = boot_projects_server();
+    {
+        let conn = state.conn.lock().expect("conn lock");
+        conn.execute(
+            "INSERT INTO source_registry (id, provider, source_kind, lifecycle_state, health_state, coverage_level, normalized_root_path, fingerprint, native_project)
+             VALUES (1, 'codex', 'agent_memory', 'confirmed', 'healthy', 'full', '/codex', 'fp-c', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_runs (source_id, generation, state, fencing_token, intent, manifest_revision)
+             VALUES (1, 'gen_1', 'succeeded', 1, 'gen_1', 'mr')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tessera_meta(key, value) VALUES ('active_generation:1', 'gen_1')",
+            [],
+        )
+        .unwrap();
+        for (id, observed) in [("rec_a", 100), ("rec_b", 200)] {
+            conn.execute(
+                "INSERT INTO memory_records (record_id, source_id, generation, provider, unit_kind, native_unit_id, native_locator, content_hash, parser_version, title, body, native_project, provider_memory_type, coverage_level, observed_at, source_revision, display_locator)
+                 VALUES (?1, 1, 'gen_1', 'codex', 'section', ?1, 'file:///f#x', 'h', 'v1', 'browse record', 'body', NULL, 'memory', 'full', ?2, 'r', 'file:///f#L1')",
+                rusqlite::params![id, observed],
+            )
+            .unwrap();
+        }
+    }
+
+    // Page 1 browse.
+    let page1 = raw_http(
+        port,
+        &format!("GET /api/browse?source=src_1&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(page1.starts_with("HTTP/1.1 200"));
+    let body = page1.split("\r\n\r\n").nth(1).expect("body");
+    let json: serde_json::Value = serde_json::from_str(body).expect("json");
+    let cursor = json["payload"]["next_cursor"]
+        .as_str()
+        .expect("page-1 browse cursor")
+        .to_string();
+
+    // Bump the revision.
+    let proj = post_json(port, "/api/projects/create", r#"{"name":"P"}"#);
+    let pid = proj
+        .split("\"project_id\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("project_id")
+        .to_string();
+    let add = post_json(
+        port,
+        "/api/projects/mappings/add",
+        &format!(r#"{{"project_id":"{pid}","provider":"codex","native_project":null}}"#),
+    );
+    assert!(add.starts_with("HTTP/1.1 200"));
+
+    // Page 2 with the stale cursor → 409 cursor_stale.
+    let page2 = raw_http(
+        port,
+        &format!(
+            "GET /api/browse?source=src_1&cursor={cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(
+        page2.starts_with("HTTP/1.1 409"),
+        "mapping change must invalidate the browse cursor: got:\n{page2}"
+    );
+    assert!(page2.contains("\"code\":\"cursor_stale\""));
+}
+
+/// Story 5.2 — an old `v3.<hex>` search cursor (pre-5.2 envelope) is rejected
+/// as `cursor_stale` on the wire via the prefix-gate (mirrors v1./v2.
+/// recovery). Forward-compatible: the UI's existing cursor_stale recovery
+/// re-runs page 1.
+#[test]
+fn search_v3_cursor_is_rejected_as_stale_over_http() {
+    let (port, _state) = boot_projects_server();
+    // Hand-craft a v3 cursor envelope. The prefix gate fires before any
+    // decode, but a realistic payload keeps the test honest about the v3
+    // shape.
+    let payload = r#"{"version":3,"query":"x","revision":"deadbeef","last_record_id":"rec_1","last_title_match":false,"last_observed_at":0,"last_coverage_full":false,"provider":null,"source":null,"memory_type":null,"native_project":null,"since":null}"#;
+    let hex: String = payload.bytes().map(|b| format!("{b:02x}")).collect();
+    let v3_cursor = format!("v3.{hex}");
+    let response = raw_http(
+        port,
+        &format!(
+            "GET /api/search?q=x&cursor={v3_cursor}&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 409"), "v3 cursor must 409: got:\n{response}");
+    assert!(response.contains("\"code\":\"cursor_stale\""));
 }

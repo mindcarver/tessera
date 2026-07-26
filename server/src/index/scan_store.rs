@@ -761,6 +761,36 @@ impl<'a> ScanStore<'a> {
             None => Ok(None),
         }
     }
+
+    /// Story 5.2 — read one Tessera Project's mapping scope set as a vec of
+    /// `(provider, native_project)` pairs. Used by the search sidecar
+    /// narrowing (Q3=A): when a `tessera_project` filter is set, the sidecar
+    /// lists only confirmed sources whose `(provider,
+    /// COALESCE(native_project, ''))` is in this set. The pairs are returned
+    /// with `native_project` exactly as persisted (`None` for Codex global);
+    /// the caller normalizes through `COALESCE` semantics when comparing.
+    ///
+    /// Returns an empty vec for an unknown project rowid (no mappings ⇒ no
+    /// sources in the sidecar — matches the I/O matrix's "unknown project ⇒
+    /// empty results, not an error"). Read-only; never mutates canonical
+    /// rows or the project tables.
+    pub(crate) fn project_mapping_scope_set(
+        &self,
+        project_rowid: i64,
+    ) -> rusqlite::Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider, native_project FROM project_mappings
+             WHERE tessera_project_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_rowid], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 impl QueryStore for ScanStore<'_> {
@@ -795,12 +825,18 @@ impl QueryStore for ScanStore<'_> {
         // predicate: a `present` flag (0/1) short-circuits the predicate to
         // true when the filter is `None`, so a no-filter request runs the same
         // SQL shape as before (the flag is the first operand of an `OR`, so
-        // SQLite stops evaluating at `0 = 0`). `tessera_project` is accepted
-        // on the DTO but produces NO predicate here (Design Notes — reserved,
-        // not implemented). `native_project = ?` honestly excludes rows whose
-        // `native_project` is NULL (Codex's global store): SQL `NULL = 'x'` is
-        // NULL, not true, so a NULL row never matches a project filter — the
-        // spec calls this the honest behavior, not a bug.
+        // SQLite stops evaluating at `0 = 0`). `native_project = ?` honestly
+        // excludes rows whose `native_project` is NULL (Codex's global store):
+        // SQL `NULL = 'x'` is NULL, not true, so a NULL row never matches a
+        // project filter — the spec calls this the honest behavior, not a bug.
+        //
+        // Story 5.2 — `tessera_project` filter (was reserved in 2.4). The
+        // predicate joins `memory_records` to `project_mappings` via an
+        // `EXISTS` subquery on `(provider, COALESCE(native_project, ''))`. The
+        // `COALESCE` collapse mirrors the Story 5.1 uniqueness index, so a
+        // Codex global (`native_project NULL`) maps correctly. Reuses the
+        // existing "presence-flag OR predicate" idiom so the no-filter path is
+        // unchanged. No copy of canonical rows (AD-2): the join is read-only.
         let mut stmt = self.conn.prepare(
             "SELECT m.record_id, m.title, m.body, m.provider, m.source_id,
                     m.native_project, m.native_locator, m.display_locator,
@@ -829,12 +865,18 @@ impl QueryStore for ScanStore<'_> {
                AND (?11 = 0 OR m.provider_memory_type = ?12)
                AND (?13 = 0 OR m.native_project = ?14)
                AND (?15 = 0 OR m.observed_at >= ?16)
+               AND (?17 = 0 OR EXISTS (
+                   SELECT 1 FROM project_mappings pm
+                   WHERE pm.tessera_project_id = ?18
+                     AND pm.provider = m.provider
+                     AND COALESCE(pm.native_project, '') = COALESCE(m.native_project, '')
+               ))
              ORDER BY
                (CASE WHEN instr(m.title, ?1) > 0 THEN 0 ELSE 1 END) ASC,
                m.observed_at DESC,
                (CASE WHEN m.coverage_level = 'full' THEN 0 ELSE 1 END) ASC,
                m.record_id ASC
-             LIMIT ?17",
+             LIMIT ?19",
         )?;
         let page_size = i64::try_from(request.limit() + 1).expect("search limit is bounded");
         let cursor_present: i64 = if after.is_some() { 1 } else { 0 };
@@ -869,6 +911,19 @@ impl QueryStore for ScanStore<'_> {
         let native_project_value: Option<&str> = request.native_project();
         let since_present: i64 = request.since().map_or(0, |_| 1);
         let since_value: Option<i64> = request.since();
+        // Story 5.2 — Tessera-project projection filter. Resolve `proj_<n>`
+        // to its rowid at this SQL-binding boundary (the wire/DTO shape is
+        // unchanged). `None` here covers BOTH "filter absent" (no
+        // `tessera_project` on the request) AND "malformed handle" (the
+        // `to_rowid` parse failed); either way the EXISTS predicate's
+        // `pm.tessera_project_id = NULL` is NULL (never true), so a malformed
+        // id honestly yields no rows (treated as a filter that matches
+        // nothing, NOT an error — I/O matrix). The presence flag stays 0 for
+        // both so the OR short-circuits to true on the no-filter path.
+        let tessera_project_present: i64 = request.tessera_project().map_or(0, |_| 1);
+        let tessera_project_rowid: Option<i64> = request
+            .tessera_project()
+            .and_then(|p| crate::domain::project::ProjectId(p.to_string()).to_rowid());
         let rows = stmt.query_map(
             params![
                 request.query(),
@@ -887,6 +942,8 @@ impl QueryStore for ScanStore<'_> {
                 native_project_value,
                 since_present,
                 since_value,
+                tessera_project_present,
+                tessera_project_rowid,
                 page_size,
             ],
             |row| {
@@ -1055,6 +1112,30 @@ impl QueryStore for ScanStore<'_> {
                 hash ^= u64::from(byte);
                 hash = hash.wrapping_mul(0x100000001b3);
             }
+        }
+        // Story 5.2 — fold the `project_mapping_revision` scalar into the
+        // index revision so ANY change to a Tessera Project's mapped scope set
+        // invalidates every outstanding search AND browse cursor (AD-26 /
+        // AD-31). Read via `tessera_meta`; absent ⇒ `0` (pre-Story-5.2 fresh
+        // DB before migration id 8 runs, or a corrupt key — collapse to `0`
+        // rather than surfacing an error so a corrupt key cannot break the
+        // read path; the next scope-set-changing op re-writes a numeric
+        // value). Bound into BOTH search and browse cursors via this single
+        // revision, so the existing `revision != cursor.revision` gate in
+        // `search`/`browse` surfaces `cursor_stale` on a mapping change
+        // without further cursor plumbing.
+        let mapping_revision: i64 = match self.conn.query_row(
+            "SELECT value FROM tessera_meta WHERE key = 'project_mapping_revision'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => value.parse::<i64>().unwrap_or(0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+            Err(error) => return Err(error),
+        };
+        for byte in format!("pmr:{mapping_revision};").bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
         }
         Ok(if any {
             format!("{hash:016x}")

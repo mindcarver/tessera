@@ -370,11 +370,15 @@ test("filter controls narrow results by AND and Clear restores full scope", asyn
   // first search populates the sidecar-derived provider list.
   await expect(page.getByTestId("search-effective-range")).toContainText("Codex + Claude Code");
 
-  // Story 2.4 — the reserved Tessera-project slot is rendered DISABLED (not
-  // merely absent), per the spec Boundaries/I/O matrix/AC.
-  const tesseraSlot = page.getByLabel("Tessera project (reserved)");
+  // Story 5.2 — the Tessera-project filter (was a disabled reserved slot in
+  // 2.4) is now a live, keyboard-reachable `<select>` populated by
+  // `listProjects()`. AD-21 / NFR-13 contract holds with the slot active.
+  const tesseraSlot = page.getByLabel("Tessera project");
   await expect(tesseraSlot).toBeVisible();
-  await expect(tesseraSlot).toBeDisabled();
+  await expect(tesseraSlot).toBeEnabled();
+  // Keyboard-reachability: focus the select; it claims focus.
+  await tesseraSlot.focus();
+  await expect(tesseraSlot).toBeFocused();
 
   // Keyboard-set the provider filter. `selectOption` focuses the `<select>`
   // and dispatches the change event — the keyboard-reachable contract.
@@ -1899,12 +1903,18 @@ test("projects region is keyboard-reachable for create rename add remove delete"
   await expect(projectsRegion.getByTestId("projects-empty")).toContainText("No Tessera projects yet.");
   expect(deleteCalls).toBe(1);
 
-  // --- Reserved Tessera-project filter slot stays disabled (Story 5.2). ---
-  // The existing 2.4 test already pins this; assert it here too so a 5.1
-  // regression that accidentally fills the slot fails loudly in this test.
-  const tesseraSlot = page.getByLabel("Tessera project (reserved)");
+  // --- Story 5.2 — Tessera-project filter slot is now live (was disabled in
+  // 2.4). The Search component fetches /api/projects on mount to populate
+  // the select. Mock it to an empty list so the assertion stays focused on
+  // the slot being enabled + keyboard-reachable (the projects-region test's
+  // concern), not on option content (covered by the dedicated filter-controls
+  // test).
+  await page.route("**/api/projects", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  const tesseraSlot = page.getByLabel("Tessera project");
   await expect(tesseraSlot).toBeVisible();
-  await expect(tesseraSlot).toBeDisabled();
+  await expect(tesseraSlot).toBeEnabled();
 
   expect(inventoryCalls).toBeGreaterThan(0);
   expect(listCalls).toBeGreaterThan(0);

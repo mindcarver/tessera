@@ -51,9 +51,12 @@ pub struct SearchRequest {
     /// computes "now - N days" (Design Notes — client-side presets → absolute
     /// seconds). Predicate is `observed_at >= since`.
     since: Option<i64>,
-    /// Reserved for Epic 5 (Tessera Project projection). Accepted on the wire
-    /// and DTO, **ignored at the SQL layer** (no schema column, no predicate)
-    /// so Epic 5 can fill it without a contract change here.
+    /// Story 5.2 — Tessera Project projection filter (`proj_<n>` handle).
+    /// Resolved to the project rowid at the SQL boundary via
+    /// `ProjectId::to_rowid` and applied as an `EXISTS` predicate over
+    /// `project_mappings`. An unknown / malformed id honestly matches
+    /// nothing (treated as a filter that excludes all rows, NOT an error).
+    /// `None` restores the unfiltered scope.
     tessera_project: Option<String>,
 }
 
@@ -83,7 +86,12 @@ impl SearchRequest {
         filters: SearchFilters,
     ) -> Result<Self, SearchRequestError> {
         let query = query.trim().to_string();
-        if query.is_empty() || query.len() > MAX_QUERY_BYTES {
+        // Story 5.2 — the empty-query check is now tessera_project-aware and
+        // runs AFTER the tessera_project shape sanity below. The length cap
+        // stays here so a loopback request cannot push an unbounded query past
+        // the early gate; an empty query is accepted only when a project
+        // filter is set (the "browse by project" path, Q1=A).
+        if query.len() > MAX_QUERY_BYTES {
             return Err(SearchRequestError::Invalid);
         }
         if cursor.as_ref().is_some_and(|value| value.len() > MAX_CURSOR_BYTES) {
@@ -125,10 +133,28 @@ impl SearchRequest {
                 return Err(SearchRequestError::Invalid);
             }
         }
+        // Story 5.2 — tessera_project shape sanity (existing length cap). The
+        // SQL layer resolves the `proj_<n>` handle to its rowid and treats an
+        // unknown / malformed id as "filter that matches nothing" (not an
+        // error), so this layer only bounds the string.
         if let Some(ref value) = filters.tessera_project {
             if value.is_empty() || value.len() > MAX_FILTER_BYTES {
                 return Err(SearchRequestError::Invalid);
             }
+        }
+        // Story 5.2 — allow an empty `q=` when a tessera_project filter is
+        // set so the UI can "browse" a project's mapped scope via Search
+        // (Q1=A — browse stays single-source; the AC's "browse" is satisfied
+        // by Search with `q=` + `tessera_project`). The SQL `instr(title, '')`
+        // predicate matches every row when the needle is empty, so the request
+        // returns every in-scope record ranked as today. Without a
+        // tessera_project filter the 2.x contract holds: empty query is
+        // rejected (no browse-by-search without a project scope). The
+        // authoritative `MAX_QUERY_BYTES` gate already ran above, so this
+        // check narrows ONLY on the empty-vs-project combination.
+        let has_project = filters.tessera_project.is_some();
+        if !has_project && query.is_empty() {
+            return Err(SearchRequestError::Invalid);
         }
         let since = match filters.since {
             Some(value) if (0..=MAX_SINCE).contains(&value) => Some(value),
@@ -159,7 +185,9 @@ impl SearchRequest {
     pub fn memory_type(&self) -> Option<ProviderMemoryType> { self.memory_type }
     pub fn native_project(&self) -> Option<&str> { self.native_project.as_deref() }
     pub fn since(&self) -> Option<i64> { self.since }
-    /// Reserved for Epic 5 — accepted but never produces a SQL predicate.
+    /// Story 5.2 — Tessera Project filter (`proj_<n>` wire form). Resolved
+    /// to the project rowid at the SQL boundary; an unknown / malformed id
+    /// matches nothing (treated as a filter, NOT an error).
     pub fn tessera_project(&self) -> Option<&str> { self.tessera_project.as_deref() }
 }
 
@@ -176,8 +204,8 @@ pub struct SearchFilters {
     pub memory_type: Option<ProviderMemoryType>,
     pub native_project: Option<String>,
     pub since: Option<i64>,
-    /// Reserved for Epic 5 (Tessera Project projection); accepted, ignored at
-    /// the SQL layer.
+    /// Story 5.2 — Tessera Project projection filter (`proj_<n>` handle).
+    /// Resolved at the SQL boundary; unknown / malformed matches nothing.
     pub tessera_project: Option<String>,
 }
 

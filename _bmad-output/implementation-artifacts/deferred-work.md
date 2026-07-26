@@ -153,3 +153,21 @@ Tauri 移除、传输改为 loopback-only HTTP（tiny_http）后，上述条目�
 - source_spec: `_bmad-output/implementation-artifacts/spec-5-1-project-mapping.md`
   summary: UI/backend length-limit metric divergence for multi-byte project names — the create/rename `<input maxLength={128}>` counts UTF-16 code units while the backend `validate_project_name` counts UTF-8 bytes. A pathologically long multi-byte name (e.g. 64+ emoji) can pass the UI hint and be rejected by the backend with `400 bad_request`.
   evidence: `src/features/projects/Projects.tsx` create/rename inputs vs `server/src/application/project.rs::validate_project_name` (`trimmed.len() > MAX_PROJECT_NAME_LEN`) — edge-case finding E1 / adversarial A5. The backend is the authority and correctly enforces a bounded contract (AD-17); the matrix wording ">128 chars" is loose. Low impact (project names are short). Consider giving the UI a matching byte-length guard (`TextEncoder`) when the project-create/rename UI is next touched.
+
+## Deferred from: code review of spec-5-2-project-projection (2026-07-26)
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-5-2-project-projection.md`
+  summary: The Story 5.2 projection `EXISTS` predicate uses `COALESCE(pm.native_project,'') = COALESCE(m.native_project,'')`, which is non-sargable on `native_project` — SQLite can use only the `(tessera_project_id, provider)` prefix of the Story 5.1 index and rescan the tail per `memory_records` row, giving O(N_records × mappings_per_project) per project-scoped search, with no benchmark in the diff.
+  evidence: `server/src/index/scan_store.rs` `search_records` tessera_project predicate (adversarial finding F5). Correctness is unaffected; the cost is hidden and unmeasured. Fold into a sargable form (`(pm.native_project IS NULL AND m.native_project IS NULL) OR pm.native_project = m.native_project`) or a generated `native_project_norm` column + index when a perf story re-touches the search SQL; add a benchmark first.
+- source_spec: `_bmad-output/implementation-artifacts/spec-5-2-project-projection.md`
+  summary: `Search.tsx` calls `listProjects()` once on mount; projects created/renamed/deleted from the Projects view (or another tab) while Search stays mounted do not refresh the `<select>` until remount.
+  evidence: `src/features/search/Search.tsx` projects `useEffect` deps `[]` (adversarial F8). Consider refetch on focus, or a shared projects store invalidated by the Projects mutation hooks.
+- source_spec: `_bmad-output/implementation-artifacts/spec-5-2-project-projection.md`
+  summary: `effectiveRangeText` falls back to the raw `proj_<n>` handle in the `role="status"` aria-live region when the projects list has not loaded (or the fetch failed), leaking an internal id to screen-reader users.
+  evidence: `src/features/search/Search.tsx` `effectiveRangeText` (adversarial F9). Render `(loading…)` or omit the tessera part until the name resolves; consider a unified a11y pass with the Story 5.1 A8 confirm-region finding.
+- source_spec: `_bmad-output/implementation-artifacts/spec-5-2-project-projection.md`
+  summary: The Playwright Tessera-project assertion checks visible/enabled/focused only; it never `selectOption`s a project, never inspects the `/api/search` request URL for `tessera_project=`, and the route mock ignores `tessera_project` — so the AC's "the choice filters results, announced via aria-live" is verified only at the HTTP layer, not the UI.
+  evidence: `tests/ui/accessibility.spec.ts` filter-controls + projects-region tests (adversarial F11 / verification-gap). Extend to `selectOption` a known project and assert result narrowing + aria-live change; have the route mock narrow on `tessera_project`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-5-2-project-projection.md`
+  summary: No TS unit-test layer guards `buildSearchParams`'s new `tessera_project` emission (or the `q=`-when-empty fallback); a typo or dropped wire emission would silently disable narrowing with no test failure.
+  evidence: `src/api/search.ts` `buildSearchParams` (verification-gap F13). The locked stack ships no vitest/jest; either introduce one or cover via the extended Playwright test above.

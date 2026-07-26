@@ -162,6 +162,19 @@ fn raw_http(port: u16, request: &str) -> String {
     panic!("could not connect to test server: {last_err:?}");
 }
 
+/// POST a JSON body and return the full response text. Story 5.2 — shared by
+/// the project-API tests under `http_api.rs` so the Content-Length is always
+/// computed from the actual body (mirrors `projects_api.rs::post_json`).
+fn post_json(port: u16, path: &str, body: &str) -> String {
+    raw_http(
+        port,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+}
+
 /// `GET /api/ping` returns the versioned envelope with the full AD-9 security
 /// header set — the UI→core→UI round-trip on the new transport (Story 1.1 AC).
 #[test]
@@ -1319,21 +1332,61 @@ fn search_rejects_unknown_memory_type_value_with_bad_request() {
     assert!(response.contains("\"code\":\"bad_request\""), "got:\n{response}");
 }
 
-/// Story 2.4 I/O matrix — `tessera_project` param is accepted and ignored at
-/// the SQL layer (reserved for Epic 5). The result set equals the unfiltered
-/// default scope.
+/// Story 5.2 — `tessera_project` param (was reserved in 2.4) now narrows the
+/// result set to records whose `(provider, native_project)` is in the
+/// project's mapping scope set. Replaces the 2.4 "accepted and ignored" wire
+/// test: the slot is live. The fixture's boot_filter_test_server has Codex
+/// (NULL native_project) + Claude (proj-claude) confirmed sources; we create
+/// a project + map the Codex global scope to it via the project HTTP API
+/// (exercising the same code path users hit), then assert a project-scoped
+/// search returns only Codex records and the sidecar narrows.
 #[test]
-fn search_accepts_and_ignores_tessera_project_param_over_http() {
+fn search_tessera_project_param_narrows_results_over_http() {
     let port = boot_filter_test_server();
+
+    // Create a project + add the (codex, null) mapping via the HTTP API.
+    let create = post_json(port, "/api/projects/create", r#"{"name":"Codex-only"}"#);
+    assert!(create.starts_with("HTTP/1.1 200"), "create project: {create}");
+    let create_body = create.split("\r\n\r\n").nth(1).expect("body");
+    let create_json: serde_json::Value = serde_json::from_str(create_body).expect("json");
+    let project_id = create_json["payload"]["project_id"].as_str().expect("project_id");
+
+    let add = post_json(
+        port,
+        "/api/projects/mappings/add",
+        &format!(r#"{{"project_id":"{project_id}","provider":"codex","native_project":null}}"#),
+    );
+    assert!(add.starts_with("HTTP/1.1 200"), "add mapping: {add}");
+
+    // Project-scoped search → only Codex records match.
     let response = raw_http(
         port,
-        &format!("GET /api/search?q=federation&tessera_project=epic-5-future&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        &format!("GET /api/search?q=federation&tessera_project={project_id}&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
     );
     assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
     let body = response.split("\r\n\r\n").nth(1).expect("body");
     let json: serde_json::Value = serde_json::from_str(body).expect("json");
     let results = json["payload"]["results"].as_array().expect("results array");
-    assert_eq!(results.len(), 2, "tessera_project must not narrow: both records must match: {results:?}");
+    assert_eq!(results.len(), 1, "tessera_project must narrow to Codex only: {results:?}");
+    assert_eq!(results[0]["provider"].as_str(), Some("codex"));
+    // Sidecar narrows to the project's mapped source (Codex only).
+    let sources = json["payload"]["sources"].as_array().expect("sources array");
+    assert_eq!(sources.len(), 1, "sidecar must narrow to the 1 mapped source: {sources:?}");
+    assert_eq!(sources[0]["provider"].as_str(), Some("codex"));
+
+    // Unknown project id over the wire → empty results, NOT a 400.
+    let unknown = raw_http(
+        port,
+        &format!("GET /api/search?q=federation&tessera_project=proj_999&limit=20 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(unknown.starts_with("HTTP/1.1 200"), "unknown project is not an error: {unknown}");
+    let unknown_body = unknown.split("\r\n\r\n").nth(1).expect("body");
+    let unknown_json: serde_json::Value = serde_json::from_str(unknown_body).expect("json");
+    assert_eq!(
+        unknown_json["payload"]["results"].as_array().expect("results").len(),
+        0,
+        "unknown project yields no rows",
+    );
 }
 
 /// Story 2.4 AC — unknown query keys are still rejected (the filter params are

@@ -14,7 +14,9 @@
 //! 1.4/1.5. Story 5.1 adds the Tessera Project mapping layer
 //! (`project_store` module + migration id `7`) so the user can explicitly
 //! associate provider-native projects into a cross-Agent view (local-only;
-//! provider directories are never modified).
+//! provider directories are never modified). Story 5.2 appends migration id
+//! `8` (`v7_project_mapping_revision`) seeding the `project_mapping_revision`
+//! scalar that invalidates outstanding cursors on mapping changes.
 
 pub mod migrations;
 pub mod project_store;
@@ -30,10 +32,11 @@ pub mod source_registry;
 /// (`v3_canonical_memory_records`); Story 1.8 appended migration id `5`
 /// (`v4_rescan_cancellation`); Story 4.2 appended migration id `6`
 /// (`v5_source_health_cause`); Story 5.1 appended migration id `7`
-/// (`v6_tessera_projects`), so the current schema version is `7`. The value
-/// `0` is reserved as the pre-migration sentinel on a fresh database and is
-/// never a valid `CURRENT_SCHEMA_VERSION`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+/// (`v6_tessera_projects`); Story 5.2 appended migration id `8`
+/// (`v7_project_mapping_revision`), so the current schema version is `8`.
+/// The value `0` is reserved as the pre-migration sentinel on a fresh
+/// database and is never a valid `CURRENT_SCHEMA_VERSION`.
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// Re-export the registries so application / IPC code can name them without a
 /// long path.

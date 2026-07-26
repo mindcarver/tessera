@@ -460,8 +460,10 @@ fn migrations_apply_canonical_records_and_rescan_cancellation_schema() {
     // Story 4.2 bumped the schema_version baseline 5→6 with the
     // v5_source_health_cause migration (adds source_registry.health_cause);
     // Story 5.1 bumped 6→7 with the v6_tessera_projects migration (adds the
-    // `tessera_projects` + `project_mappings` tables).
-    assert_eq!(v, "7");
+    // `tessera_projects` + `project_mappings` tables); Story 5.2 bumped 7→8
+    // with the v7_project_mapping_revision migration (seeds
+    // `project_mapping_revision` in tessera_meta).
+    assert_eq!(v, "8");
 
     for table in ["scan_runs", "memory_records", "scan_diagnostics"] {
         let n: i64 = conn

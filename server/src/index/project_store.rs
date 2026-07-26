@@ -287,6 +287,83 @@ impl<'a> ProjectStore<'a> {
         })
     }
 
+    /// Story 5.2 — read the `project_mapping_revision` scalar from
+    /// `tessera_meta`. Returns `0` when the key is absent (a fresh DB before
+    /// migration id `8` runs, or any caller that has not yet applied the
+    /// Story 5.2 migration). The value is parsed as `i64`; a non-numeric
+    /// value (manual edit / corruption) collapses to `0` rather than
+    /// surfacing an error so a corrupt key cannot break the read path — the
+    /// next scope-set-changing op re-writes a numeric value via
+    /// [`Self::bump_project_mapping_revision`].
+    pub fn project_mapping_revision(&self) -> rusqlite::Result<i64> {
+        match self.conn.query_row(
+            "SELECT value FROM tessera_meta WHERE key = 'project_mapping_revision'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => Ok(value.parse::<i64>().unwrap_or(0)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Story 5.2 — bump the `project_mapping_revision` scalar (+1) inside
+    /// the existing `ProjectStore::with_transaction` whenever a Tessera
+    /// Project's mapped scope set changes (successful new `insert_mapping`,
+    /// `remove_mapping` that deleted a row, `delete` that removed mappings).
+    /// The application layer calls this only for scope-set-changing ops —
+    /// `create` / `rename` / idempotent re-add do NOT bump because they leave
+    /// the projection's result set unchanged (a renamed project still maps
+    /// the same Native Projects, so every outstanding cursor's snapshot is
+    /// still accurate).
+    ///
+    /// `CAST(COALESCE(CAST(value AS INTEGER), 0) + 1 AS TEXT)` performs the
+    /// +1 in SQLite (no round-trip through the application layer) and stores
+    /// the result back as TEXT, matching the `tessera_meta.value` column's
+    /// TEXT affinity. `COALESCE(..., 0)` is NULL-safe: a missing or
+    /// text-corrupt `value` collapses to `0` rather than propagating NULL
+    /// back into the column (the unguarded `CAST(NULL AS INTEGER) + 1` is
+    /// NULL, which would otherwise permanently zero the read path via the
+    /// `parse::<i64>().unwrap_or(0)` self-masking in
+    /// [`Self::project_mapping_revision`]).
+    ///
+    /// Affected-rows check: if the seed row is absent (a fixture that skipped
+    /// migration id `8`, or any caller that has not yet applied Story 5.2's
+    /// seed), the UPDATE matches 0 rows and — without the seed-then-retry
+    /// below — every subsequent bump would silently no-op, leaving
+    /// [`Self::project_mapping_revision`] reading `0` forever and breaking
+    /// AD-31's cursor invalidation without a peep. Inserting the seed row
+    /// then re-running the UPDATE guarantees the bump is never a silent
+    /// no-op. Idempotent under the existing
+    /// [`Self::with_transaction`] seam: an unsuccessful call surfaces as
+    /// `rusqlite::Error` and the transaction rolls back, so the bump and
+    /// the scope-set change commit atomically — or neither does.
+    pub fn bump_project_mapping_revision(&self) -> rusqlite::Result<()> {
+        let touched = self.conn.execute(
+            "UPDATE tessera_meta SET value = CAST(COALESCE(CAST(value AS INTEGER), 0) + 1 AS TEXT) \
+             WHERE key = 'project_mapping_revision'",
+            [],
+        )?;
+        if touched == 0 {
+            // Seed row absent. INSERT OR IGNORE keeps this concurrent-safe
+            // (two racing bumps that both see 0 rows both INSERT OR IGNORE
+            // the seed; exactly one wins, the other is a no-op) and the
+            // second UPDATE always finds the row — guaranteeing the bump
+            // commits +1 rather than silently disappearing.
+            self.conn.execute(
+                "INSERT OR IGNORE INTO tessera_meta(key, value) \
+                 VALUES ('project_mapping_revision', '0')",
+                [],
+            )?;
+            self.conn.execute(
+                "UPDATE tessera_meta SET value = CAST(COALESCE(CAST(value AS INTEGER), 0) + 1 AS TEXT) \
+                 WHERE key = 'project_mapping_revision'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     fn get_by_rowid(&self, rowid: i64) -> rusqlite::Result<Option<TesseraProject>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {PROJECT_SELECT_COLS} FROM tessera_projects WHERE id = ?1"

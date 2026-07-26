@@ -999,8 +999,9 @@ fn reset_derived_data_wipes_four_targets_preserves_schema_version() {
 
     // schema_version + reserved meta key preserved. Story 5.1 bumped
     // schema_version from 6 to 7 (the v6_tessera_projects migration adds the
-    // `tessera_projects` + `project_mappings` tables); the rebuild wipe
-    // preserves it.
+    // `tessera_projects` + `project_mappings` tables); Story 5.2 bumped it
+    // from 7 to 8 (the v7_project_mapping_revision migration seeds
+    // `project_mapping_revision`); the rebuild wipe preserves it.
     let schema_version: String = conn
         .query_row(
             "SELECT value FROM tessera_meta WHERE key = 'schema_version'",
@@ -1008,7 +1009,7 @@ fn reset_derived_data_wipes_four_targets_preserves_schema_version() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(schema_version, "7", "schema_version preserved");
+    assert_eq!(schema_version, "8", "schema_version preserved");
     let reserved: String = conn
         .query_row(
             "SELECT value FROM tessera_meta WHERE key = 'reserved'",
@@ -1253,4 +1254,95 @@ fn rebuild_index_works_against_a_booted_file_backed_state() {
     );
     // Tempdirs + `state` (and its `conn` borrow) drop in reverse declaration
     // order at end of scope — `conn` before `state` — so no explicit drops here.
+}
+
+// ---------------------------------------------------------------------------
+// Story 5.2 — Reset Index preserves `project_mapping_revision` (AD-29).
+//
+// The reset wipe keys on the `active_generation:` prefix only, so the
+// `project_mapping_revision` key (a Story 5.2 scalar seeded by migration id 8)
+// survives a rebuild. Mappings and their revision MUST survive rebuild so the
+// user's authored state is not silently undone by a rebuild.
+// ---------------------------------------------------------------------------
+
+/// Story 5.2 (AD-29) — a rebuild MUST NOT touch `project_mapping_revision` or
+/// any row of `tessera_projects` / `project_mappings`. The wipe keys on the
+/// `active_generation:` prefix only; the mapping revision + mappings
+/// themselves are user-authored state the rebuild is contractually forbidden
+/// to undo. Pins the AC: "Reset Index is run, `project_mapping_revision` is
+/// read after, then it is unchanged".
+#[test]
+fn rebuild_preserves_project_mapping_revision_and_mappings() {
+    use tessera_lib::application::{add_mapping, create_project};
+    use tessera_lib::domain::project::{CreateProjectRequest, MappingRequest};
+    use tessera_lib::index::ProjectStore;
+
+    let tmp = tempdir().expect("scratch app-data dir");
+    let state = tessera_lib::boot(tmp.path()).expect("boot");
+    {
+        let conn = state.conn.lock().expect("conn lock");
+        let project_store = ProjectStore::new(&conn);
+        // Create a project + add two mappings. Each successful add bumps the
+        // revision (0 → 1 → 2).
+        let project = create_project(
+            &project_store,
+            &CreateProjectRequest { name: "Federation".to_string() },
+        )
+        .expect("create project");
+        add_mapping(
+            &project_store,
+            &MappingRequest {
+                project_id: project.project_id.clone(),
+                provider: "codex".to_string(),
+                native_project: None,
+            },
+        )
+        .expect("add codex mapping");
+        add_mapping(
+            &project_store,
+            &MappingRequest {
+                project_id: project.project_id.clone(),
+                provider: "claude_code".to_string(),
+                native_project: Some("proj-a".to_string()),
+            },
+        )
+        .expect("add claude mapping");
+        assert_eq!(
+            project_store.project_mapping_revision().unwrap(),
+            2,
+            "two add-mappings bump the revision to 2"
+        );
+    }
+
+    // Run the rebuild. No confirmed sources means the wipe runs and no
+    // rescans dispatch — exactly what we want to test the wipe's scope.
+    let confirmed = {
+        let conn = state.conn.lock().expect("conn lock");
+        application::rebuild_index(&conn).expect("rebuild succeeds with no confirmed sources")
+    };
+    assert!(confirmed.is_empty(), "no confirmed sources → empty rescan list");
+
+    // Post-rebuild: the project + its mappings + the revision survive.
+    {
+        let conn = state.conn.lock().expect("conn lock");
+        let project_store = ProjectStore::new(&conn);
+        assert_eq!(
+            project_store.project_mapping_revision().unwrap(),
+            2,
+            "AD-29: project_mapping_revision survives rebuild"
+        );
+        let projects = tessera_lib::application::list_projects(&project_store).unwrap();
+        assert_eq!(projects.len(), 1, "the project row survives rebuild");
+        assert_eq!(projects[0].mappings.len(), 2, "both mappings survive rebuild");
+        // Active-generation markers ARE wiped (the rebuild's job); confirm the
+        // wipe ran by asserting no active_generation keys remain.
+        let active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tessera_meta WHERE key LIKE 'active_generation:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0, "active_generation markers wiped by rebuild");
+    }
 }

@@ -15,6 +15,7 @@ import {
   type SearchTimePreset,
   type SourceQueryStatus,
 } from "../../api/search";
+import { listProjects, type TesseraProjectView } from "../../api/projects";
 import { EmptyState } from "../../components/EmptyState";
 import { LoadMore } from "../../components/LoadMore";
 import { ResultCard } from "../../components/ResultCard";
@@ -63,6 +64,8 @@ interface FilterState {
   memory_type: string;
   native_project: string;
   timePreset: string;
+  /** Story 5.2 — Tessera project filter (`proj_<n>` or ""). */
+  tessera_project: string;
 }
 
 const EMPTY_FILTERS: FilterState = {
@@ -71,6 +74,7 @@ const EMPTY_FILTERS: FilterState = {
   memory_type: "",
   native_project: "",
   timePreset: "all",
+  tessera_project: "",
 };
 
 function isEmptyFilterState(filters: FilterState): boolean {
@@ -78,7 +82,8 @@ function isEmptyFilterState(filters: FilterState): boolean {
     && filters.source === ""
     && filters.memory_type === ""
     && filters.native_project.trim() === ""
-    && filters.timePreset === "all";
+    && filters.timePreset === "all"
+    && filters.tessera_project.trim() === "";
 }
 
 /**
@@ -98,6 +103,9 @@ function toSearchFilters(filters: FilterState, since: number | undefined): Searc
   const nativeProject = filters.native_project.trim();
   if (nativeProject !== "") result.native_project = nativeProject;
   if (since !== undefined) result.since = since;
+  // Story 5.2 — Tessera-project filter. Trim so whitespace-only is absent.
+  const tesseraProject = filters.tessera_project.trim();
+  if (tesseraProject !== "") result.tessera_project = tesseraProject;
   return result;
 }
 
@@ -133,6 +141,28 @@ export function Search(): ReactElement {
    * preset. Cleared on every filter change so the next page 1 resolves fresh.
    */
   const resolvedSinceRef = useRef<number | undefined>(undefined);
+  /**
+   * Story 5.2 — Tessera projects list for the project `<select>` (replaces the
+   * disabled reserved slot shipped in 2.4). Fetched once on mount via
+   * `listProjects()`; an empty list (no projects created yet) leaves the
+   * control in place but with only the "All projects" option. A fetch failure
+   * (e.g. core unavailable) collapses to an empty list rather than surfacing
+   * an error — the user can still search by keyword.
+   */
+  const [projects, setProjects] = useState<TesseraProjectView[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    listProjects()
+      .then((envelope) => {
+        if (!cancelled) setProjects(envelope.payload);
+      })
+      .catch(() => {
+        if (!cancelled) setProjects([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   useEffect(() => {
     const firstNewResult = pendingResultFocus.current;
     if (firstNewResult === null) return;
@@ -244,9 +274,9 @@ export function Search(): ReactElement {
       <input id="memory-search" value={query} onChange={(event) => { ++request.current; ++openRequest.current; setQuery(event.target.value); setState({ kind: "idle" }); setOpenState({ kind: "idle" }); }} />
       <button type="submit">Search</button>
     </form>
-    {renderFilterControls(filters, updateFilter, clearFilters, filtersActive, confirmedSources)}
-    <p role="status" data-testid="search-effective-range">{effectiveRangeText(filters, confirmedProviders)}</p>
-    <div aria-live="polite">{renderOpenState(openState)}{renderState(state, loadMore, openRecord, openState, resultList, alert, filters, filtersActive, confirmedProviders)}</div>
+    {renderFilterControls(filters, updateFilter, clearFilters, filtersActive, confirmedSources, projects)}
+    <p role="status" data-testid="search-effective-range">{effectiveRangeText(filters, confirmedProviders, projects)}</p>
+    <div aria-live="polite">{renderOpenState(openState)}{renderState(state, loadMore, openRecord, openState, resultList, alert, filters, filtersActive, confirmedProviders, projects)}</div>
   </section>;
 }
 
@@ -255,8 +285,8 @@ export function Search(): ReactElement {
  * readable `<label>`; the Provider, Source, Memory-type, and time-preset
  * filters are `<select>`s; Native-project is a free-form `<input>`
  * (exact-match on the wire). A Clear-filters button resets every filter to its
- * default. A disabled Tessera-project slot is rendered (reserved for Epic 5 —
- * the spec requires it "shown disabled in the UI", not merely absent). Changing
+ * default. Story 5.2 — the Tessera-project filter (was a disabled reserved
+ * slot in 2.4) is now a live `<select>` populated by `listProjects()`. Changing
  * any control resets the result state to idle (clears any held cursor) so the
  * next submit is a fresh page-1 query under the new filter combination.
  */
@@ -266,6 +296,7 @@ function renderFilterControls(
   clearFilters: () => void,
   filtersActive: boolean,
   confirmedSources: ConfirmedSource[],
+  projects: TesseraProjectView[],
 ): ReactElement {
   return <fieldset aria-label="Search filters">
     <legend>Filter memories</legend>
@@ -324,14 +355,23 @@ function renderFilterControls(
       ))}
     </select>
     {/*
-      Story 2.4 — reserved Tessera-project slot, rendered DISABLED (not merely
-      absent) per the spec Boundaries/I/O matrix/AC. Epic 5 fills this without a
-      contract change; until then it is visibly reserved so the user understands
-      the dimension exists but is not yet active.
+      Story 5.2 — Tessera-project filter (was a disabled reserved slot in 2.4).
+      Now a live `<select>` populated by `listProjects()`. When a project is
+      selected without a keyword, the form submits `q=` (empty) so the backend
+      Search path returns every in-scope record ranked (the AC's "browse by
+      project" — Q1=A). The cursor-clearing on change is handled by
+      `updateFilter`'s idle reset, the same pattern every other filter uses.
     */}
-    <label htmlFor="memory-filter-tessera-project">Tessera project (reserved)</label>
-    <select id="memory-filter-tessera-project" disabled aria-disabled="true">
-      <option value="">Reserved for a future release</option>
+    <label htmlFor="memory-filter-tessera-project">Tessera project</label>
+    <select
+      id="memory-filter-tessera-project"
+      value={filters.tessera_project}
+      onChange={(event) => updateFilter({ tessera_project: event.target.value })}
+    >
+      <option value="">All projects</option>
+      {projects.map((p) => (
+        <option key={p.project_id} value={p.project_id}>{p.name}</option>
+      ))}
     </select>
     <button type="button" onClick={clearFilters} disabled={!filtersActive}>Clear filters</button>
   </fieldset>;
@@ -396,7 +436,7 @@ function distinctProviders(sources: SourceQueryStatus[]): string[] {
  * - "Codex, type=memory, last 7d" — provider + memory-type + time filters set.
  * - "All confirmed sources" — no search has run yet, so no sidecar.
  */
-function effectiveRangeText(filters: FilterState, confirmedProviders: string[]): string {
+function effectiveRangeText(filters: FilterState, confirmedProviders: string[], projects: TesseraProjectView[]): string {
   const providerText = filters.provider
     ? providerDisplayName(filters.provider)
     : (confirmedProviders.length > 0
@@ -414,6 +454,14 @@ function effectiveRangeText(filters: FilterState, confirmedProviders: string[]):
     // similar single quote rather than inventing an HTML-escaping dependency.
     parts.push(`project="${nativeProject.replace(/"/g, "'")}"`);
   }
+  // Story 5.2 — surface the active Tessera-project filter by its name (not
+  // the raw `proj_<n>` handle) so the readout is human-readable. Falls back
+  // to the raw handle if the project list has not loaded yet.
+  const tesseraProjectId = filters.tessera_project.trim();
+  if (tesseraProjectId) {
+    const named = projects.find((p) => p.project_id === tesseraProjectId)?.name ?? tesseraProjectId;
+    parts.push(`tessera="${named.replace(/"/g, "'")}"`);
+  }
   if (filters.timePreset === "7d") parts.push("last 7d");
   else if (filters.timePreset === "30d") parts.push("last 30d");
   return parts.join(", ");
@@ -429,6 +477,7 @@ function renderState(
   filters: FilterState,
   filtersActive: boolean,
   confirmedProviders: string[],
+  projects: TesseraProjectView[],
 ): ReactElement | null {
   const openingId = openingRecordId(openState);
   if (state.kind === "idle") return null;
@@ -443,7 +492,7 @@ function renderState(
   if (state.kind === "error") return <>{partialUnavailableBanner(state.sources ?? [], Boolean(state.results))}{state.results ? renderResults(state.results, null, loadMore, openRecord, openingId, resultList) : null}<p ref={alert} tabIndex={-1} role="alert">{state.message}</p></>;
   if (state.kind === "stale") return <>{partialUnavailableBanner(state.sources, true)}<p ref={alert} tabIndex={-1} role="alert">{state.message}</p>{renderResults(state.results, null, loadMore, openRecord, openingId, resultList)}</>;
   // ready
-  if (state.empty) return <EmptyState message={emptyCopy(state.empty, filters, filtersActive, confirmedProviders)} />;
+  if (state.empty) return <EmptyState message={emptyCopy(state.empty, filters, filtersActive, confirmedProviders, projects)} />;
   return <>{partialUnavailableBanner(state.sources, state.results.length > 0)}{renderResults(state.results, state.cursor, loadMore, openRecord, openingId, resultList)}</>;
 }
 
@@ -520,13 +569,13 @@ function hasErrorCode(error: unknown, code: string): boolean {
  * filter-aware readout names the known providers instead of the generic "All
  * confirmed sources" fallback.
  */
-function emptyCopy(state: SearchEmptyState, filters: FilterState, filtersActive: boolean, confirmedProviders: string[]): string {
+function emptyCopy(state: SearchEmptyState, filters: FilterState, filtersActive: boolean, confirmedProviders: string[], projects: TesseraProjectView[]): string {
   switch (state) {
     case "no_match":
       // A filter-induced zero-result set must not claim the keyword matched
       // nothing — the filters are the cause. Name them.
       if (filtersActive) {
-        const active = effectiveRangeText(filters, confirmedProviders);
+        const active = effectiveRangeText(filters, confirmedProviders, projects);
         return `No indexed memory matched within the active filters (${active}).`;
       }
       return "No indexed memory matched this keyword.";
