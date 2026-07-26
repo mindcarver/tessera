@@ -2,10 +2,11 @@
 title: 'Story 4.3: Rediscovery & Degraded Handling for Path/Permission/Identity Change'
 type: 'feature'
 created: '2026-07-26'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 1
 followup_review_recommended: true
 baseline_revision: 'f3fb14c05373dff93ed78a9ba64cdbefa4a92d8c'
+final_revision: 'a1eb858'
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/epic-4-context.md'
   - '{project-root}/_bmad-output/implementation-artifacts/spec-4-2-connector-failure-isolation-stale-last-success.md'
