@@ -271,7 +271,13 @@ export function Obsidian(): ReactElement {
         );
         setSearchCursor(page.payload.next_cursor);
       })
-      .catch((error: unknown) => setMessage(readTesseraErrorMessage(error)));
+      .catch((error: unknown) =>
+        setSearchResults((prev) =>
+          prev.kind === "ok"
+            ? { kind: "error", message: readTesseraErrorMessage(error) }
+            : { kind: "error", message: readTesseraErrorMessage(error) },
+        ),
+      );
   }, [searchCursor, searchQuery, browsePageSize]);
 
   const exitSearch = useCallback(() => {

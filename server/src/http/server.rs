@@ -623,11 +623,17 @@ fn parse_knowledge_search_query(
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         match key {
             "q" => q = Some(percent_decode_bounded(value, 1024).ok_or(())?),
-            "limit" => limit = value.parse::<u32>().map_err(|_| ())?.clamp(1, 100),
+            "limit" => {
+                let decoded = percent_decode_bounded(value, 8).ok_or(())?;
+                limit = decoded.parse::<u32>().map_err(|_| ())?.clamp(1, 100);
+            }
             "cursor" => cursor = Some(percent_decode_bounded(value, 1024).ok_or(())?),
             "source" => source = Some(percent_decode_bounded(value, 256).ok_or(())?),
             "folder" => folder = Some(percent_decode_bounded(value, 1024).ok_or(())?),
-            "since" => since = Some(value.parse::<i64>().map_err(|_| ())?),
+            "since" => {
+                let decoded = percent_decode_bounded(value, 32).ok_or(())?;
+                since = Some(decoded.parse::<i64>().map_err(|_| ())?);
+            }
             "" => {}
             _ => return Err(()),
         }

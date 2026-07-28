@@ -392,3 +392,88 @@ fn search_knowledge_empty_query_is_bad_request() {
     let result = application::search_knowledge(&registry, &conn, "", 20, None, None, None, None);
     assert!(matches!(result.unwrap_err(), application::query::QueryError::BadRequest));
 }
+
+/// title_match: a note with the keyword in its title ranks before a body-only match.
+#[test]
+fn search_knowledge_title_match_ranks_first() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    fs::write(vault.join("title.md"), "# rust\nirrelevant body").unwrap();
+    fs::write(vault.join("body.md"), "# Other\nrust in body only").unwrap();
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault)).unwrap();
+    application::scan_source(&registry, &conn, &source.source_id).unwrap();
+    let page = application::search_knowledge(&registry, &conn, "rust", 20, None, None, None, None).unwrap();
+    assert!(page.results.len() >= 2);
+    assert!(page.results[0].title_match, "first result should be a title match");
+    assert!(!page.results.iter().all(|r| r.title_match), "at least one body-only match");
+}
+
+/// Terminal pagination page: 5 notes, limit=2 → page 3 has 1 result, no cursor.
+#[test]
+fn search_knowledge_terminal_page_has_no_cursor() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    for i in 0..5 { fs::write(vault.join(format!("note{i}.md")), format!("# Note{i}\nrust keyword")).unwrap(); }
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault)).unwrap();
+    application::scan_source(&registry, &conn, &source.source_id).unwrap();
+    let p1 = application::search_knowledge(&registry, &conn, "rust", 2, None, None, None, None).unwrap();
+    let p2 = application::search_knowledge(&registry, &conn, "rust", 2, Some(&p1.next_cursor.clone().unwrap()), None, None, None).unwrap();
+    let p3 = application::search_knowledge(&registry, &conn, "rust", 2, Some(&p2.next_cursor.clone().unwrap()), None, None, None).unwrap();
+    assert_eq!(p3.results.len(), 1, "terminal page has 1 remaining result");
+    assert!(p3.next_cursor.is_none(), "terminal page has no cursor");
+    // All 5 distinct across 3 pages.
+    let mut all_ids: Vec<String> = vec![];
+    for page in [&p1, &p2, &p3] { all_ids.extend(page.results.iter().map(|r| r.record_id.clone())); }
+    let unique: std::collections::HashSet<_> = all_ids.iter().collect();
+    assert_eq!(unique.len(), 5, "5 distinct notes across all pages");
+}
+
+/// Whitespace-only query → bad_request.
+#[test]
+fn search_knowledge_whitespace_only_query_is_bad_request() {
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let result = application::search_knowledge(&registry, &conn, "   ", 20, None, None, None, None);
+    assert!(matches!(result.unwrap_err(), application::query::QueryError::BadRequest));
+}
+
+/// Unknown source id → bad_request (not silent empty).
+#[test]
+fn search_knowledge_unknown_source_is_bad_request() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault)).unwrap();
+    application::scan_source(&registry, &conn, &source.source_id).unwrap();
+    let bad_id = tessera_lib::domain::source::SourceId("src_abc".to_string());
+    let result = application::search_knowledge(&registry, &conn, "rust", 20, None, Some(&bad_id), None, None);
+    assert!(matches!(result.unwrap_err(), application::query::QueryError::BadRequest));
+}
+
+/// LIKE wildcard in folder prefix is treated literally (not as a wildcard).
+#[test]
+fn search_knowledge_folder_prefix_escapes_like_wildcards() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("vault");
+    fs::create_dir_all(vault.join("Notes/sub")).unwrap();
+    fs::write(vault.join("Notes/top.md"), "# Rust\nrust here").unwrap();
+    fs::write(vault.join("Notes/sub/deep.md"), "# Rust\nrust deep").unwrap();
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault)).unwrap();
+    application::scan_source(&registry, &conn, &source.source_id).unwrap();
+    // folder="Notes/%" should match NOTHING (literal % in path, not wildcard).
+    let page = application::search_knowledge(&registry, &conn, "rust", 20, None, None, Some("Notes/%"), None).unwrap();
+    assert!(page.results.is_empty(), "literal % folder prefix matches no paths");
+    // folder="Notes/sub" still matches normally.
+    let page2 = application::search_knowledge(&registry, &conn, "rust", 20, None, None, Some("Notes/sub"), None).unwrap();
+    assert_eq!(page2.results.len(), 1, "normal folder prefix works");
+}

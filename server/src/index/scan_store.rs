@@ -980,7 +980,12 @@ impl<'a> ScanStore<'a> {
         let source_present: i64 = if source_filter.is_some() { 1 } else { 0 };
         let source_value: Option<i64> = source_filter;
         let folder_present: i64 = if folder_prefix.is_some() { 1 } else { 0 };
-        let folder_value: Option<&str> = folder_prefix;
+        // Escape LIKE wildcards (%, _) and the escape char (\) in the
+        // folder prefix so it is a literal prefix, not a wildcard pattern
+        // (review finding: folder=Notes/%25 would match everything).
+        let escaped_folder: Option<String> = folder_prefix.map(|f| {
+            f.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        });
         let since_present: i64 = if since.is_some() { 1 } else { 0 };
         let since_value: Option<i64> = since;
         let mut stmt = self.conn.prepare(
@@ -1003,7 +1008,7 @@ impl<'a> ScanStore<'a> {
                        AND k.record_id > ?5)
                )
                AND (?6 = 0 OR k.source_id = ?7)
-               AND (?8 = 0 OR k.native_locator LIKE ?9 || '%')
+               AND (?8 = 0 OR k.native_locator LIKE ?9 || '%' ESCAPE CHAR(92))
                AND (?10 = 0 OR k.observed_at >= ?11)
              ORDER BY
                (CASE WHEN instr(k.title, ?1) > 0 THEN 0 ELSE 1 END) ASC,
@@ -1021,7 +1026,7 @@ impl<'a> ScanStore<'a> {
                 source_present,
                 source_value,
                 folder_present,
-                folder_value,
+                escaped_folder.as_deref(),
                 since_present,
                 since_value,
                 page_size,
@@ -1058,7 +1063,8 @@ impl<'a> ScanStore<'a> {
         Ok((out, has_more))
     }
 
-
+    /// Most recent successfully completed scan. It is intentionally separate
+    /// from `latest_run`: a failed/cancelled rescan must not erase this fact.
     pub fn last_successful_finished_at(&self, source_rowid: i64) -> rusqlite::Result<Option<i64>> {
         self.conn
             .query_row(

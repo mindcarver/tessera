@@ -808,29 +808,45 @@ pub fn search_knowledge(
     folder_prefix: Option<&str>,
     since: Option<i64>,
 ) -> Result<KnowledgeSearchPage, QueryError> {
-    if query.is_empty() {
+    if query.trim().is_empty() {
         return Err(QueryError::BadRequest);
     }
     let store = ScanStore::new(conn);
-    // Resolve optional source filter to a rowid.
+    // Resolve optional source filter to a rowid. An unresolvable source id is
+    // a bad_request (consistent with browse_knowledge), not a silent -1.
     let source_rowid: Option<i64> = match source_filter {
-        Some(sid) => ScanStore::source_rowid(sid).or(Some(-1)), // -1 → no match
+        Some(sid) => Some(ScanStore::source_rowid(sid).ok_or(QueryError::BadRequest)?),
         None => None,
     };
-    // Decode cursor: `ks.<0|1>:<native_locator>:<record_id>`. The ORDER BY is
-    // (title_rank, native_locator ASC, record_id ASC) so the cursor carries
-    // all three keys for a correct lexicographic strictly-after.
+    // Compute a lightweight scope hash of (query, source, folder, since) so a
+    // mid-pagination filter change is detected as CursorStale (mirrors
+    // Agent-Memory's cursor filter binding).
+    let scope_hash = knowledge_scope_hash(query, source_rowid, folder_prefix, since);
+    // Decode cursor: `ks.<rank>\x1f<locator>\x1f<record_id>\x1f<scope_hash>`.
+    // Uses \x1f (unit separator) as delimiter — it cannot appear in filesystem
+    // paths, unlike `:` which Windows drive letters or Obsidian aliases use.
+    // The ORDER BY is (title_rank, native_locator ASC, record_id ASC).
     let (after_id, after_title_match, after_locator) = match cursor {
         Some(c) if c.starts_with("ks.") => {
             let rest = &c[3..];
-            let (rank_str, rest2) = rest.split_once(':').ok_or(QueryError::CursorStale)?;
-            let (locator, id) = rest2.rsplit_once(':').ok_or(QueryError::CursorStale)?;
-            let tm = match rank_str {
+            let parts: Vec<&str> = rest.split('\x1f').collect();
+            if parts.len() != 4 {
+                return Err(QueryError::CursorStale);
+            }
+            // Validate scope: the cursor's scope hash must match the current
+            // filters, else the caller changed filters mid-pagination.
+            if parts[3] != scope_hash {
+                return Err(QueryError::CursorStale);
+            }
+            let tm = match parts[0] {
                 "0" => Some(true),
                 "1" => Some(false),
                 _ => return Err(QueryError::CursorStale),
             };
-            (Some(id.to_string()), tm, Some(locator.to_string()))
+            if parts[1].is_empty() || parts[2].is_empty() {
+                return Err(QueryError::CursorStale);
+            }
+            (Some(parts[2].to_string()), tm, Some(parts[1].to_string()))
         }
         Some(_) => return Err(QueryError::CursorStale),
         None => (None, None, None),
@@ -854,13 +870,18 @@ pub fn search_knowledge(
             .iter()
             .find(|s| s.source_id.to_rowid() == Some(rowid))
             .map(|s| {
-                std::path::Path::new(&s.normalized_root_path)
+                // Trim trailing '/' so file_name() works on paths like
+                // "/Users/x/MyVault/" (otherwise file_name returns None and
+                // the full absolute path leaks — NFR-3).
+                let clean = s.normalized_root_path.trim_end_matches('/');
+                std::path::Path::new(clean)
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or(&s.normalized_root_path)
+                    .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+                    .unwrap_or("vault")
                     .to_string()
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| "vault".to_string())
     };
     let results: Vec<KnowledgeSearchResult> = rows
         .iter()
@@ -885,7 +906,7 @@ pub fn search_knowledge(
     let next_cursor = if has_more {
         results.last().map(|r| {
             let rank = if r.title_match { 0 } else { 1 };
-            format!("ks.{rank}:{}:{}", r.vault_relative_path, r.record_id)
+            format!("ks.{rank}\x1f{}\x1f{}\x1f{scope_hash}", r.vault_relative_path, r.record_id)
         })
     } else {
         None
@@ -901,6 +922,35 @@ pub fn search_knowledge(
         next_cursor,
         empty_state,
     })
+}
+
+/// Compute a lightweight FNV-1a hash of the search scope (query + filters)
+/// so a mid-pagination filter change is detected as CursorStale. The hash is
+/// opaque to the caller and encoded into the `ks.` cursor body.
+fn knowledge_scope_hash(
+    query: &str,
+    source_rowid: Option<i64>,
+    folder_prefix: Option<&str>,
+    since: Option<i64>,
+) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in query.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for b in source_rowid.unwrap_or(0).to_string().as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for b in folder_prefix.unwrap_or("").as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for b in since.unwrap_or(0).to_string().as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn knowledge_search_empty_state(
