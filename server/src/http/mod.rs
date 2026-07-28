@@ -227,7 +227,7 @@ pub fn confirm_knowledge_source(
     let source = application::confirm_knowledge_source(&registry, candidate)
         .map_err(|err| map_source_error(err, None))?;
     drop(conn);
-    start_watch_best_effort(state, &source.source_id, &source.normalized_root_path);
+    start_watch_best_effort(state, &source.source_id, &source.provider, &source.normalized_root_path);
     Ok(wrap_source(source))
 }
 
