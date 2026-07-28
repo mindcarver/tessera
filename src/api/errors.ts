@@ -25,6 +25,12 @@ export const TESSERA_STABLE_ERROR_CODES: ReadonlySet<string> = new Set([
   // Story 1.3: confirm/reject could not canonicalize the root (missing /
   // non-dir / non-absolute — NFR-5/6); disable/list surfaced a DB error.
   "confirm_failed",
+  // Story 6.3: a Knowledge (Obsidian Vault) confirm was rejected because its
+  // root overlaps an already-confirmed Source. Surfacing this safe message is
+  // what lets a failed confirm show visible feedback instead of falling back
+  // to the generic "core did not respond" string (which reads like a crash and
+  // contributed to the "点击确认没反应" symptom).
+  "root_overlap",
   "source_not_found",
   // Story 1.4: a scan failed (mid-scan read failure, source changed during
   // scan, commit CAS loss, non-confirmed source). The previous index is
