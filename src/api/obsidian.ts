@@ -349,3 +349,91 @@ export async function browseKnowledge(
     "Tessera core Knowledge Browse response did not match the versioned envelope contract.",
   );
 }
+
+// --- Story 6.9 — Knowledge Search -------------------------------------------
+
+export interface KnowledgeSearchResult {
+  record_id: string;
+  excerpt: string;
+  provider: string;
+  source_id: string;
+  vault_name: string;
+  vault_relative_path: string;
+  display_locator: string;
+  observed_at: number;
+  coverage_level: string;
+  modified_time: string | null;
+  health_state: string;
+  title_match: boolean;
+}
+
+export interface KnowledgeSearchPage {
+  query: string;
+  results: KnowledgeSearchResult[];
+  next_cursor: string | null;
+  empty_state: "no_match" | "not_indexed" | "source_unavailable" | "none";
+}
+
+function asSearchResult(value: unknown): KnowledgeSearchResult | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  if (
+    !isString(v.record_id) ||
+    !isString(v.excerpt) ||
+    !isString(v.provider) ||
+    !isString(v.source_id) ||
+    !isString(v.vault_name) ||
+    !isString(v.vault_relative_path) ||
+    !isString(v.display_locator) ||
+    !isNumber(v.observed_at) ||
+    !isString(v.coverage_level) ||
+    isOptionalStringOrNull(v.modified_time) === false ||
+    !isString(v.health_state) ||
+    typeof v.title_match !== "boolean"
+  ) {
+    return null;
+  }
+  return v as unknown as KnowledgeSearchResult;
+}
+
+export async function searchKnowledge(
+  query: string,
+  limit: number,
+  cursor?: string,
+  source?: string,
+  folder?: string,
+  since?: number,
+): Promise<Envelope<KnowledgeSearchPage>> {
+  let path = `/api/knowledge/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+  if (cursor) path += `&cursor=${encodeURIComponent(cursor)}`;
+  if (source) path += `&source=${encodeURIComponent(source)}`;
+  if (folder) path += `&folder=${encodeURIComponent(folder)}`;
+  if (since !== undefined) path += `&since=${since}`;
+  const raw = (await apiGet(path)) as unknown;
+  const envelope = raw as Envelope<unknown> | null;
+  if (envelope && envelope.api_version === API_VERSION && envelope.payload && typeof envelope.payload === "object") {
+    const payload = envelope.payload as Record<string, unknown>;
+    const validStates = new Set(["no_match", "not_indexed", "source_unavailable", "none"]);
+    if (
+      isString(payload.query) &&
+      Array.isArray(payload.results) &&
+      payload.results.every((r) => asSearchResult(r) !== null) &&
+      isOptionalStringOrNull(payload.next_cursor) &&
+      typeof payload.empty_state === "string" &&
+      validStates.has(payload.empty_state)
+    ) {
+      return {
+        api_version: envelope.api_version,
+        payload: {
+          query: payload.query as string,
+          results: payload.results.map((r) => asSearchResult(r) as KnowledgeSearchResult),
+          next_cursor: (payload.next_cursor as string | null) ?? null,
+          empty_state: payload.empty_state as KnowledgeSearchPage["empty_state"],
+        },
+      };
+    }
+  }
+  throwContractError(
+    "Tessera core Knowledge Search response did not match the versioned envelope contract.",
+  );
+}

@@ -21,9 +21,11 @@ import {
   getKnowledgeInventory,
   rejectKnowledgeSource,
   requestVaultPicker,
+  searchKnowledge,
   type KnowledgeCandidate,
   type KnowledgeInventory,
   type KnowledgeNoteResult,
+  type KnowledgeSearchResult,
 } from "../../api/obsidian";
 import { readTesseraErrorMessage } from "../../api/errors";
 import type { HealthState } from "../../api/sources";
@@ -167,6 +169,13 @@ export function Obsidian(): ReactElement {
   });
   const [browseCursor, setBrowseCursor] = useState<string | null>(null);
   const browsePageSize = 20;
+  // Story 6.9 — Search state.
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<LoadState<KnowledgeSearchResult[]>>({
+    kind: "loading",
+  });
+  const [searchCursor, setSearchCursor] = useState<string | null>(null);
+  const [searchActive, setSearchActive] = useState(false);
 
   const refreshInventory = useCallback(() => {
     getKnowledgeInventory()
@@ -234,6 +243,43 @@ export function Obsidian(): ReactElement {
     setBrowseCursor(null);
     refreshInventory();
   }, [refreshInventory]);
+
+  // Story 6.9 — keyword search across all confirmed vaults.
+  const runSearch = useCallback((q: string) => {
+    if (!q.trim()) return;
+    setSearchActive(true);
+    setSearchQuery(q);
+    setSearchCursor(null);
+    setSearchResults({ kind: "loading" });
+    searchKnowledge(q, browsePageSize)
+      .then((page) => {
+        setSearchResults({ kind: "ok", value: page.payload.results });
+        setSearchCursor(page.payload.next_cursor);
+      })
+      .catch((error: unknown) =>
+        setSearchResults({ kind: "error", message: readTesseraErrorMessage(error) }),
+      );
+  }, [browsePageSize]);
+
+  const loadMoreSearch = useCallback(() => {
+    if (!searchCursor || !searchQuery) return;
+    const cursor = searchCursor;
+    searchKnowledge(searchQuery, browsePageSize, cursor)
+      .then((page) => {
+        setSearchResults((prev) =>
+          prev.kind === "ok" ? { kind: "ok", value: [...prev.value, ...page.payload.results] } : prev,
+        );
+        setSearchCursor(page.payload.next_cursor);
+      })
+      .catch((error: unknown) => setMessage(readTesseraErrorMessage(error)));
+  }, [searchCursor, searchQuery, browsePageSize]);
+
+  const exitSearch = useCallback(() => {
+    setSearchActive(false);
+    setSearchQuery("");
+    setSearchResults({ kind: "loading" });
+    setSearchCursor(null);
+  }, []);
 
   const resolveCandidate = useCallback(
     (candidate: KnowledgeCandidate, action: "confirm" | "reject") => {
@@ -330,12 +376,87 @@ export function Obsidian(): ReactElement {
     );
   }
 
+  // Story 6.9 — Search results view.
+  if (searchActive) {
+    return (
+      <section aria-label="知识库搜索结果" id="tessera-obsidian" className="tsr-section">
+        <h2 className="tsr-section__title">搜索「{searchQuery}」</h2>
+        <p aria-live="polite" className="visually-hidden-text">{message}</p>
+        <div className="tsr-rebuild">
+          <button type="button" className="tsr-btn" onClick={exitSearch}>
+            ← 返回知识库
+          </button>
+        </div>
+        {searchResults.kind === "loading" ? <p className="tsr-prose">正在搜索…</p> : null}
+        {searchResults.kind === "error" ? <p role="alert" className="tsr-prose">{searchResults.message}</p> : null}
+        {searchResults.kind === "ok" && searchResults.value.length === 0 ? (
+          <p className="tsr-prose">未找到匹配的笔记。</p>
+        ) : null}
+        {searchResults.kind === "ok" && searchResults.value.length > 0 ? (
+          <>
+            <ul className="tsr-cards">
+              {searchResults.value.map((note) => (
+                <li key={note.record_id} className="tsr-card">
+                  <article className="tsr-card__body">
+                    <div className="tsr-card__row">
+                      <div className="tsr-card__main">
+                        <h5 className="tsr-card__prov">{note.vault_name}</h5>
+                        <div className="tsr-card__name">{note.vault_relative_path}</div>
+                        <p className="tsr-card__meta">
+                          {new Date(note.observed_at * 1000).toLocaleString("zh-CN")}
+                        </p>
+                        <p className="tsr-prose" style={{ whiteSpace: "pre-wrap", marginTop: "0.5rem" }}>
+                          {note.excerpt}
+                        </p>
+                      </div>
+                    </div>
+                  </article>
+                </li>
+              ))}
+            </ul>
+            {searchCursor ? (
+              <div className="tsr-rebuild">
+                <button type="button" className="tsr-btn" onClick={loadMoreSearch}>加载更多</button>
+              </div>
+            ) : null}
+          </>
+        ) : null}
+      </section>
+    );
+  }
+
   return (
     <section aria-label="Obsidian 知识库" id="tessera-obsidian" className="tsr-section">
       <h2 className="tsr-section__title">Obsidian 知识库</h2>
       <p aria-live="polite" className="visually-hidden-text">
         {message}
       </p>
+
+      {/* Story 6.9 — cross-vault keyword search */}
+      <section aria-label="搜索知识库" className="tsr-block">
+        <h3 className="tsr-block__title">搜索笔记</h3>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            runSearch(searchQuery);
+          }}
+        >
+          <div className="tsr-rebuild">
+            <input
+              type="text"
+              className="tsr-input"
+              placeholder="输入关键词搜索所有知识库…"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              aria-label="搜索关键词"
+              style={{ marginRight: "0.5rem", padding: "0.4rem 0.6rem", minWidth: "300px" }}
+            />
+            <button type="submit" className="tsr-btn tsr-btn--primary">
+              搜索
+            </button>
+          </div>
+        </form>
+      </section>
 
       {/* ---- Vault candidates (from registry + picker fallback) ---- */}
       <section aria-label="发现的 Vault" className="tsr-block">

@@ -437,6 +437,41 @@ pub fn browse_knowledge(
     })
 }
 
+/// `GET /api/knowledge/search?q=&limit=&cursor=&source=&folder=&since=` —
+/// keyword-search Knowledge notes across all confirmed Vaults (Story 6.9).
+pub fn search_knowledge(
+    query: &str,
+    limit: u32,
+    cursor: Option<&str>,
+    source: Option<&str>,
+    folder: Option<&str>,
+    since: Option<i64>,
+    state: &IndexState,
+) -> Result<Envelope<crate::application::query::KnowledgeSearchPage>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let source_id = source.map(|s| SourceId(s.to_string()));
+    let page = application::search_knowledge(
+        &registry,
+        &conn,
+        query,
+        limit,
+        cursor,
+        source_id.as_ref(),
+        folder,
+        since,
+    )
+    .map_err(|error| match error {
+        QueryError::BadRequest => ErrorEnvelope::bad_request("knowledge_search"),
+        QueryError::CursorStale => ErrorEnvelope::cursor_stale("knowledge_search"),
+        QueryError::Internal => ErrorEnvelope::internal_for(None, "knowledge_search"),
+    })?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: page,
+    })
+}
+
 pub fn open_original_location(
     request: OpenRequest,
     state: &IndexState,

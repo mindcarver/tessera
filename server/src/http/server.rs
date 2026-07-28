@@ -47,7 +47,7 @@ use crate::http::{
     discover_sources, get_scan_status, knowledge_inventory, list_projects, list_sources,
     open_original_location, ping, rebind_source, reject_knowledge_source, reject_source,
     remove_mapping, rename_project, request_vault_picker, rescan_events, scan_source, search,
-    source_inventory, start_rebuild, start_rescan,
+    search_knowledge, source_inventory, start_rebuild, start_rescan,
 };
 use crate::IndexState;
 
@@ -350,6 +350,21 @@ fn route(
             };
             respond_result(request, browse_knowledge(&ksource, klimit, kcursor.as_deref(), state))
         }
+        // Story 6.9 — Knowledge Search (cross-vault keyword search).
+        (Method::Get, "/api/knowledge/search") => {
+            let (kq, klimit, kcursor, ksource, kfolder, ksince) =
+                match parse_knowledge_search_query(query) {
+                    Ok(v) => v,
+                    Err(()) => {
+                        return request.respond(json_error(
+                            StatusCode(400),
+                            "bad_request",
+                            "The request did not match Tessera's knowledge search contract.",
+                        ))
+                    }
+                };
+            respond_result(request, search_knowledge(&kq, klimit, kcursor.as_deref(), ksource.as_deref(), kfolder.as_deref(), ksince, state))
+        }
         (Method::Post, "/api/scan") => {
             let source_id = match read_source_id_body(&mut request) {
                 Ok(id) => id,
@@ -593,6 +608,33 @@ fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
 /// behavior so the two surfaces share one vocabulary.
 /// Story 6.9 — parse the Knowledge Browse query params: `source` (required
 /// `src_<n>`), `limit` (default 20, max 100), `cursor` (optional `kb.<id>`).
+/// Story 6.9 — parse the Knowledge Search query params: `q` (required),
+/// `limit` (default 20, max 100), `cursor`, `source`, `folder`, `since`.
+fn parse_knowledge_search_query(
+    query: &str,
+) -> Result<(String, u32, Option<String>, Option<String>, Option<String>, Option<i64>), ()> {
+    let mut q: Option<String> = None;
+    let mut limit: u32 = 20;
+    let mut cursor: Option<String> = None;
+    let mut source: Option<String> = None;
+    let mut folder: Option<String> = None;
+    let mut since: Option<i64> = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "q" => q = Some(percent_decode_bounded(value, 1024).ok_or(())?),
+            "limit" => limit = value.parse::<u32>().map_err(|_| ())?.clamp(1, 100),
+            "cursor" => cursor = Some(percent_decode_bounded(value, 1024).ok_or(())?),
+            "source" => source = Some(percent_decode_bounded(value, 256).ok_or(())?),
+            "folder" => folder = Some(percent_decode_bounded(value, 1024).ok_or(())?),
+            "since" => since = Some(value.parse::<i64>().map_err(|_| ())?),
+            "" => {}
+            _ => return Err(()),
+        }
+    }
+    Ok((q.ok_or(())?, limit, cursor, source, folder, since))
+}
+
 fn parse_knowledge_browse_query(query: &str) -> Result<(String, u32, Option<String>), ()> {
     let mut source: Option<String> = None;
     let mut limit: u32 = 20;

@@ -96,6 +96,8 @@ pub struct StagedDiagnostic {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnowledgeRecordRow {
     pub record_id: String,
+    /// The note's derived title (first # heading or filename stem).
+    pub title: String,
     /// First ~320 chars of the note body (derived presentation).
     pub excerpt: String,
     pub provider: String,
@@ -913,6 +915,126 @@ impl<'a> ScanStore<'a> {
                 let body: String = row.get(2)?;
                 Ok(KnowledgeRecordRow {
                     record_id: row.get(0)?,
+                    title: title.clone(),
+                    excerpt: knowledge_excerpt(&title, &body),
+                    provider: row.get(3)?,
+                    source_id: SourceId::from_rowid(row.get(4)?),
+                    vault_relative_path: row.get(5)?,
+                    display_locator: row.get(6)?,
+                    observed_at: row.get(7)?,
+                    coverage_level: row.get(8)?,
+                    modified_time: row.get(9)?,
+                    health_state,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        let has_more = out.len() as u32 > limit;
+        if has_more {
+            out.truncate(limit as usize);
+        }
+        Ok((out, has_more))
+    }
+
+    /// Search Knowledge records across ALL confirmed Knowledge sources with a
+    /// usable active generation (Story 6.9). Mirrors the Agent-Memory
+    /// `search_records` SQL pattern but reads `knowledge_records` and uses
+    /// simpler Knowledge-domain filters (source, folder-prefix, since).
+    ///
+    /// Keyword matching is `instr(title || char(10) || body, ?query) > 0`
+    /// (substring, no FTS5). Results are ordered by title-match rank first,
+    /// then Vault-relative path, then record_id. The cursor is a record_id
+    /// lexicographic strictly-after within the same title-match tier.
+    ///
+    /// `source_filter`: `Some(rowid)` narrows to one Vault; `None` searches all.
+    /// `folder_prefix`: `Some("Notes/sub")` narrows to notes whose
+    /// `native_locator` starts with the prefix. `since`: `Some(epoch_sec)`
+    /// filters by observed_at >= threshold.
+    pub fn search_knowledge_records(
+        &self,
+        query: &str,
+        limit: u32,
+        after_record_id: Option<&str>,
+        after_title_match: Option<bool>,
+        after_locator: Option<&str>,
+        source_filter: Option<i64>,
+        folder_prefix: Option<&str>,
+        since: Option<i64>,
+    ) -> rusqlite::Result<(Vec<KnowledgeRecordRow>, bool)> {
+        let page_size = i64::try_from(limit + 1).expect("limit is bounded");
+        // Cursor: present flag + title_match rank + record_id. The cursor
+        // encodes the last result's (title_match, record_id) so the next page
+        // continues within the correct tier. A title-match=true row sorts
+        // before title-match=false; within a tier, record_id ASC.
+        let cursor_present: i64 = if after_record_id.is_some() { 1 } else { 0 };
+        let cursor_title_rank: i64 = match after_title_match {
+            Some(true) => 0,
+            Some(false) => 1,
+            None => 0,
+        };
+        let cursor_locator: Option<&str> = after_locator;
+        let cursor_id: Option<&str> = after_record_id;
+        let source_present: i64 = if source_filter.is_some() { 1 } else { 0 };
+        let source_value: Option<i64> = source_filter;
+        let folder_present: i64 = if folder_prefix.is_some() { 1 } else { 0 };
+        let folder_value: Option<&str> = folder_prefix;
+        let since_present: i64 = if since.is_some() { 1 } else { 0 };
+        let since_value: Option<i64> = since;
+        let mut stmt = self.conn.prepare(
+            "SELECT k.record_id, k.title, k.body, k.provider, k.source_id,
+                    k.native_locator, k.display_locator, k.observed_at,
+                    k.coverage_level, k.modified_time, s.health_state
+             FROM knowledge_records k
+             JOIN source_registry s ON s.id = k.source_id
+             JOIN tessera_meta active ON active.key = ('active_generation:' || k.source_id)
+                                       AND active.value = k.generation
+             WHERE s.lifecycle_state = 'confirmed'
+               AND instr(k.title || char(10) || k.body, ?1) > 0
+               AND (
+                   ?2 = 0
+                   OR (CASE WHEN instr(k.title, ?1) > 0 THEN 0 ELSE 1 END) > ?3
+                   OR ((CASE WHEN instr(k.title, ?1) > 0 THEN 0 ELSE 1 END) = ?3
+                       AND k.native_locator > ?4)
+                   OR ((CASE WHEN instr(k.title, ?1) > 0 THEN 0 ELSE 1 END) = ?3
+                       AND k.native_locator = ?4
+                       AND k.record_id > ?5)
+               )
+               AND (?6 = 0 OR k.source_id = ?7)
+               AND (?8 = 0 OR k.native_locator LIKE ?9 || '%')
+               AND (?10 = 0 OR k.observed_at >= ?11)
+             ORDER BY
+               (CASE WHEN instr(k.title, ?1) > 0 THEN 0 ELSE 1 END) ASC,
+               k.native_locator ASC,
+               k.record_id ASC
+             LIMIT ?12",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                query,
+                cursor_present,
+                cursor_title_rank,
+                cursor_locator,
+                cursor_id,
+                source_present,
+                source_value,
+                folder_present,
+                folder_value,
+                since_present,
+                since_value,
+                page_size,
+            ],
+            |row| {
+                let health: String = row.get(10)?;
+                let health_state = HealthState::parse_str(&health)
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                let title: String = row.get(1)?;
+                let body: String = row.get(2)?;
+                Ok(KnowledgeRecordRow {
+                    record_id: row.get(0)?,
+                    title: title.clone(),
                     excerpt: knowledge_excerpt(&title, &body),
                     provider: row.get(3)?,
                     source_id: SourceId::from_rowid(row.get(4)?),
@@ -937,7 +1059,6 @@ impl<'a> ScanStore<'a> {
     }
 
 
-    /// from `latest_run`: a failed/cancelled rescan must not erase this fact.
     pub fn last_successful_finished_at(&self, source_rowid: i64) -> rusqlite::Result<Option<i64>> {
         self.conn
             .query_row(

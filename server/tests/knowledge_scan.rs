@@ -276,3 +276,119 @@ fn browse_knowledge_unscanned_vault_returns_not_yet_scanned() {
         application::query::KnowledgeBrowseEmptyState::NotYetScanned
     );
 }
+
+// --- Story 6.9 — Knowledge Search tests -------------------------------------
+
+#[test]
+fn search_knowledge_finds_matches_across_vaults() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault_a = tmp.path().join("vault-a");
+    let vault_b = tmp.path().join("vault-b");
+    fs::create_dir_all(&vault_a).unwrap();
+    fs::create_dir_all(&vault_b).unwrap();
+    fs::write(vault_a.join("a.md"), "# Rust notes\nlearning rust").unwrap();
+    fs::write(vault_b.join("b.md"), "# Python notes\nlearning python rust").unwrap();
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let sa = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault_a)).unwrap();
+    let sb = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault_b)).unwrap();
+    application::scan_source(&registry, &conn, &sa.source_id).unwrap();
+    application::scan_source(&registry, &conn, &sb.source_id).unwrap();
+    let page = application::search_knowledge(&registry, &conn, "rust", 20, None, None, None, None).unwrap();
+    assert!(page.results.len() >= 2);
+    let names: Vec<&str> = page.results.iter().map(|r| r.vault_name.as_str()).collect();
+    assert!(names.contains(&"vault-a") && names.contains(&"vault-b"));
+}
+
+#[test]
+fn search_knowledge_with_source_filter_narrows_to_one_vault() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault_a = tmp.path().join("vault-a");
+    let vault_b = tmp.path().join("vault-b");
+    fs::create_dir_all(&vault_a).unwrap();
+    fs::create_dir_all(&vault_b).unwrap();
+    fs::write(vault_a.join("a.md"), "# Rust\nrust content").unwrap();
+    fs::write(vault_b.join("b.md"), "# Rust\nrust content").unwrap();
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let sa = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault_a)).unwrap();
+    let sb = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault_b)).unwrap();
+    application::scan_source(&registry, &conn, &sa.source_id).unwrap();
+    application::scan_source(&registry, &conn, &sb.source_id).unwrap();
+    let page = application::search_knowledge(&registry, &conn, "rust", 20, None, Some(&sa.source_id), None, None).unwrap();
+    assert_eq!(page.results.len(), 1);
+    assert_eq!(page.results[0].vault_name, "vault-a");
+}
+
+#[test]
+fn search_knowledge_with_folder_prefix_narrows_results() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("vault");
+    fs::create_dir_all(vault.join("Notes/sub")).unwrap();
+    fs::write(vault.join("Notes/top.md"), "# Rust\nrust here").unwrap();
+    fs::write(vault.join("Notes/sub/deep.md"), "# Rust\nrust deep").unwrap();
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault)).unwrap();
+    application::scan_source(&registry, &conn, &source.source_id).unwrap();
+    let page = application::search_knowledge(&registry, &conn, "rust", 20, None, None, Some("Notes/sub"), None).unwrap();
+    assert_eq!(page.results.len(), 1);
+    assert!(page.results[0].vault_relative_path.starts_with("Notes/sub"));
+}
+
+#[test]
+fn search_knowledge_no_match_returns_no_match_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    fs::write(vault.join("a.md"), "# Hello\nworld").unwrap();
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault)).unwrap();
+    application::scan_source(&registry, &conn, &source.source_id).unwrap();
+    let page = application::search_knowledge(&registry, &conn, "zzznomatch", 20, None, None, None, None).unwrap();
+    assert!(page.results.is_empty());
+    assert_eq!(page.empty_state, application::query::KnowledgeSearchEmptyState::NoMatch);
+}
+
+#[test]
+fn search_knowledge_unscanned_returns_not_indexed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let _ = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault)).unwrap();
+    let page = application::search_knowledge(&registry, &conn, "anything", 20, None, None, None, None).unwrap();
+    assert!(page.results.is_empty());
+    assert_eq!(page.empty_state, application::query::KnowledgeSearchEmptyState::NotIndexed);
+}
+
+#[test]
+fn search_knowledge_paginates_across_pages() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    for i in 0..5 { fs::write(vault.join(format!("note{i}.md")), format!("# Note{i}\nrust keyword")).unwrap(); }
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault)).unwrap();
+    application::scan_source(&registry, &conn, &source.source_id).unwrap();
+    let page1 = application::search_knowledge(&registry, &conn, "rust", 2, None, None, None, None).unwrap();
+    assert_eq!(page1.results.len(), 2);
+    let cursor = page1.next_cursor.expect("has_more");
+    let page2 = application::search_knowledge(&registry, &conn, "rust", 2, Some(&cursor), None, None, None).unwrap();
+    assert_eq!(page2.results.len(), 2);
+    let ids1: Vec<&str> = page1.results.iter().map(|r| r.record_id.as_str()).collect();
+    for id in page2.results.iter().map(|r| r.record_id.as_str()) {
+        assert!(!ids1.contains(&id), "no duplicate: {id}");
+    }
+}
+
+#[test]
+fn search_knowledge_empty_query_is_bad_request() {
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let result = application::search_knowledge(&registry, &conn, "", 20, None, None, None, None);
+    assert!(matches!(result.unwrap_err(), application::query::QueryError::BadRequest));
+}

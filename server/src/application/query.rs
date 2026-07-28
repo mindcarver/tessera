@@ -751,6 +751,199 @@ fn knowledge_browse_empty_state(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Story 6.9 — Knowledge (Obsidian) cross-vault keyword Search
+// ---------------------------------------------------------------------------
+
+/// A Knowledge search result (Story 6.9). Reuses KnowledgeNoteResult fields
+/// and adds the vault name so the user sees which Vault each hit belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnowledgeSearchResult {
+    pub record_id: String,
+    pub excerpt: String,
+    pub provider: String,
+    pub source_id: String,
+    /// Vault display name (derived from the source registry root path).
+    pub vault_name: String,
+    pub vault_relative_path: String,
+    pub display_locator: String,
+    pub observed_at: i64,
+    pub coverage_level: String,
+    pub modified_time: Option<String>,
+    pub health_state: String,
+    /// Whether the query was found in the note's title (relevance signal).
+    pub title_match: bool,
+}
+
+/// A SearchPage for Knowledge notes (Story 6.9).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnowledgeSearchPage {
+    pub query: String,
+    pub results: Vec<KnowledgeSearchResult>,
+    pub next_cursor: Option<String>,
+    pub empty_state: KnowledgeSearchEmptyState,
+}
+
+/// Knowledge search empty states (mirrors SearchEmptyState).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeSearchEmptyState {
+    NoMatch,
+    NotIndexed,
+    SourceUnavailable,
+    None,
+}
+
+/// Keyword-search Knowledge notes across all confirmed Vaults (Story 6.9).
+/// instr() substring match over title+body. Optional filters: single vault
+/// (`source`), folder-prefix (`folder`), modified-time threshold (`since`).
+/// Cursor is `ks.<title_match_rank>:<record_id>` (opaque to the caller).
+pub fn search_knowledge(
+    registry: &SourceRegistry<'_>,
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    cursor: Option<&str>,
+    source_filter: Option<&SourceId>,
+    folder_prefix: Option<&str>,
+    since: Option<i64>,
+) -> Result<KnowledgeSearchPage, QueryError> {
+    if query.is_empty() {
+        return Err(QueryError::BadRequest);
+    }
+    let store = ScanStore::new(conn);
+    // Resolve optional source filter to a rowid.
+    let source_rowid: Option<i64> = match source_filter {
+        Some(sid) => ScanStore::source_rowid(sid).or(Some(-1)), // -1 → no match
+        None => None,
+    };
+    // Decode cursor: `ks.<0|1>:<native_locator>:<record_id>`. The ORDER BY is
+    // (title_rank, native_locator ASC, record_id ASC) so the cursor carries
+    // all three keys for a correct lexicographic strictly-after.
+    let (after_id, after_title_match, after_locator) = match cursor {
+        Some(c) if c.starts_with("ks.") => {
+            let rest = &c[3..];
+            let (rank_str, rest2) = rest.split_once(':').ok_or(QueryError::CursorStale)?;
+            let (locator, id) = rest2.rsplit_once(':').ok_or(QueryError::CursorStale)?;
+            let tm = match rank_str {
+                "0" => Some(true),
+                "1" => Some(false),
+                _ => return Err(QueryError::CursorStale),
+            };
+            (Some(id.to_string()), tm, Some(locator.to_string()))
+        }
+        Some(_) => return Err(QueryError::CursorStale),
+        None => (None, None, None),
+    };
+    let (rows, has_more) = store
+        .search_knowledge_records(
+            query,
+            limit,
+            after_id.as_deref(),
+            after_title_match,
+            after_locator.as_deref(),
+            source_rowid,
+            folder_prefix,
+            since,
+        )
+        .map_err(|_| QueryError::Internal)?;
+    // Build a vault_name lookup from the registry.
+    let sources = registry.list().map_err(|_| QueryError::Internal)?;
+    let vault_name_for = |rowid: i64| -> String {
+        sources
+            .iter()
+            .find(|s| s.source_id.to_rowid() == Some(rowid))
+            .map(|s| {
+                std::path::Path::new(&s.normalized_root_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&s.normalized_root_path)
+                    .to_string()
+            })
+            .unwrap_or_default()
+    };
+    let results: Vec<KnowledgeSearchResult> = rows
+        .iter()
+        .map(|r| {
+            let rowid = r.source_id.to_rowid().unwrap_or(0);
+            KnowledgeSearchResult {
+                record_id: r.record_id.clone(),
+                excerpt: r.excerpt.clone(),
+                provider: r.provider.clone(),
+                source_id: r.source_id.to_string(),
+                vault_name: vault_name_for(rowid),
+                vault_relative_path: r.vault_relative_path.clone(),
+                display_locator: r.display_locator.clone(),
+                observed_at: r.observed_at,
+                coverage_level: r.coverage_level.clone(),
+                modified_time: r.modified_time.clone(),
+                health_state: r.health_state.as_str().to_string(),
+                title_match: r.title.contains(query),
+            }
+        })
+        .collect();
+    let next_cursor = if has_more {
+        results.last().map(|r| {
+            let rank = if r.title_match { 0 } else { 1 };
+            format!("ks.{rank}:{}:{}", r.vault_relative_path, r.record_id)
+        })
+    } else {
+        None
+    };
+    let empty_state = if results.is_empty() && cursor.is_none() {
+        knowledge_search_empty_state(registry, &store, source_rowid)
+    } else {
+        KnowledgeSearchEmptyState::None
+    };
+    Ok(KnowledgeSearchPage {
+        query: query.to_string(),
+        results,
+        next_cursor,
+        empty_state,
+    })
+}
+
+fn knowledge_search_empty_state(
+    registry: &SourceRegistry<'_>,
+    store: &ScanStore<'_>,
+    source_filter: Option<i64>,
+) -> KnowledgeSearchEmptyState {
+    // If a specific source is filtered, check only that one; otherwise check
+    // all confirmed Knowledge sources.
+    let knowledge_sources: Vec<_> = registry
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.source_kind == crate::domain::source::SourceKind::LocalKnowledge)
+        .filter(|s| s.lifecycle_state == SourceLifecycle::Confirmed)
+        .filter(|s| {
+            source_filter
+                .map(|f| s.source_id.to_rowid() == Some(f))
+                .unwrap_or(true)
+        })
+        .collect();
+    let mut any_indexed = false;
+    let mut any_unavailable = false;
+    for source in &knowledge_sources {
+        let Some(rowid) = source.source_id.to_rowid() else { continue };
+        if store.active_generation(rowid).ok().flatten().is_some() {
+            any_indexed = true;
+        }
+        if let Some(run) = store.latest_run(rowid).ok().flatten() {
+            if matches!(run.state, ScanRunState::Failed | ScanRunState::Retry) {
+                any_unavailable = true;
+            }
+        }
+    }
+    if any_unavailable && !any_indexed {
+        KnowledgeSearchEmptyState::SourceUnavailable
+    } else if !any_indexed {
+        KnowledgeSearchEmptyState::NotIndexed
+    } else {
+        KnowledgeSearchEmptyState::NoMatch
+    }
+}
+
 fn empty_state(
     registry: &SourceRegistry<'_>,
     store: &ScanStore<'_>,

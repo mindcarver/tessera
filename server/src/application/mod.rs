@@ -53,7 +53,7 @@ pub use rebuild::{rebuild_index, RebuildError};
 pub use open::{
     open_original_location, reset_open_path_for_tests, set_open_path_for_tests, OpenError,
 };
-pub use query::{browse, browse_knowledge, search};
+pub use query::{browse, browse_knowledge, search, search_knowledge};
 pub use reconcile::{
     reserve_run, trigger_reconcile, HintQueue, ReconcileConfig, ReconcileSupervisor, TriggerError,
     DEFAULT_DEBOUNCE, DEFAULT_PERIOD,
