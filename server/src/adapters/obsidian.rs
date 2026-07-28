@@ -114,6 +114,154 @@ fn push_netstring(s: &mut String, bytes: &[u8]) {
     s.push_str(std::str::from_utf8(bytes).expect("netstring content is UTF-8"));
 }
 
+// ---------------------------------------------------------------------------
+// Story 6.5 — Markdown enumeration, parsing, and indexing (zero Vault writes)
+// ---------------------------------------------------------------------------
+
+/// The maximum accepted Markdown note size, in bytes (Story 6.5 / readiness
+/// decision `obsidian-knowledge-readiness-decisions-2026-07-27.md`). Exactly
+/// 1 MiB — 12.17× the largest observed note (86,142 bytes) and 21.76× the P99
+/// (48,190 bytes) on the 2026-07-27 real-corpus measurement. Enforced BEFORE
+/// note-body allocation or read; an oversized note gets a safe diagnostic and
+/// never replaces last-success data. Changing this bound requires a new
+/// measured decision artifact (it is not a hidden runtime override).
+pub const MAX_NOTE_BYTES: u64 = 1_048_576;
+
+/// A supported Knowledge note discovered in a Vault, ready for canonical
+/// record construction. Carries the metadata needed to build a `krec_` row
+/// without holding the note body (the indexer reads the body separately,
+/// bounded by [`MAX_NOTE_BYTES`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnowledgeNote {
+    /// Vault-relative path with forward slashes (stable across platforms).
+    /// Used as the `native_locator` and as an input to the `krec_` id.
+    pub vault_relative_path: String,
+    /// File size in bytes (already validated ≤ [`MAX_NOTE_BYTES`]).
+    pub size: u64,
+    /// Source modification time as an RFC 3339 string when available.
+    pub modified_time: Option<String>,
+}
+
+/// Enumerate supported Markdown notes under a confirmed Vault root (Story 6.5
+/// / AD-39). Recursively includes regular `.md` files under allowed non-hidden
+/// paths and excludes `.obsidian/**`, every dot-path, `.git/**`, trash,
+/// Canvas (`.canvas`), attachments, binaries, plugin data, and symlink
+/// directories. Enforces [`MAX_NOTE_BYTES`] on metadata BEFORE any body read.
+///
+/// Zero-write (NFR-14): this function reads directory entries and file
+/// metadata only; it never opens a note body and never writes anything. The
+/// caller (the scan pipeline) reads bodies separately under the same bound.
+pub fn enumerate_notes(vault_root: &Path) -> std::io::Result<Vec<KnowledgeNote>> {
+    let mut notes = Vec::new();
+    walk_vault(vault_root, vault_root, &mut notes)?;
+    // Deterministic ordering by Vault-relative path so re-scans are stable.
+    notes.sort_by(|a, b| a.vault_relative_path.cmp(&b.vault_relative_path));
+    Ok(notes)
+}
+
+/// Recursive walker applying the AD-39 inclusion/exclusion policy. `root` is
+/// the canonical Vault root (for relative-path computation); `dir` is the
+/// current directory being read.
+fn walk_vault(root: &Path, dir: &Path, notes: &mut Vec<KnowledgeNote>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            // Non-UTF-8 name: skip (would stringify to U+FFFD). Not an error.
+            continue;
+        };
+        // Exclude every dot-path (`.obsidian`, `.git`, `.trash`, any hidden
+        // file/dir). AD-39: all dot-paths are excluded, not just specific ones.
+        if name.starts_with('.') {
+            continue;
+        }
+        // Exclude well-known non-note directories at any depth.
+        if is_excluded_dir(name) {
+            continue;
+        }
+        let path = entry.path();
+        let meta = entry.metadata()?;
+        // Exclude symlink directories (AD-39: do not recurse through symlinks;
+        // a symlink could escape the Vault root).
+        if meta.is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            walk_vault(root, &path, notes)?;
+            continue;
+        }
+        if !meta.is_file() {
+            continue; // e.g. special files — skip without diagnostic noise.
+        }
+        // Only regular `.md` notes are in-matrix (AD-39). `.canvas`, attachments,
+        // binaries, and plugin data are excluded by extension here.
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let size = meta.len();
+        // Enforce max_note_bytes on METADATA before any body read (Story 6.5
+        // AC). An oversized note is skipped — the scan pipeline surfaces it
+        // via a `knowledge_note_too_large` diagnostic; it never replaces
+        // last-success data and never allocates the body.
+        if size > MAX_NOTE_BYTES {
+            continue;
+        }
+        let vault_relative_path = relative_to_vault(root, &path);
+        notes.push(KnowledgeNote {
+            vault_relative_path,
+            size,
+            modified_time: modified_time_rfc3339(&meta),
+        });
+    }
+    Ok(())
+}
+
+/// True for well-known directories that must never be recursed into
+/// (AD-39). Dot-paths are already excluded by the caller; this catches
+/// non-dot names that are still out-of-matrix.
+fn is_excluded_dir(name: &str) -> bool {
+    matches!(name, "node_modules" | "__pycache__")
+}
+
+/// Compute the Vault-relative path with forward slashes (platform-stable).
+/// Returns the path as-is when it cannot be made relative (defensive).
+fn relative_to_vault(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
+}
+
+/// Format a file's modification time as an RFC 3339 string, or `None` when
+/// unavailable. Uses Unix seconds → RFC 3339 conversion without pulling
+/// `chrono` (the locked stack excludes it). The format is `YYYY-MM-DDTHH:MM:SSZ`.
+fn modified_time_rfc3339(meta: &std::fs::Metadata) -> Option<String> {
+    let mtime = meta.modified().ok()?;
+    let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some(unix_seconds_to_rfc3339(secs))
+}
+
+/// Convert Unix seconds to a coarse RFC 3339 `YYYY-MM-DDTHH:MM:SSZ` string
+/// without a calendar crate. Uses the civil-from-days algorithm (Howard
+/// Hinnant). Accuracy is to the second; that is sufficient for a
+/// source-modified-time facet and avoids a `chrono`/`time` dependency.
+fn unix_seconds_to_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64 + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let rem = (secs % 86_400) as u64;
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
 /// A fail-safe diagnostic describing why vault discovery could not produce a
 /// complete candidate set (AD-37 / Story 6.2 AC). Carried alongside the
 /// (possibly empty) candidate list so the UI can distinguish "no vaults
@@ -546,5 +694,124 @@ mod tests {
         assert_ne!(KNOWLEDGE_PARSER_VERSION, "codex-markdown/v1");
         assert_ne!(KNOWLEDGE_PARSER_VERSION, "claude-markdown/v1");
         assert_eq!(UNIT_KIND_NOTE, "note");
+    }
+
+    // --- Story 6.5 — Markdown enumeration, AD-39 exclusions, max_note_bytes ---
+
+    /// Build a realistic Vault layout exercising the AD-39 in/out matrix.
+    fn build_sample_vault(root: &std::path::Path) {
+        use std::fs;
+        // In-matrix notes.
+        fs::create_dir_all(root.join("Notes/sub")).unwrap();
+        fs::write(root.join("Notes/foo.md"), "# Foo\n").unwrap();
+        fs::write(root.join("Notes/sub/bar.md"), "# Bar\n").unwrap();
+        fs::write(root.join("readme.md"), "top-level\n").unwrap();
+        // Excluded: .obsidian config.
+        fs::create_dir_all(root.join(".obsidian")).unwrap();
+        fs::write(root.join(".obsidian/workspace.json"), "{}").unwrap();
+        // Excluded: dot-path / hidden.
+        fs::write(root.join(".secret.md"), "hidden\n").unwrap();
+        // Excluded: .git.
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref\n").unwrap();
+        // Excluded: non-markdown (Canvas, attachment, binary).
+        fs::write(root.join("Notes/diagram.canvas"), "{}\n").unwrap();
+        fs::write(root.join("Notes/image.png"), b"\x89PNG\r\n").unwrap();
+        fs::write(root.join("Notes/data.json"), "{}\n").unwrap();
+        // Excluded: well-known non-note dir.
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/lib.md"), "lib\n").unwrap();
+    }
+
+    #[test]
+    fn enumerate_includes_only_supported_markdown_under_non_hidden_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        build_sample_vault(tmp.path());
+        let notes = enumerate_notes(tmp.path()).expect("enumerate");
+        let paths: Vec<&str> = notes.iter().map(|n| n.vault_relative_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["Notes/foo.md", "Notes/sub/bar.md", "readme.md"],
+            "only regular .md under non-hidden paths; got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn enumerate_enforces_max_note_bytes_on_metadata_before_body_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A note exactly at the limit is included; one byte over is excluded.
+        std::fs::write(tmp.path().join("at_limit.md"), vec![b'x'; MAX_NOTE_BYTES as usize])
+            .unwrap();
+        std::fs::write(
+            tmp.path().join("over_limit.md"),
+            vec![b'x'; MAX_NOTE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let notes = enumerate_notes(tmp.path()).expect("enumerate");
+        let paths: Vec<&str> = notes.iter().map(|n| n.vault_relative_path.as_str()).collect();
+        assert!(paths.contains(&"at_limit.md"), "at-limit note included");
+        assert!(
+            !paths.contains(&"over_limit.md"),
+            "over-limit note excluded before body read"
+        );
+    }
+
+    /// Story 6.5 / NFR-14: enumeration must not mutate the Vault. Snapshot the
+    /// tree before and after, assert byte-identical.
+    #[test]
+    fn enumerate_does_not_mutate_vault_files_nfr14() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        build_sample_vault(tmp.path());
+        let before = snapshot_tree(tmp.path());
+        let _ = enumerate_notes(tmp.path()).expect("enumerate");
+        let after = snapshot_tree(tmp.path());
+        assert_eq!(before, after, "NFR-14: enumeration changed Vault files");
+    }
+
+    /// Story 6.5: the max_note_bytes constant is exactly the approved bound.
+    #[test]
+    fn max_note_bytes_is_exactly_one_mebibyte() {
+        assert_eq!(MAX_NOTE_BYTES, 1_048_576, "readiness decision locked 1 MiB");
+    }
+
+    /// Walk the tree capturing (path, mtime, size, bytes) for zero-write
+    /// comparison (mirrors the Agent-Memory SM-2 pattern).
+    fn snapshot_tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, std::time::SystemTime, u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        walk_snap(root, root, &mut out);
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+    fn walk_snap(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(std::path::PathBuf, std::time::SystemTime, u64, Vec<u8>)>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let meta = entry.metadata().unwrap();
+            if meta.is_dir() {
+                walk_snap(root, &path, out);
+                continue;
+            }
+            if meta.is_file() {
+                let bytes = std::fs::read(&path).unwrap();
+                out.push((
+                    path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
+                    meta.modified().unwrap(),
+                    meta.len(),
+                    bytes,
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn modified_time_formats_as_rfc3339() {
+        // 2026-07-28T00:00:00Z = 1785196800 (spot-check the civil algorithm).
+        assert_eq!(unix_seconds_to_rfc3339(1_785_196_800), "2026-07-28T00:00:00Z");
+        // Unix epoch.
+        assert_eq!(unix_seconds_to_rfc3339(0), "1970-01-01T00:00:00Z");
     }
 }
