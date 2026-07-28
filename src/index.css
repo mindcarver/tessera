@@ -343,6 +343,17 @@ p {
   color: var(--mute);
   margin-bottom: 18px;
 }
+/* Inline count subtitle inside a block title (e.g. "共 N 个已确认 · M 个待确认").
+   The title itself is uppercase mono micro-copy; the subtitle reads as normal
+   prose so the counts are legible at a glance. */
+.tsr-block__sub {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--mute);
+  font-weight: 400;
+}
 .tsr-prose {
   line-height: 1.55;
   color: #333;
@@ -573,6 +584,12 @@ p {
   background: var(--deg-bg);
   border-left: 3px solid var(--red);
   border-bottom: 1px solid var(--line);
+  margin: 4px 0;
+}
+/* Pending (discovered, not yet confirmed) Vault card: a quieter left border so
+   it reads as a peer of confirmed cards but signals "action needed". */
+.tsr-card--pending {
+  border-left: 3px solid var(--amber, #d97706);
   margin: 4px 0;
 }
 .tsr-card__body {

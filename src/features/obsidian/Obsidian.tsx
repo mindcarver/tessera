@@ -179,6 +179,58 @@ function VaultCard({
   );
 }
 
+/**
+ * A pending (discovered but not yet confirmed) Vault card for the unified
+ * overview. Mirrors VaultCard's layout so confirmed and pending cards sit as
+ * peers in the same grid; carries the confirm/reject actions instead of the
+ * browse/refresh actions. The in-flight state disables both buttons and shows
+ * "处理中…" on the one being acted on (reuses the per-candidate resolvingKey).
+ */
+function PendingVaultCard({
+  candidate,
+  isResolving,
+  onConfirm,
+  onReject,
+}: {
+  candidate: KnowledgeCandidate;
+  isResolving: boolean;
+  onConfirm: () => void;
+  onReject: () => void;
+}): ReactElement {
+  // Derive a readable vault name from the root path (last path segment),
+  // matching how Obsidian itself names a vault by its folder.
+  const vaultName = candidate.root_path.split("/").filter(Boolean).pop() ?? candidate.root_path;
+  return (
+    <li data-provider={candidate.provider} className="tsr-card tsr-card--pending">
+      <article className="tsr-card__body">
+        <div className="tsr-card__row">
+          <div className="tsr-card__main">
+            <h5 className="tsr-card__prov">Obsidian 知识库 · 待确认</h5>
+            <div className="tsr-card__name">{vaultName}</div>
+            <code className="tsr-card__path">{candidate.root_path}</code>
+            <div className="tsr-card__meta">{describeCoverage(candidate.coverage_level)}</div>
+          </div>
+          <div className="tsr-card__aside">
+            <div className="tsr-card__actions">
+              <button
+                type="button"
+                className="tsr-btn tsr-btn--primary"
+                onClick={onConfirm}
+                disabled={isResolving}
+              >
+                {isResolving ? "处理中…" : "确认"}
+              </button>
+              <button type="button" className="tsr-btn" onClick={onReject} disabled={isResolving}>
+                {isResolving ? "处理中…" : "忽略"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </article>
+    </li>
+  );
+}
+
 export function Obsidian(): ReactElement {
   const [discovery, setDiscovery] = useState<
     LoadState<{ candidates: KnowledgeCandidate[]; diagnostic: string | null }>
@@ -525,15 +577,14 @@ export function Obsidian(): ReactElement {
         </form>
       </section>
 
-      {/* ---- Vault candidates (from registry + picker fallback) ---- */}
-      {/* A Vault already present as a confirmed Inventory row is hidden from the
-          candidate list: without this, confirming a Vault left its candidate
-          card in place AND added an Inventory card, so the action looked like
-          it did nothing. The filter is client-only and only applies once both
-          discovery and inventory have loaded. */}
+      {/* ---- 我的知识库：统一的 Vault 总览（已确认 + 待确认卡片网格）----
+          合并了原先分开的「候选 Vault」长列表与「已确认的知识库」清单。
+          一个屏幕看清「我管理了哪些库、各自多大、哪个待确认」。已确认的
+          Vault 复用 VaultCard；待确认的用 PendingVaultCard；两者在同一个
+          tsr-cards 网格里平铺。已确认的 Vault 不再重复出现在待确认区。 */}
       {(() => {
         const resolved = confirmedRootSet(inventory);
-        const candidates =
+        const pendingCandidates =
           discovery.kind === "ok"
             ? resolved
               ? discovery.value.candidates.filter(
@@ -541,110 +592,90 @@ export function Obsidian(): ReactElement {
                 )
               : discovery.value.candidates
             : [];
+        const confirmedCount = inventory.kind === "ok" ? inventory.value.length : 0;
+        const pendingCount = pendingCandidates.length;
+        const hasConfirmedCards = inventory.kind === "ok" && inventory.value.length > 0;
+        const hasPendingCards = discovery.kind === "ok" && pendingCandidates.length > 0;
         return (
-        <section aria-label="发现的 Vault" className="tsr-block">
-          <h3 className="tsr-block__title">候选 Vault</h3>
+          <section aria-label="我的知识库" className="tsr-block">
+            <h3 className="tsr-block__title">
+              我的知识库
+              <span className="tsr-block__sub">
+                {" "}
+                · 共 {confirmedCount} 个已确认 · {pendingCount} 个待确认
+              </span>
+            </h3>
 
-          <div className="tsr-rebuild">
-            <button
-              type="button"
-              className="tsr-btn tsr-btn--primary"
-              onClick={onPicker}
-              disabled={pickerBusy}
-              aria-label="选择已有 Obsidian Vault"
-            >
-              {pickerBusy ? "正在打开选择器…" : "选择已有 Vault"}
-            </button>
-          </div>
+            <div className="tsr-rebuild">
+              <button
+                type="button"
+                className="tsr-btn tsr-btn--primary"
+                onClick={onPicker}
+                disabled={pickerBusy}
+                aria-label="选择已有 Obsidian Vault"
+              >
+                {pickerBusy ? "正在打开选择器…" : "选择已有 Vault"}
+              </button>
+            </div>
 
-          {discovery.kind === "loading" ? (
-            <p className="tsr-prose">正在查找已注册的 Obsidian Vault…</p>
-          ) : null}
-          {discovery.kind === "error" ? (
-            <p role="alert" className="tsr-prose">
-              {discovery.message}
-            </p>
-          ) : null}
-          {discovery.kind === "ok" && diagnosticText ? (
-            <p role="status" className="tsr-prose">
-              {diagnosticText}
-            </p>
-          ) : null}
-          {discovery.kind === "ok" && candidates.length === 0 && !diagnosticText ? (
-            <p className="tsr-prose">未发现已注册的 Obsidian Vault。可手动选择已有 Vault。</p>
-          ) : null}
-          {discovery.kind === "ok" && candidates.length > 0 ? (
-            <ul className="tsr-candidates">
-              {candidates.map((candidate) => {
-                const key = candidateKey(candidate);
-                const isResolving = resolvingKey === key;
-                return (
-                  <li key={key} className="tsr-candidate">
-                    <div className="tsr-candidate__main">
-                      <span className="tsr-candidate__provider">{candidate.provider}</span>
-                      <span className="tsr-candidate__coverage">
-                        {describeCoverage(candidate.coverage_level)}
-                      </span>
-                      <code className="tsr-candidate__path">{candidate.root_path}</code>
-                    </div>
-                    <div className="tsr-candidate__actions">
-                      <button
-                        type="button"
-                        className="tsr-btn tsr-btn--primary"
-                        onClick={() => resolveCandidate(candidate, "confirm")}
-                        disabled={isResolving}
-                      >
-                        {isResolving ? "处理中…" : "确认"}
-                      </button>
-                      <button
-                        type="button"
-                        className="tsr-btn"
-                        onClick={() => resolveCandidate(candidate, "reject")}
-                        disabled={isResolving}
-                      >
-                        {isResolving ? "处理中…" : "拒绝"}
-                      </button>
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          ) : null}
-        </section>
+            {discovery.kind === "error" ? (
+              <p role="alert" className="tsr-prose">
+                {discovery.message}
+              </p>
+            ) : null}
+            {inventory.kind === "error" ? (
+              <p role="alert" className="tsr-prose">
+                {inventory.message}
+              </p>
+            ) : null}
+            {discovery.kind === "ok" && diagnosticText ? (
+              <p role="status" className="tsr-prose">
+                {diagnosticText}
+              </p>
+            ) : null}
+
+            {(discovery.kind === "loading" || inventory.kind === "loading") &&
+            !hasConfirmedCards &&
+            !hasPendingCards ? (
+              <p className="tsr-prose">正在加载知识库…</p>
+            ) : null}
+
+            {!hasConfirmedCards && !hasPendingCards && !diagnosticText ? (
+              <p className="tsr-prose">未发现已注册的 Obsidian Vault。可手动选择已有 Vault。</p>
+            ) : null}
+
+            {hasConfirmedCards || hasPendingCards ? (
+              <ul className="tsr-cards">
+                {inventory.kind === "ok"
+                  ? inventory.value.map((item) => (
+                      <VaultCard
+                        key={item.source_id}
+                        item={item}
+                        onRefresh={refreshInventory}
+                        onBrowse={() => loadBrowse(item.source_id, item.vault_name)}
+                      />
+                    ))
+                  : null}
+                {hasPendingCards
+                  ? pendingCandidates.map((candidate) => {
+                      const key = candidateKey(candidate);
+                      const isResolving = resolvingKey === key;
+                      return (
+                        <PendingVaultCard
+                          key={key}
+                          candidate={candidate}
+                          isResolving={isResolving}
+                          onConfirm={() => resolveCandidate(candidate, "confirm")}
+                          onReject={() => resolveCandidate(candidate, "reject")}
+                        />
+                      );
+                    })
+                  : null}
+              </ul>
+            ) : null}
+          </section>
         );
       })()}
-
-      {/* ---- Knowledge Inventory (one card per confirmed Vault) ---- */}
-      <section
-        aria-label="知识库清单"
-        aria-busy={inventory.kind === "loading"}
-        className="tsr-block"
-      >
-        <h3 className="tsr-block__title">已确认的知识库</h3>
-        {inventory.kind === "loading" ? (
-          <p className="tsr-prose">正在加载知识库清单…</p>
-        ) : null}
-        {inventory.kind === "error" ? (
-          <p role="alert" className="tsr-prose">
-            {inventory.message}
-          </p>
-        ) : null}
-        {inventory.kind === "ok" && inventory.value.length === 0 ? (
-          <p className="tsr-prose">尚未确认任何 Obsidian Vault。</p>
-        ) : null}
-        {inventory.kind === "ok" && inventory.value.length > 0 ? (
-          <ul className="tsr-cards">
-            {inventory.value.map((item) => (
-              <VaultCard
-                key={item.source_id}
-                item={item}
-                onRefresh={refreshInventory}
-                onBrowse={() => loadBrowse(item.source_id, item.vault_name)}
-              />
-            ))}
-          </ul>
-        ) : null}
-      </section>
     </section>
   );
 }
