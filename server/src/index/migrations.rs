@@ -107,6 +107,18 @@ pub static MIGRATIONS: &[Migration] = &[
         name: "v8_local_knowledge_source_kind",
         apply: v8_local_knowledge_source_kind,
     },
+    // Story 6.4 — independent Knowledge canonical table + identity (Phase C.0).
+    // Creates `knowledge_records`, a parallel to `memory_records` that does NOT
+    // reuse the Agent-Memory canonical schema (AD-19/AD-38): separate table,
+    // `krec_` identity prefix, file-level `note` units, Vault-relative native
+    // locators, and a Knowledge parser version. Reuses the existing
+    // `scan_runs` state machine and generation staging pattern (single mutation
+    // path) but partitions records by table. Agent tables are untouched.
+    Migration {
+        id: 10,
+        name: "v9_knowledge_records",
+        apply: v9_knowledge_records,
+    },
 ];
 
 /// Ensure the meta tables exist on a fresh DB so [`apply`] can read
@@ -462,6 +474,49 @@ fn v8_local_knowledge_source_kind(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// v9 (migration id `10`) — independent Knowledge canonical table (Story 6.4 /
+/// Phase C.0).
+///
+/// Creates `knowledge_records`, a parallel-to-`memory_records` staging table
+/// for Obsidian Vault notes. It deliberately does NOT reuse the Agent-Memory
+/// canonical schema (AD-19/AD-38):
+/// - separate table (`knowledge_records`, not `memory_records`);
+/// - `krec_` identity prefix (not `rec_`);
+/// - file-level `unit_kind = 'note'` (no heading/block identity — AD-38);
+/// - Vault-relative native locator (not a Codex/Claude file URI);
+/// - Knowledge parser version (`obsidian-markdown/v1`);
+/// - no `native_project` column (Obsidian Vaults have no Agent-Memory project
+///   concept — the Vault name is the Knowledge domain label).
+///
+/// Reuses the SAME generation-staging pattern as `memory_records`: composite
+/// PK `(record_id, generation)`, `scan_runs` drives state, and
+/// `tessera_meta.active_generation:<source_rowid>` selects the visible
+/// generation. This keeps a single mutation path (AD-5) while partitioning
+/// records by domain.
+fn v9_knowledge_records(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE knowledge_records (
+            record_id        TEXT    NOT NULL,
+            source_id        INTEGER NOT NULL REFERENCES source_registry(id),
+            generation       TEXT    NOT NULL,
+            provider         TEXT    NOT NULL,
+            unit_kind        TEXT    NOT NULL,
+            native_unit_id   TEXT    NOT NULL,
+            native_locator   TEXT    NOT NULL,
+            content_hash     TEXT    NOT NULL,
+            parser_version   TEXT    NOT NULL,
+            modified_time    TEXT,
+            PRIMARY KEY (record_id, generation)
+        ) STRICT;
+
+        CREATE INDEX knowledge_records_source_generation
+            ON knowledge_records(source_id, generation);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Apply all pending migrations atomically (AD-29).
 ///
 /// Semantics:
@@ -573,9 +628,10 @@ mod tests {
         // appended the structured source health cause (id 6), Story 5.1
         // appended the Tessera Project mapping layer (id 7), Story 5.2
         // appended the project_mapping_revision seed (id 8), and Story 6.1
-        // appended the local_knowledge source-kind activation (id 9).
+        // appended the local_knowledge source-kind activation (id 9), and
+        // Story 6.4 appended the knowledge_records canonical table (id 10).
         // The `0` value remains reserved as the pre-migration sentinel.
-        assert_eq!(v, "9");
+        assert_eq!(v, "10");
     }
 
     #[test]
@@ -611,8 +667,9 @@ mod tests {
         // idempotent baseline five audit rows; Story 4.2's v5_source_health_cause
         // brings it to six; Story 5.1's v6_tessera_projects brings it to seven;
         // Story 5.2's v7_project_mapping_revision brings it to eight; Story 6.1's
-        // v8_local_knowledge_source_kind brings it to nine.
-        assert_eq!(count, 9, "exactly nine audit rows after idempotent re-run");
+        // v8_local_knowledge_source_kind brings it to nine; Story 6.4's
+        // v9_knowledge_records brings it to ten.
+        assert_eq!(count, 10, "exactly ten audit rows after idempotent re-run");
     }
 
     /// AD-29 / A-7: migration is atomic. If a later migration fails mid-batch,
@@ -640,7 +697,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema_version readable");
-        assert_eq!(pre_version, "9");
+        assert_eq!(pre_version, "10");
 
         // Simulate a failing follow-up migration. The failing migration
         // writes a sentinel table first, then errors; the atomic batch must
@@ -702,6 +759,11 @@ mod tests {
             },
             Migration {
                 id: 10,
+                name: "v9_knowledge_records",
+                apply: v9_knowledge_records,
+            },
+            Migration {
+                id: 11,
                 name: "partial_then_fail",
                 apply: partial_then_fail,
             },
@@ -758,7 +820,7 @@ mod tests {
             )
             .expect("schema_version still readable after rollback");
         assert_eq!(
-            post_version, "9",
+            post_version, "10",
             "schema_version must not advance on failure"
         );
 
@@ -770,7 +832,7 @@ mod tests {
             )
             .expect("count");
         assert_eq!(
-            audit_count, 9,
+            audit_count, 10,
             "no audit row recorded for the failed migration"
         );
 

@@ -55,6 +55,65 @@ pub const PROVIDER_ID: &str = "obsidian";
 /// [`crate::domain::source::SourceKind::LocalKnowledge`].
 pub const SOURCE_KIND: &str = "local_knowledge";
 
+/// Knowledge parser version persisted on every `knowledge_records` row
+/// (Story 6.4 / AD-38). Independent from the Agent-Memory parser versions
+/// (`codex-markdown/v1`, `claude-markdown/v1`) — a format change in Obsidian
+/// note parsing bumps THIS tag and triggers a Knowledge rebuild, never an
+/// Agent-Memory rebuild.
+pub const KNOWLEDGE_PARSER_VERSION: &str = "obsidian-markdown/v1";
+
+/// The file-level unit kind for Knowledge records (AD-38: one Markdown file =
+/// one Knowledge Record; no heading/block identity in Phase C.0).
+pub const UNIT_KIND_NOTE: &str = "note";
+
+/// Build a stable, locator-based `krec_` record id for a Knowledge note
+/// (Story 6.4 / AD-38). Independent from the Agent-Memory `rec_` id scheme:
+/// `krec_<fnv1a(netstring(source_id|provider|vault_relative_path|unit_kind))>`.
+///
+/// The identity is **Vault-relative-path-based**, not content-based (mirrors
+/// AD-15 for Agent Memory): re-indexing an unchanged note at the same
+/// Vault-relative path produces the SAME `krec_` id; only `content_hash`
+/// changes. A rename or move creates a new locator → new `krec_` id (no fuzzy
+/// merge — AD-35/AD-38).
+///
+/// `vault_relative_path` is the note's path relative to the Vault root, using
+/// forward slashes regardless of OS (stable across platforms). The
+/// `native_locator` persisted in `knowledge_records` is the same string.
+pub fn build_knowledge_record_id(
+    source_id: &str,
+    provider: &str,
+    vault_relative_path: &str,
+    unit_kind: &str,
+) -> String {
+    let mut buf = String::new();
+    push_netstring(&mut buf, source_id.as_bytes());
+    buf.push('|');
+    push_netstring(&mut buf, provider.as_bytes());
+    buf.push('|');
+    push_netstring(&mut buf, vault_relative_path.as_bytes());
+    buf.push('|');
+    push_netstring(&mut buf, unit_kind.as_bytes());
+    format!("krec_{:016x}", fnv1a_hex(buf.as_bytes()))
+}
+
+/// FNV-1a 64-bit hash → lowercase hex (same algorithm as Agent-Memory's
+/// `domain::scan::fnv1a_hex`; duplicated here to keep the Knowledge pipeline
+/// free of any Agent-Memory dependency, per AD-19).
+fn fnv1a_hex(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn push_netstring(s: &mut String, bytes: &[u8]) {
+    s.push_str(&bytes.len().to_string());
+    s.push(':');
+    s.push_str(std::str::from_utf8(bytes).expect("netstring content is UTF-8"));
+}
+
 /// A fail-safe diagnostic describing why vault discovery could not produce a
 /// complete candidate set (AD-37 / Story 6.2 AC). Carried alongside the
 /// (possibly empty) candidate list so the UI can distinguish "no vaults
@@ -438,5 +497,54 @@ mod tests {
             result.candidates[0].root_path,
             result.candidates[1].root_path
         );
+    }
+
+    // --- Story 6.4 — independent krec_ identity + Knowledge parser version ---
+
+    #[test]
+    fn knowledge_record_id_is_locator_based_and_deterministic() {
+        // Same inputs → same id (AD-15 locator-based identity).
+        let a = build_knowledge_record_id("src_1", "obsidian", "Notes/foo.md", "note");
+        let b = build_knowledge_record_id("src_1", "obsidian", "Notes/foo.md", "note");
+        assert_eq!(a, b);
+        assert!(a.starts_with("krec_"), "got: {a}");
+    }
+
+    #[test]
+    fn knowledge_record_id_differs_when_vault_relative_path_differs() {
+        // AD-38: rename/move → new locator → new id (no fuzzy merge).
+        let a = build_knowledge_record_id("src_1", "obsidian", "Notes/foo.md", "note");
+        let b = build_knowledge_record_id("src_1", "obsidian", "Notes/bar.md", "note");
+        assert_ne!(a, b, "different path → different krec_ id");
+    }
+
+    #[test]
+    fn knowledge_record_id_differs_when_source_differs() {
+        let a = build_knowledge_record_id("src_1", "obsidian", "Notes/foo.md", "note");
+        let b = build_knowledge_record_id("src_2", "obsidian", "Notes/foo.md", "note");
+        assert_ne!(a, b, "different source → different krec_ id");
+    }
+
+    #[test]
+    fn knowledge_record_id_does_not_collide_with_agent_memory_rec_scheme() {
+        // AD-19: the Knowledge id namespace must be distinct from Agent Memory.
+        // The Agent-Memory builder produces rec_<fnv1a(source_id|provider|
+        // native_locator|unit_kind)>; even with the same logical inputs the
+        // krec_ prefix partitions the namespaces so a record_id from one
+        // domain can never be confused for the other.
+        let krec = build_knowledge_record_id("src_1", "obsidian", "Notes/foo.md", "note");
+        assert!(krec.starts_with("krec_"));
+        assert!(!krec.starts_with("rec_"));
+    }
+
+    #[test]
+    fn knowledge_parser_version_is_independent_from_agent_memory() {
+        // AD-38: the parser version is a distinct tag, not a reuse of Codex/
+        // Claude versions. A Knowledge format change never triggers an Agent
+        // rebuild and vice versa.
+        assert_eq!(KNOWLEDGE_PARSER_VERSION, "obsidian-markdown/v1");
+        assert_ne!(KNOWLEDGE_PARSER_VERSION, "codex-markdown/v1");
+        assert_ne!(KNOWLEDGE_PARSER_VERSION, "claude-markdown/v1");
+        assert_eq!(UNIT_KIND_NOTE, "note");
     }
 }

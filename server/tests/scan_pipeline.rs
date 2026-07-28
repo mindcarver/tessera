@@ -464,8 +464,10 @@ fn migrations_apply_canonical_records_and_rescan_cancellation_schema() {
     // with the v7_project_mapping_revision migration (seeds
     // `project_mapping_revision` in tessera_meta); Story 6.1 bumped 8→9 with
     // the v8_local_knowledge_source_kind migration (activates the
-    // `local_knowledge` Source kind for Phase C.0 Obsidian Knowledge).
-    assert_eq!(v, "9");
+    // `local_knowledge` Source kind for Phase C.0 Obsidian Knowledge); Story
+    // 6.4 bumped 9→10 with the v9_knowledge_records migration (independent
+    // Knowledge canonical table, AD-38).
+    assert_eq!(v, "10");
 
     for table in ["scan_runs", "memory_records", "scan_diagnostics"] {
         let n: i64 = conn
