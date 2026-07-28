@@ -59,7 +59,10 @@ test("keyboard rescan posts successfully and announces ordered progress", async 
 
 test("keyboard search renders provenance, empty states, pagination, and safe API errors", async ({ page }) => {
   await page.goto("/");
-  const confirm = page.getByRole("button", { name: "确认" });
+  // Scope to the Agent-Memory candidate region: the Obsidian view also renders
+  // a "确认" button on the same page (one per discovered host Vault), so an
+  // unscoped lookup is ambiguous on machines with an Obsidian vault registry.
+  const confirm = page.getByRole("region", { name: "发现的候选来源" }).getByRole("button", { name: "确认", exact: true });
   await expect(confirm).toBeVisible();
   await confirm.press("Enter");
   await expect(page.getByRole("button", { name: "重新扫描", exact: true })).toBeVisible();
@@ -324,7 +327,7 @@ test("renders OpenCode discovery bases and exposes provider and instruction filt
   await page.goto("/");
 
   const candidateRegion = page.getByRole("region", {
-    name: "Discovered candidate sources",
+    name: "发现的候选来源",
   });
   await expect(candidateRegion.getByRole("listitem")).toHaveCount(2);
   await expect(candidateRegion).toContainText("opencode");
@@ -2127,6 +2130,168 @@ test("projects add-mapping 409 surfaces a safe mapping_conflict alert naming the
   await expect(alert).toContainText("already mapped");
   const body = (await alert.textContent()) ?? "";
   expect(body.toLowerCase()).not.toContain("credential");
+});
+
+/**
+ * Story 6.3 regression — confirming an Obsidian Vault must give visible
+ * feedback. Previously the confirm/reject outcome was written into a
+ * `visually-hidden-text` `<p>`, AND a confirmed Vault stayed in the candidate
+ * list (discovery returns every registry Vault regardless of lifecycle), so
+ * clicking 确认 looked like it did nothing. Now: success renders a visible
+ * `role="status"`, the confirmed Vault leaves the 候选 Vault region, and a
+ * matching card appears in the 已确认的知识库 region.
+ *
+ * Scoped to the "发现的 Vault" region because both the Sources view and the
+ * Obsidian view render a "确认" button on the same page.
+ */
+test("obsidian confirm renders visible success and moves the vault into inventory", async ({ page }) => {
+  // Keep the Agent-Memory Sources view quiet so its 确认 button does not
+  // collide with the Obsidian one.
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+
+  const candidate = {
+    provider: "obsidian",
+    root_path: "/fixture/vault/9lai",
+    basis: "obsidian_vault_registry",
+    coverage_level: "full",
+    native_project: null,
+  };
+  await page.route("**/api/knowledge/discover", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: { candidates: [candidate], diagnostic: null } }),
+    }),
+  );
+  let confirmCalls = 0;
+  await page.route("**/api/knowledge/confirm", async (route) => {
+    confirmCalls += 1;
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: { source_id: "src_obsidian_1" } }),
+    });
+  });
+  // Inventory: state-driven — empty until the confirm call flips the Vault to
+  // confirmed, then returns the row on every subsequent fetch. This avoids
+  // depending on the exact number of pre-confirm inventory fetches.
+  const inventoryRow = {
+    source_id: "src_obsidian_1",
+    vault_name: "9lai",
+    provider: "obsidian",
+    root: "/fixture/vault/9lai",
+    coverage_level: "full",
+    health_state: "unknown",
+    last_successful_scan: null,
+    complete_note_count: null,
+    latest_error: null,
+    cause: "none",
+    stale: false,
+    lifecycle_state: "confirmed",
+  };
+  await page.route("**/api/knowledge/inventory", async (route) => {
+    const payload = confirmCalls > 0 ? [inventoryRow] : [];
+    return route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload }),
+    });
+  });
+
+  await page.goto("/");
+
+  // The candidate region is `<section aria-label="发现的 Vault">` (the visible
+  // heading "候选 Vault" is not the accessible name).
+  const candidateRegion = page.getByRole("region", { name: "发现的 Vault" });
+
+  // Before confirm: the candidate card shows its root path, inventory is empty.
+  await expect(candidateRegion).toContainText("/fixture/vault/9lai");
+  await expect(page.getByRole("region", { name: "知识库清单" })).toContainText("尚未确认任何 Obsidian Vault。");
+
+  // Keyboard-reachable confirm, scoped to the Obsidian candidate region.
+  const confirmBtn = candidateRegion.getByRole("button", { name: "确认", exact: true });
+  await confirmBtn.focus();
+  const confirmResponse = page.waitForResponse(
+    (r) => r.url().endsWith("/api/knowledge/confirm") && r.request().method() === "POST",
+  );
+  await page.keyboard.press("Enter");
+  expect((await confirmResponse).status()).toBe(200);
+  expect(confirmCalls).toBe(1);
+
+  // Visible success feedback now renders (was hidden before the fix). Scope to
+  // the Obsidian section: the Search view also carries a role="status".
+  await expect(page.locator("#tessera-obsidian").getByRole("status")).toContainText("已确认 Vault。");
+
+  // The confirmed Vault left the candidate region and entered the inventory.
+  await expect(candidateRegion).not.toContainText("/fixture/vault/9lai");
+  await expect(page.getByRole("region", { name: "知识库清单" })).toContainText("9lai");
+});
+
+/**
+ * Story 6.3 regression — a failed confirm (e.g. a root-overlap 409) must
+ * surface a visible `role="alert"` so "点击确认没反应" never masks a real
+ * failure. Previously the error was written into a visually-hidden element.
+ * The candidate must also stay in the candidate region (an error must not
+ * remove it).
+ */
+test("obsidian confirm failure surfaces a visible alert and keeps the candidate", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+
+  const candidate = {
+    provider: "obsidian",
+    root_path: "/fixture/vault/overlap",
+    basis: "obsidian_vault_registry",
+    coverage_level: "full",
+    native_project: null,
+  };
+  await page.route("**/api/knowledge/discover", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: { candidates: [candidate], diagnostic: null } }),
+    }),
+  );
+  await page.route("**/api/knowledge/confirm", async (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        code: "root_overlap",
+        message: "This vault's root overlaps an already-confirmed source. Resolve the conflict before confirming.",
+        source_id: null,
+        phase: "confirm",
+      }),
+    }),
+  );
+  await page.route("**/api/knowledge/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+
+  await page.goto("/");
+
+  // The candidate region is `<section aria-label="发现的 Vault">` (the visible
+  // heading "候选 Vault" is not the accessible name).
+  const candidateRegion = page.getByRole("region", { name: "发现的 Vault" });
+  const confirmBtn = candidateRegion.getByRole("button", { name: "确认", exact: true });
+  await confirmBtn.focus();
+  await page.keyboard.press("Enter");
+
+  // The visible alert renders the safe envelope message (no path/credential).
+  // Scope to the Obsidian section: the ping status and other regions may also
+  // carry role="alert".
+  const alert = page.locator("#tessera-obsidian").getByRole("alert");
+  await expect(alert).toContainText("overlaps an already-confirmed source. Resolve the conflict");
+  const alertBody = (await alert.textContent()) ?? "";
+  expect(alertBody.toLowerCase()).not.toContain("credential");
+
+  // The candidate stays put — a failed confirm must not remove it.
+  await expect(candidateRegion).toContainText("/fixture/vault/overlap");
 });
 
 // Local mock type for the projects region test (mirrors TesseraProjectView

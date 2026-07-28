@@ -94,6 +94,32 @@ function asHealthState(s: string): HealthState {
   return s as HealthState;
 }
 
+/**
+ * Stable per-candidate key, identical in shape to the React `key` used on each
+ * candidate `<li>`. Reused for the in-flight `resolvingKey` so only the button
+ * being acted on is disabled.
+ */
+function candidateKey(candidate: KnowledgeCandidate): string {
+  return `${candidate.provider}:${candidate.root_path}`;
+}
+
+/**
+ * The set of root paths that already exist as a confirmed Inventory row, so a
+ * Vault already confirmed does not linger in the candidate list (the
+ * "看起来没反应" symptom where a confirmed Vault appeared in BOTH 候选 and
+ * 已确认). Keys on `provider\0root` since both candidates and inventory are
+ * Obsidian-only here. Null when inventory isn't loaded yet, meaning do not
+ * filter (preserve loading behavior).
+ */
+function confirmedRootSet(inventory: LoadState<KnowledgeInventory[]>): Set<string> | null {
+  if (inventory.kind !== "ok") return null;
+  const set = new Set<string>();
+  for (const item of inventory.value) {
+    set.add(`${item.provider}\0${item.root}`);
+  }
+  return set;
+}
+
 /** A single confirmed-Vault Inventory card. */
 function VaultCard({
   item,
@@ -158,7 +184,16 @@ export function Obsidian(): ReactElement {
     LoadState<{ candidates: KnowledgeCandidate[]; diagnostic: string | null }>
   >({ kind: "loading" });
   const [inventory, setInventory] = useState<LoadState<KnowledgeInventory[]>>({ kind: "loading" });
-  const [message, setMessage] = useState("");
+  // Candidate feedback state. Was a bare `string` rendered into a
+  // `visually-hidden-text` `<p>`, so confirm/reject success and error were
+  // both invisible — the "点击确认没反应" symptom. Now a discriminated union
+  // rendered as a visible `role="alert"` (error) or `role="status"` (success).
+  const [message, setMessage] = useState<
+    { kind: "idle" } | { kind: "success"; text: string } | { kind: "error"; text: string }
+  >({ kind: "idle" });
+  // Per-candidate in-flight state so the 确认/拒绝 button being acted on shows
+  // "处理中…" and is disabled for the duration of the confirm/reject request.
+  const [resolvingKey, setResolvingKey] = useState<string | null>(null);
   const [pickerBusy, setPickerBusy] = useState(false);
   // Story 6.9 — Browse view state: which vault is being browsed + its notes.
   const [browseVault, setBrowseVault] = useState<{ sourceId: string; vaultName: string } | null>(
@@ -234,7 +269,7 @@ export function Obsidian(): ReactElement {
         );
         setBrowseCursor(page.payload.next_cursor);
       })
-      .catch((error: unknown) => setMessage(readTesseraErrorMessage(error)));
+      .catch((error: unknown) => setMessage({ kind: "error", text: readTesseraErrorMessage(error) }));
   }, [browseVault, browseCursor]);
 
   const exitBrowse = useCallback(() => {
@@ -289,14 +324,23 @@ export function Obsidian(): ReactElement {
 
   const resolveCandidate = useCallback(
     (candidate: KnowledgeCandidate, action: "confirm" | "reject") => {
+      const key = candidateKey(candidate);
       const op = action === "confirm" ? confirmKnowledgeSource : rejectKnowledgeSource;
+      setResolvingKey(key);
       op(candidate)
         .then(() => {
-          setMessage(action === "confirm" ? "已确认 Vault。" : "已拒绝 Vault。");
+          setResolvingKey(null);
+          setMessage({
+            kind: "success",
+            text: action === "confirm" ? "已确认 Vault。" : "已拒绝 Vault。",
+          });
           refreshDiscovery();
           refreshInventory();
         })
-        .catch((error: unknown) => setMessage(readTesseraErrorMessage(error)));
+        .catch((error: unknown) => {
+          setResolvingKey(null);
+          setMessage({ kind: "error", text: readTesseraErrorMessage(error) });
+        });
     },
     [refreshDiscovery, refreshInventory],
   );
@@ -307,20 +351,20 @@ export function Obsidian(): ReactElement {
       .then((result) => {
         setPickerBusy(false);
         if (result.payload.status === "cancelled") {
-          setMessage("已取消选择。");
+          setMessage({ kind: "success", text: "已取消选择。" });
           return;
         }
         if (result.payload.status === "invalid") {
-          setMessage("所选目录不可用或不是有效的 Vault。");
+          setMessage({ kind: "error", text: "所选目录不可用或不是有效的 Vault。" });
           return;
         }
         // selected: refresh discovery so the new candidate appears as a card.
-        setMessage("已选择 Vault，请确认。");
+        setMessage({ kind: "success", text: "已选择 Vault，请确认。" });
         refreshDiscovery();
       })
       .catch((error: unknown) => {
         setPickerBusy(false);
-        setMessage(readTesseraErrorMessage(error));
+        setMessage({ kind: "error", text: readTesseraErrorMessage(error) });
       });
   }, [refreshDiscovery]);
 
@@ -332,7 +376,12 @@ export function Obsidian(): ReactElement {
     return (
       <section aria-label={`浏览 ${browseVault.vaultName} 笔记`} id="tessera-obsidian" className="tsr-section">
         <h2 className="tsr-section__title">{browseVault.vaultName} · 笔记列表</h2>
-        <p aria-live="polite" className="visually-hidden-text">{message}</p>
+        {message.kind === "error" ? (
+          <p role="alert" className="tsr-prose">{message.text}</p>
+        ) : null}
+        {message.kind === "success" ? (
+          <p role="status" aria-live="polite" className="tsr-prose">{message.text}</p>
+        ) : null}
         <div className="tsr-rebuild">
           <button type="button" className="tsr-btn" onClick={exitBrowse}>
             ← 返回知识库清单
@@ -387,7 +436,12 @@ export function Obsidian(): ReactElement {
     return (
       <section aria-label="知识库搜索结果" id="tessera-obsidian" className="tsr-section">
         <h2 className="tsr-section__title">搜索「{searchQuery}」</h2>
-        <p aria-live="polite" className="visually-hidden-text">{message}</p>
+        {message.kind === "error" ? (
+          <p role="alert" className="tsr-prose">{message.text}</p>
+        ) : null}
+        {message.kind === "success" ? (
+          <p role="status" aria-live="polite" className="tsr-prose">{message.text}</p>
+        ) : null}
         <div className="tsr-rebuild">
           <button type="button" className="tsr-btn" onClick={exitSearch}>
             ← 返回知识库
@@ -434,9 +488,16 @@ export function Obsidian(): ReactElement {
   return (
     <section aria-label="Obsidian 知识库" id="tessera-obsidian" className="tsr-section">
       <h2 className="tsr-section__title">Obsidian 知识库</h2>
-      <p aria-live="polite" className="visually-hidden-text">
-        {message}
-      </p>
+      {message.kind === "error" ? (
+        <p role="alert" className="tsr-prose">
+          {message.text}
+        </p>
+      ) : null}
+      {message.kind === "success" ? (
+        <p role="status" aria-live="polite" className="tsr-prose">
+          {message.text}
+        </p>
+      ) : null}
 
       {/* Story 6.9 — cross-vault keyword search */}
       <section aria-label="搜索知识库" className="tsr-block">
@@ -465,74 +526,93 @@ export function Obsidian(): ReactElement {
       </section>
 
       {/* ---- Vault candidates (from registry + picker fallback) ---- */}
-      <section aria-label="发现的 Vault" className="tsr-block">
-        <h3 className="tsr-block__title">候选 Vault</h3>
+      {/* A Vault already present as a confirmed Inventory row is hidden from the
+          candidate list: without this, confirming a Vault left its candidate
+          card in place AND added an Inventory card, so the action looked like
+          it did nothing. The filter is client-only and only applies once both
+          discovery and inventory have loaded. */}
+      {(() => {
+        const resolved = confirmedRootSet(inventory);
+        const candidates =
+          discovery.kind === "ok"
+            ? resolved
+              ? discovery.value.candidates.filter(
+                  (c) => !resolved.has(`${c.provider}\0${c.root_path}`),
+                )
+              : discovery.value.candidates
+            : [];
+        return (
+        <section aria-label="发现的 Vault" className="tsr-block">
+          <h3 className="tsr-block__title">候选 Vault</h3>
 
-        <div className="tsr-rebuild">
-          <button
-            type="button"
-            className="tsr-btn tsr-btn--primary"
-            onClick={onPicker}
-            disabled={pickerBusy}
-            aria-label="选择已有 Obsidian Vault"
-          >
-            {pickerBusy ? "正在打开选择器…" : "选择已有 Vault"}
-          </button>
-        </div>
+          <div className="tsr-rebuild">
+            <button
+              type="button"
+              className="tsr-btn tsr-btn--primary"
+              onClick={onPicker}
+              disabled={pickerBusy}
+              aria-label="选择已有 Obsidian Vault"
+            >
+              {pickerBusy ? "正在打开选择器…" : "选择已有 Vault"}
+            </button>
+          </div>
 
-        {discovery.kind === "loading" ? (
-          <p className="tsr-prose">正在查找已注册的 Obsidian Vault…</p>
-        ) : null}
-        {discovery.kind === "error" ? (
-          <p role="alert" className="tsr-prose">
-            {discovery.message}
-          </p>
-        ) : null}
-        {discovery.kind === "ok" && diagnosticText ? (
-          <p role="status" className="tsr-prose">
-            {diagnosticText}
-          </p>
-        ) : null}
-        {discovery.kind === "ok" &&
-        discovery.value.candidates.length === 0 &&
-        !diagnosticText ? (
-          <p className="tsr-prose">未发现已注册的 Obsidian Vault。可手动选择已有 Vault。</p>
-        ) : null}
-        {discovery.kind === "ok" && discovery.value.candidates.length > 0 ? (
-          <ul className="tsr-candidates">
-            {discovery.value.candidates.map((candidate) => (
-              <li
-                key={`${candidate.provider}:${candidate.root_path}`}
-                className="tsr-candidate"
-              >
-                <div className="tsr-candidate__main">
-                  <span className="tsr-candidate__provider">{candidate.provider}</span>
-                  <span className="tsr-candidate__coverage">
-                    {describeCoverage(candidate.coverage_level)}
-                  </span>
-                  <code className="tsr-candidate__path">{candidate.root_path}</code>
-                </div>
-                <div className="tsr-candidate__actions">
-                  <button
-                    type="button"
-                    className="tsr-btn tsr-btn--primary"
-                    onClick={() => resolveCandidate(candidate, "confirm")}
-                  >
-                    确认
-                  </button>
-                  <button
-                    type="button"
-                    className="tsr-btn"
-                    onClick={() => resolveCandidate(candidate, "reject")}
-                  >
-                    拒绝
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        ) : null}
-      </section>
+          {discovery.kind === "loading" ? (
+            <p className="tsr-prose">正在查找已注册的 Obsidian Vault…</p>
+          ) : null}
+          {discovery.kind === "error" ? (
+            <p role="alert" className="tsr-prose">
+              {discovery.message}
+            </p>
+          ) : null}
+          {discovery.kind === "ok" && diagnosticText ? (
+            <p role="status" className="tsr-prose">
+              {diagnosticText}
+            </p>
+          ) : null}
+          {discovery.kind === "ok" && candidates.length === 0 && !diagnosticText ? (
+            <p className="tsr-prose">未发现已注册的 Obsidian Vault。可手动选择已有 Vault。</p>
+          ) : null}
+          {discovery.kind === "ok" && candidates.length > 0 ? (
+            <ul className="tsr-candidates">
+              {candidates.map((candidate) => {
+                const key = candidateKey(candidate);
+                const isResolving = resolvingKey === key;
+                return (
+                  <li key={key} className="tsr-candidate">
+                    <div className="tsr-candidate__main">
+                      <span className="tsr-candidate__provider">{candidate.provider}</span>
+                      <span className="tsr-candidate__coverage">
+                        {describeCoverage(candidate.coverage_level)}
+                      </span>
+                      <code className="tsr-candidate__path">{candidate.root_path}</code>
+                    </div>
+                    <div className="tsr-candidate__actions">
+                      <button
+                        type="button"
+                        className="tsr-btn tsr-btn--primary"
+                        onClick={() => resolveCandidate(candidate, "confirm")}
+                        disabled={isResolving}
+                      >
+                        {isResolving ? "处理中…" : "确认"}
+                      </button>
+                      <button
+                        type="button"
+                        className="tsr-btn"
+                        onClick={() => resolveCandidate(candidate, "reject")}
+                        disabled={isResolving}
+                      >
+                        {isResolving ? "处理中…" : "拒绝"}
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : null}
+        </section>
+        );
+      })()}
 
       {/* ---- Knowledge Inventory (one card per confirmed Vault) ---- */}
       <section
