@@ -59,6 +59,12 @@ notify = "8.2"
 # descriptor-to-path comparison explicit and portable.
 same-file = "1"
 
+# Native OS folder-picker dialog for Obsidian Vault fallback selection
+# (Story 6.3). Rust-owned so the browser never submits a path, URI, or
+# filesystem handle (AD-37). Synchronous API matches the rest of the core;
+# the async feature is disabled to avoid pulling tokio into the locked stack.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal"] }
+
 [dev-dependencies]
 sha2 = "0.10"
 tempfile = "3"

@@ -148,6 +148,20 @@ impl ErrorEnvelope {
         )
     }
 
+    /// Construct a `root_overlap` error envelope (Story 6.3). Emitted when a
+    /// Knowledge Vault confirm is blocked because the candidate root overlaps
+    /// an already-Confirmed Source root (contains / is-contained-by / equal).
+    /// The safe message reveals no path detail; the UI shows both roots and
+    /// requires explicit ownership resolution.
+    pub fn root_overlap(source_id: Option<&str>, phase: &str) -> Self {
+        Self::new(
+            "root_overlap",
+            "This vault's root overlaps an already-confirmed source. Resolve the conflict before confirming.",
+            source_id,
+            phase,
+        )
+    }
+
     /// Construct a `scan_failed` error envelope (Story 1.4). Stable code per
     /// AD-13; the safe message never includes body / query text / credentials
     /// or path detail beyond what the user already confirmed. Emitted when a

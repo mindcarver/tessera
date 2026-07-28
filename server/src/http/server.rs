@@ -42,11 +42,11 @@ use crate::domain::ports::provider_adapter::ProviderMemoryType;
 use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
-    add_mapping, browse, cancel_rescan_request, confirm_source, create_project, delete_project,
-    disable_source, discover_knowledge_sources, discover_sources, get_scan_status, list_projects,
-    list_sources, open_original_location, ping, rebind_source, reject_source, remove_mapping,
-    rename_project, rescan_events, scan_source, search, source_inventory, start_rebuild,
-    start_rescan,
+    add_mapping, browse, cancel_rescan_request, confirm_knowledge_source, confirm_source,
+    create_project, delete_project, disable_source, discover_knowledge_sources, discover_sources,
+    get_scan_status, list_projects, list_sources, open_original_location, ping, rebind_source,
+    reject_knowledge_source, reject_source, remove_mapping, rename_project, request_vault_picker,
+    rescan_events, scan_source, search, source_inventory, start_rebuild, start_rescan,
 };
 use crate::IndexState;
 
@@ -149,6 +149,24 @@ fn route(
         // (AD-19); never routes through ProviderAdapter (Story 6.1 AC).
         (Method::Get, "/api/knowledge/discover") => {
             respond_ok(request, discover_knowledge_sources())
+        }
+        // Story 6.3 — Knowledge confirm / reject / Rust-owned vault picker.
+        (Method::Post, "/api/knowledge/confirm") => {
+            let candidate = match read_json_body::<ConfirmRequest>(&mut request) {
+                Ok(body) => body.candidate,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, confirm_knowledge_source(&candidate, state))
+        }
+        (Method::Post, "/api/knowledge/reject") => {
+            let candidate = match read_json_body::<ConfirmRequest>(&mut request) {
+                Ok(body) => body.candidate,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, reject_knowledge_source(&candidate, state))
+        }
+        (Method::Post, "/api/knowledge/picker") => {
+            respond_ok(request, request_vault_picker())
         }
         (Method::Post, "/api/sources/confirm") => {
             let candidate = match read_json_body::<ConfirmRequest>(&mut request) {

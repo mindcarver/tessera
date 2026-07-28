@@ -30,8 +30,9 @@ pub mod source;
 // Re-export so IPC and lib.rs can name `application::discover_sources` etc.
 // without a path change from 1.2.
 pub use source::{
-    confirm_source, disable_source, discover_obsidian_vaults, discover_sources, list_sources,
-    native_project_for_root, rebind_source, reject_source, SourceError,
+    confirm_knowledge_source, confirm_source, disable_source, discover_obsidian_vaults,
+    discover_sources, list_sources, native_project_for_root, rebind_source, reject_knowledge_source,
+    reject_source, request_existing_vault_picker, SourceError, VaultPickerOutcome,
 };
 
 // Story 5.1 — Tessera Project orchestration. Re-exported so IPC and tests

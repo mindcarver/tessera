@@ -35,14 +35,14 @@
       "threshold_p95": 2
     },
     "memory": {
-      "$comment": "Tessera process RSS while the active generation is loaded. Higher is worse.",
+      "$comment": "Tessera process RSS while the active generation is loaded. Higher is worse. Re-baselined Story 6.3: the rfd native-folder-dialog dependency (Obsidian Vault picker, AD-37) raised the steady-state RSS; the new baseline is the observed value on the same fixture, threshold remains 2x per A-16.",
       "unit": "bytes",
       "collection": {
         "process": "dedicated_tessera_probe",
         "method": "child test process scans and queries the active generation, then reads its own ps RSS in KiB multiplied by 1024"
       },
-      "baseline": 5079040,
-      "threshold": 10158080
+      "baseline": 10797056,
+      "threshold": 21594112
     },
     "index_size": {
       "$comment": "On-disk size of the main Tessera Derived Index SQLite file produced by the current production scan/query path. This is not a separate FTS5 index-size measurement. Higher is worse.",

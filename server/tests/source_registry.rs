@@ -231,8 +231,142 @@ fn local_knowledge_source_kind_round_trips_and_unknown_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------
-// Confirm + idempotency
+// Story 6.3 — Knowledge confirm/reject + root overlap blocking
 // ---------------------------------------------------------------------------
+
+/// Build an Obsidian Knowledge candidate for an existing directory.
+fn knowledge_candidate(root: &std::path::Path) -> CandidateSource {
+    CandidateSource {
+        provider: "obsidian".to_string(),
+        root_path: root.to_string_lossy().to_string(),
+        basis: DiscoveryBasis::ObsidianVaultRegistry,
+        coverage_level: CoverageLevel::Full,
+        native_project: None,
+    }
+}
+
+/// Story 6.3 AC: confirming a Vault persists a `local_knowledge` Source.
+#[test]
+fn confirm_knowledge_source_persists_local_knowledge_kind() {
+    let tmp = tempdir().expect("tempdir");
+    let vault = tmp.path().join("my-vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let candidate = knowledge_candidate(&vault);
+
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source =
+        application::confirm_knowledge_source(&registry, &candidate).expect("confirm knowledge");
+    assert_eq!(
+        source.source_kind,
+        tessera_lib::domain::source::SourceKind::LocalKnowledge
+    );
+    assert_eq!(source.provider, "obsidian");
+    assert_eq!(source.lifecycle_state, SourceLifecycle::Confirmed);
+}
+
+/// Story 6.3 AC: same-name Vaults at different non-overlapping roots confirm
+/// independently (remain distinct).
+#[test]
+fn confirm_two_distinct_vaults_succeeds_independently() {
+    let tmp = tempdir().expect("tempdir");
+    let vault_a = tmp.path().join("kb-a/Notes");
+    let vault_b = tmp.path().join("kb-b/Notes");
+    std::fs::create_dir_all(&vault_a).unwrap();
+    std::fs::create_dir_all(&vault_b).unwrap();
+
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let a = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault_a))
+        .expect("confirm a");
+    let b = application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault_b))
+        .expect("confirm b");
+    assert_ne!(a.source_id, b.source_id, "distinct roots → distinct sources");
+}
+
+/// Story 6.3 AC: a Candidate whose root overlaps an already-Confirmed Source
+/// root is blocked with `RootOverlap`.
+#[test]
+fn confirm_overlapping_nested_root_is_blocked() {
+    let tmp = tempdir().expect("tempdir");
+    let outer = tmp.path().join("vault-root");
+    let inner = outer.join("sub-vault");
+    std::fs::create_dir_all(&inner).unwrap();
+
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    // Confirm the outer root first.
+    application::confirm_knowledge_source(&registry, &knowledge_candidate(&outer))
+        .expect("confirm outer");
+    // The inner root is contained by the outer → blocked.
+    let err = application::confirm_knowledge_source(&registry, &knowledge_candidate(&inner))
+        .expect_err("inner must be blocked");
+    assert!(
+        matches!(err, application::SourceError::RootOverlap),
+        "nested root must be blocked with RootOverlap; got {err:?}"
+    );
+}
+
+/// Story 6.3 AC: confirming a root that CONTAINS an existing confirmed root is
+/// also blocked (overlap is symmetric).
+#[test]
+fn confirm_root_containing_existing_confirmed_is_blocked() {
+    let tmp = tempdir().expect("tempdir");
+    let outer = tmp.path().join("vault-root");
+    let inner = outer.join("sub");
+    std::fs::create_dir_all(&inner).unwrap();
+
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    // Confirm the inner root first.
+    application::confirm_knowledge_source(&registry, &knowledge_candidate(&inner))
+        .expect("confirm inner");
+    // The outer root contains the inner → blocked.
+    let err = application::confirm_knowledge_source(&registry, &knowledge_candidate(&outer))
+        .expect_err("outer must be blocked");
+    assert!(
+        matches!(err, application::SourceError::RootOverlap),
+        "containing root must be blocked with RootOverlap; got {err:?}"
+    );
+}
+
+/// Story 6.3 AC: re-confirming the same root is idempotent (wake-up), not
+/// blocked by overlap against itself.
+#[test]
+fn reconfirm_same_vault_is_idempotent_not_overlap() {
+    let tmp = tempdir().expect("tempdir");
+    let vault = tmp.path().join("v");
+    std::fs::create_dir_all(&vault).unwrap();
+    let candidate = knowledge_candidate(&vault);
+
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let first = application::confirm_knowledge_source(&registry, &candidate).expect("first");
+    let second = application::confirm_knowledge_source(&registry, &candidate).expect("second");
+    assert_eq!(first.source_id, second.source_id, "idempotent wake-up");
+}
+
+/// Story 6.3 AC: disabling a confirmed vault then confirming an overlapping
+/// root succeeds (ownership resolved).
+#[test]
+fn disable_then_confirm_overlapping_root_succeeds() {
+    let tmp = tempdir().expect("tempdir");
+    let outer = tmp.path().join("vault-root");
+    let inner = outer.join("sub");
+    std::fs::create_dir_all(&inner).unwrap();
+
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let confirmed = application::confirm_knowledge_source(&registry, &knowledge_candidate(&outer))
+        .expect("confirm outer");
+    // Disable it.
+    application::disable_source(&registry, &confirmed.source_id).expect("disable");
+    // Now the inner root can be confirmed (the outer is no longer Confirmed).
+    application::confirm_knowledge_source(&registry, &knowledge_candidate(&inner))
+        .expect("inner confirmable after outer disabled");
+}
+
+
 
 /// I/O matrix row 1: confirm a real existing Codex memories dir →
 /// `src_<n>` + `confirmed` + `coverage_level=full` + normalized path +

@@ -37,7 +37,7 @@ use std::sync::MutexGuard;
 
 use crate::application;
 use crate::application::query::QueryError;
-use crate::application::{OpenError, ProjectError, SourceError};
+use crate::application::{OpenError, ProjectError, SourceError, VaultPickerOutcome};
 use crate::domain::open::{OpenRequest, OpenResult};
 use crate::domain::project::{
     CreateProjectRequest, DeleteProjectRequest, DeleteProjectResponse, MappingRequest,
@@ -201,6 +201,53 @@ pub fn reject_source(
     drop(conn);
     stop_watch_best_effort(state, &source.source_id);
     Ok(wrap_source(source))
+}
+
+// --- Story 6.3: Knowledge (Obsidian Vault) confirm / reject / picker --------
+//
+// Independent pipeline (AD-19): routes through confirm_knowledge_source /
+// reject_knowledge_source, never through ProviderAdapter (6.1 AC). The picker
+// is Rust-owned: the browser only triggers the action and receives a
+// VaultPickerOutcome; it never submits a path, URI, or filesystem handle.
+
+/// `confirm_knowledge_source` — confirm an Obsidian Vault as a
+/// `local_knowledge` Source (Story 6.3). Blocks on root overlap with
+/// `root_overlap`.
+pub fn confirm_knowledge_source(
+    candidate: &CandidateSource,
+    state: &IndexState,
+) -> Result<Envelope<Source>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_knowledge_source(&registry, candidate)
+        .map_err(|err| map_source_error(err, None))?;
+    drop(conn);
+    start_watch_best_effort(state, &source.source_id, &source.normalized_root_path);
+    Ok(wrap_source(source))
+}
+
+/// `reject_knowledge_source` — reject an Obsidian Vault Candidate (Story 6.3).
+pub fn reject_knowledge_source(
+    candidate: &CandidateSource,
+    state: &IndexState,
+) -> Result<Envelope<Source>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let source = application::reject_knowledge_source(&registry, candidate)
+        .map_err(|err| map_source_error(err, None))?;
+    drop(conn);
+    stop_watch_best_effort(state, &source.source_id);
+    Ok(wrap_source(source))
+}
+
+/// `request_vault_picker` — trigger the Rust-owned native OS folder picker
+/// (Story 6.3). The browser receives a `VaultPickerOutcome`; it never supplies
+/// a path. Returns the versioned envelope wrapping the outcome.
+pub fn request_vault_picker() -> Envelope<VaultPickerOutcome> {
+    Envelope {
+        api_version: API_VERSION,
+        payload: application::request_existing_vault_picker(),
+    }
 }
 
 /// `disable_source` — disable a confirmed Source by `source_id` (AD-4: only
@@ -916,6 +963,7 @@ fn map_source_error(err: SourceError, source_id: Option<&str>) -> ErrorEnvelope 
     match err {
         SourceError::ConfirmFailed => ErrorEnvelope::confirm_failed(source_id, "source"),
         SourceError::SourceNotFound => ErrorEnvelope::source_not_found(source_id, "source"),
+        SourceError::RootOverlap => ErrorEnvelope::root_overlap(source_id, "source"),
         SourceError::Internal => ErrorEnvelope::internal_for(source_id, "source"),
     }
 }
