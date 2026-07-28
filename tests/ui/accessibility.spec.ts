@@ -2202,16 +2202,18 @@ test("obsidian confirm renders visible success and moves the vault into inventor
 
   await page.goto("/");
 
-  // The candidate region is `<section aria-label="发现的 Vault">` (the visible
-  // heading "候选 Vault" is not the accessible name).
-  const candidateRegion = page.getByRole("region", { name: "发现的 Vault" });
+  // The unified overview region `<section aria-label="我的知识库">` now hosts
+  // both confirmed and pending Vault cards in one grid.
+  const overview = page.getByRole("region", { name: "我的知识库" });
 
-  // Before confirm: the candidate card shows its root path, inventory is empty.
-  await expect(candidateRegion).toContainText("/fixture/vault/9lai");
-  await expect(page.getByRole("region", { name: "知识库清单" })).toContainText("尚未确认任何 Obsidian Vault。");
+  // Before confirm: the pending card shows the vault root path; the header
+  // counts 0 confirmed · 1 pending.
+  await expect(overview).toContainText("/fixture/vault/9lai");
+  await expect(overview).toContainText("0 个已确认");
+  await expect(overview).toContainText("1 个待确认");
 
-  // Keyboard-reachable confirm, scoped to the Obsidian candidate region.
-  const confirmBtn = candidateRegion.getByRole("button", { name: "确认", exact: true });
+  // Keyboard-reachable confirm, scoped to the overview's pending card.
+  const confirmBtn = overview.getByRole("button", { name: "确认", exact: true });
   await confirmBtn.focus();
   const confirmResponse = page.waitForResponse(
     (r) => r.url().endsWith("/api/knowledge/confirm") && r.request().method() === "POST",
@@ -2224,9 +2226,102 @@ test("obsidian confirm renders visible success and moves the vault into inventor
   // the Obsidian section: the Search view also carries a role="status".
   await expect(page.locator("#tessera-obsidian").getByRole("status")).toContainText("已确认 Vault。");
 
-  // The confirmed Vault left the candidate region and entered the inventory.
-  await expect(candidateRegion).not.toContainText("/fixture/vault/9lai");
-  await expect(page.getByRole("region", { name: "知识库清单" })).toContainText("9lai");
+  // The Vault transitioned from pending to confirmed. A confirmed VaultCard
+  // still shows the same root path, so assert on the card *kind* markers
+  // instead: the pending "忽略" action is gone, the confirmed "刷新" action is
+  // present, and the header counts flipped to 1 confirmed · 0 pending.
+  await expect(overview.getByRole("button", { name: "忽略" })).toHaveCount(0);
+  await expect(overview).toContainText("9lai");
+  await expect(overview.getByRole("button", { name: "刷新" })).toHaveCount(1);
+  // The header counts updated to 1 confirmed · 0 pending.
+  await expect(overview).toContainText("1 个已确认");
+  await expect(overview).toContainText("0 个待确认");
+});
+/**
+ * 我的知识库总览 (Issue #16) — the unified overview renders confirmed and
+ * pending Vault cards in ONE grid and de-duplicates: a Vault already present
+ * as a confirmed Inventory row must NOT also render as a pending card. This
+ * pins the core acceptance item: one screen shows "我管理了哪些库、各自多大、
+ * 哪个待确认" without duplication. Mirrors the user's real setup (1 confirmed
+ * Vault + several discovered candidates).
+ */
+test("knowledge overview shows confirmed and pending vaults without duplication", async ({ page }) => {
+  await page.route("**/api/sources/discover", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  await page.route("**/api/sources/inventory", async (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify({ api_version: "1", payload: [] }) }),
+  );
+  // One confirmed Vault...
+  const confirmedRow = {
+    source_id: "src_91ai",
+    vault_name: "91ai",
+    provider: "obsidian",
+    root: "/Users/fixtures/91ai",
+    coverage_level: "full",
+    health_state: "healthy",
+    last_successful_scan: 1785228412,
+    complete_note_count: 932,
+    latest_error: null,
+    cause: "none",
+    stale: false,
+    lifecycle_state: "confirmed",
+  };
+  await page.route("**/api/knowledge/inventory", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ api_version: "1", payload: [confirmedRow] }),
+    }),
+  );
+  // ...plus 6 discovered candidates, ONE of which is the same root as the
+  // confirmed row (must be de-duplicated → 5 pending, not 6).
+  const mkCandidate = (root: string) => ({
+    provider: "obsidian",
+    root_path: root,
+    basis: "obsidian_vault_registry",
+    coverage_level: "full",
+    native_project: null,
+  });
+  await page.route("**/api/knowledge/discover", async (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        api_version: "1",
+        payload: {
+          candidates: [
+            mkCandidate("/Users/fixtures/91ai"), // dup of confirmed → filtered
+            mkCandidate("/Users/fixtures/dev-repo"),
+            mkCandidate("/Users/fixtures/mandra-work"),
+            mkCandidate("/Users/fixtures/solutions-doc"),
+            mkCandidate("/Users/fixtures/ai-doc"),
+            mkCandidate("/Users/fixtures/zly"),
+          ],
+          diagnostic: null,
+        },
+      }),
+    }),
+  );
+
+  await page.goto("/");
+
+  const overview = page.getByRole("region", { name: "我的知识库" });
+
+  // Header summary states the de-duplicated counts.
+  await expect(overview).toContainText("共 1 个已确认");
+  await expect(overview).toContainText("5 个待确认");
+
+  // The confirmed Vault renders as a confirmed card: vault name + note count +
+  // refresh action, and it does NOT also appear as a pending card (忽略 absent).
+  await expect(overview).toContainText("91ai");
+  await expect(overview).toContainText("932");
+  await expect(overview.getByRole("button", { name: "刷新" })).toHaveCount(1);
+
+  // Exactly 5 pending cards each carry an 忽略 action; the confirmed Vault's
+  // root is not among them. 5 忽略 buttons = 5 pending cards (the dup was
+  // removed).
+  await expect(overview.getByRole("button", { name: "忽略" })).toHaveCount(5);
+  // A pending card's root that is NOT the confirmed root renders.
+  await expect(overview).toContainText("/Users/fixtures/dev-repo");
 });
 
 /**
@@ -2275,10 +2370,9 @@ test("obsidian confirm failure surfaces a visible alert and keeps the candidate"
 
   await page.goto("/");
 
-  // The candidate region is `<section aria-label="发现的 Vault">` (the visible
-  // heading "候选 Vault" is not the accessible name).
-  const candidateRegion = page.getByRole("region", { name: "发现的 Vault" });
-  const confirmBtn = candidateRegion.getByRole("button", { name: "确认", exact: true });
+  // The unified overview region now hosts the pending Vault card.
+  const overview = page.getByRole("region", { name: "我的知识库" });
+  const confirmBtn = overview.getByRole("button", { name: "确认", exact: true });
   await confirmBtn.focus();
   await page.keyboard.press("Enter");
 
@@ -2291,7 +2385,7 @@ test("obsidian confirm failure surfaces a visible alert and keeps the candidate"
   expect(alertBody.toLowerCase()).not.toContain("credential");
 
   // The candidate stays put — a failed confirm must not remove it.
-  await expect(candidateRegion).toContainText("/fixture/vault/overlap");
+  await expect(overview).toContainText("/fixture/vault/overlap");
 });
 
 // Local mock type for the projects region test (mirrors TesseraProjectView
