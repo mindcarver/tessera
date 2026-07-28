@@ -4,7 +4,7 @@
 //! envelope crosses HTTP end-to-end.
 //!
 //! These tests pin the AC's wire-level behavior:
-//! - migration applies + `schema_version == "8"` post-boot (Story 5.2 bumped
+//! - migration applies + `schema_version == "11"` post-boot (Story 6.4 bumped
 //!   the schema version to seed `project_mapping_revision`);
 //! - create / list / rename / delete round-trip the versioned envelope;
 //! - add-mapping cardinality conflict surfaces 409 `mapping_conflict` naming
@@ -85,7 +85,7 @@ fn get(port: u16, path: &str) -> String {
 }
 
 #[test]
-fn schema_version_is_eight_after_boot() {
+fn schema_version_is_eleven_after_boot() {
     let (_port, state) = boot_projects_server();
     let conn = state.conn.lock().expect("conn lock");
     let v: String = conn
@@ -95,7 +95,7 @@ fn schema_version_is_eight_after_boot() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(v, "8");
+    assert_eq!(v, "11");
     // Story 5.2 — the project_mapping_revision key is seeded to "0" by
     // migration id 8. Read it back so a missing / mis-seeded key fails loudly.
     let pmr: String = conn

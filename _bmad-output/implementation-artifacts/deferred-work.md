@@ -201,3 +201,13 @@ Tauri 移除、传输改为 loopback-only HTTP（tiny_http）后，上述条目�
 - source_spec: `(runtime — Windows host adaptation, not story-scoped)`
   summary: On Windows the Codex/Claude adapters default to `$HOME/.codex` and `$HOME/.claude`, but a Git Bash shell exports `HOME=/c/Users/...` (Unix-style) which the Rust Windows binary cannot resolve → both adapters resolve a non-existent path and discover ZERO Candidate Sources. Only an explicit `CODEX_HOME` / `CLAUDE_CONFIG_DIR` with a Windows-style path works around it.
   evidence: `server/src/adapters/codex.rs` (`env::var("CODEX_HOME")` / `HOME`) and `server/src/adapters/claude_code.rs:172-173` (`env::var("CLAUDE_CONFIG_DIR")` / `env::var("HOME")`). Verified at runtime: default boot → empty `/api/sources/inventory`; `CODEX_HOME='C:/Users/Administrator/.codex' CLAUDE_CONFIG_DIR='C:/Users/Administrator/.claude'` → discover finds Codex (419 records) + 2 Claude memory sources (67 + 3). Fix: resolve the home dir via `dirs::home_dir()` (which honors `USERPROFILE` on Windows) instead of raw `$HOME`, so the default discovery path works on Windows without per-launch env overrides.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-9-knowledge-search.md`
+  summary: Knowledge search cursor lacks revision binding (re-scan mid-pagination not detected)
+  evidence: Agent-Memory search binds current_index_revision into its cursor; Knowledge search_knowledge skips it. A concurrent re-scan between page 1 and page 2 can change results without CursorStale. The IndexState mutex serializes commands so the window is narrow, but cross-vault search over N vaults widens it. Browse Knowledge has the same gap (kb. cursor, no revision).
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-9-knowledge-search.md`
+  summary: Knowledge search HTTP route lacks a wire-level test in http_api.rs
+  evidence: All 7+5 search tests call application::search_knowledge directly; the HTTP handler + parse_knowledge_search_query (percent-decode, limit clamp, since parse, unknown-key rejection) are untested at the socket level. A parser regression ships green.
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-9-knowledge-search.md`
+  summary: Duplicate query keys (q=foo&q=bar) are last-write-wins with no rejection
+  evidence: parse_knowledge_search_query does not track seen keys. Inherited from the Agent-Memory parse_search_query pattern; not introduced by this story.

@@ -42,10 +42,12 @@ use crate::domain::ports::provider_adapter::ProviderMemoryType;
 use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
-    add_mapping, browse, cancel_rescan_request, confirm_source, create_project, delete_project,
-    disable_source, discover_sources, get_scan_status, list_projects, list_sources,
-    open_original_location, ping, rebind_source, reject_source, remove_mapping, rename_project,
-    rescan_events, scan_source, search, source_inventory, start_rebuild, start_rescan,
+    add_mapping, browse, browse_knowledge, cancel_rescan_request, confirm_knowledge_source,
+    confirm_source, create_project, delete_project, disable_source, discover_knowledge_sources,
+    discover_sources, get_scan_status, knowledge_inventory, list_projects, list_sources,
+    open_original_location, ping, rebind_source, reject_knowledge_source, reject_source,
+    remove_mapping, rename_project, request_vault_picker, rescan_events, scan_source, search,
+    search_knowledge, source_inventory, start_rebuild, start_rescan,
 };
 use crate::IndexState;
 
@@ -144,6 +146,33 @@ fn route(
     match (method, path) {
         (Method::Get, "/api/ping") => respond_ok(request, ping()),
         (Method::Get, "/api/sources/discover") => respond_ok(request, discover_sources()),
+        // Story 6.2 — Knowledge (Obsidian Vault) discovery. Independent pipeline
+        // (AD-19); never routes through ProviderAdapter (Story 6.1 AC).
+        (Method::Get, "/api/knowledge/discover") => {
+            respond_ok(request, discover_knowledge_sources())
+        }
+        // Story 6.3 — Knowledge confirm / reject / Rust-owned vault picker.
+        (Method::Post, "/api/knowledge/confirm") => {
+            let candidate = match read_json_body::<ConfirmRequest>(&mut request) {
+                Ok(body) => body.candidate,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, confirm_knowledge_source(&candidate, state))
+        }
+        (Method::Post, "/api/knowledge/reject") => {
+            let candidate = match read_json_body::<ConfirmRequest>(&mut request) {
+                Ok(body) => body.candidate,
+                Err(response) => return request.respond(response),
+            };
+            respond_result(request, reject_knowledge_source(&candidate, state))
+        }
+        (Method::Post, "/api/knowledge/picker") => {
+            respond_ok(request, request_vault_picker())
+        }
+        // Story 6.6 — Knowledge Inventory (per-vault card data).
+        (Method::Get, "/api/knowledge/inventory") => {
+            respond_result(request, knowledge_inventory(state))
+        }
         (Method::Post, "/api/sources/confirm") => {
             let candidate = match read_json_body::<ConfirmRequest>(&mut request) {
                 Ok(body) => body.candidate,
@@ -306,6 +335,35 @@ fn route(
                 }
             };
             respond_result(request, browse(request_dto, state))
+        }
+        // Story 6.9 — Knowledge Browse (per-vault note list).
+        (Method::Get, "/api/knowledge/browse") => {
+            let (ksource, klimit, kcursor) = match parse_knowledge_browse_query(query) {
+                Ok(v) => v,
+                Err(()) => {
+                    return request.respond(json_error(
+                        StatusCode(400),
+                        "bad_request",
+                        "The request did not match Tessera's knowledge browse contract.",
+                    ))
+                }
+            };
+            respond_result(request, browse_knowledge(&ksource, klimit, kcursor.as_deref(), state))
+        }
+        // Story 6.9 — Knowledge Search (cross-vault keyword search).
+        (Method::Get, "/api/knowledge/search") => {
+            let (kq, klimit, kcursor, ksource, kfolder, ksince) =
+                match parse_knowledge_search_query(query) {
+                    Ok(v) => v,
+                    Err(()) => {
+                        return request.respond(json_error(
+                            StatusCode(400),
+                            "bad_request",
+                            "The request did not match Tessera's knowledge search contract.",
+                        ))
+                    }
+                };
+            respond_result(request, search_knowledge(&kq, klimit, kcursor.as_deref(), ksource.as_deref(), kfolder.as_deref(), ksince, state))
         }
         (Method::Post, "/api/scan") => {
             let source_id = match read_source_id_body(&mut request) {
@@ -548,6 +606,58 @@ fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
 /// `memory_type` handling). An invalid value returns `Err(())` → `400
 /// bad_request` (phase `browse`), matching Search's invalid-memory-type
 /// behavior so the two surfaces share one vocabulary.
+/// Story 6.9 — parse the Knowledge Browse query params: `source` (required
+/// `src_<n>`), `limit` (default 20, max 100), `cursor` (optional `kb.<id>`).
+/// Story 6.9 — parse the Knowledge Search query params: `q` (required),
+/// `limit` (default 20, max 100), `cursor`, `source`, `folder`, `since`.
+fn parse_knowledge_search_query(
+    query: &str,
+) -> Result<(String, u32, Option<String>, Option<String>, Option<String>, Option<i64>), ()> {
+    let mut q: Option<String> = None;
+    let mut limit: u32 = 20;
+    let mut cursor: Option<String> = None;
+    let mut source: Option<String> = None;
+    let mut folder: Option<String> = None;
+    let mut since: Option<i64> = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "q" => q = Some(percent_decode_bounded(value, 1024).ok_or(())?),
+            "limit" => {
+                let decoded = percent_decode_bounded(value, 8).ok_or(())?;
+                limit = decoded.parse::<u32>().map_err(|_| ())?.clamp(1, 100);
+            }
+            "cursor" => cursor = Some(percent_decode_bounded(value, 1024).ok_or(())?),
+            "source" => source = Some(percent_decode_bounded(value, 256).ok_or(())?),
+            "folder" => folder = Some(percent_decode_bounded(value, 1024).ok_or(())?),
+            "since" => {
+                let decoded = percent_decode_bounded(value, 32).ok_or(())?;
+                since = Some(decoded.parse::<i64>().map_err(|_| ())?);
+            }
+            "" => {}
+            _ => return Err(()),
+        }
+    }
+    Ok((q.ok_or(())?, limit, cursor, source, folder, since))
+}
+
+fn parse_knowledge_browse_query(query: &str) -> Result<(String, u32, Option<String>), ()> {
+    let mut source: Option<String> = None;
+    let mut limit: u32 = 20;
+    let mut cursor: Option<String> = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "source" => source = Some(percent_decode_bounded(value, 256).ok_or(())?),
+            "limit" => limit = value.parse::<u32>().map_err(|_| ())?.clamp(1, 100),
+            "cursor" => cursor = Some(percent_decode_bounded(value, 1024).ok_or(())?),
+            "" => {}
+            _ => return Err(()),
+        }
+    }
+    Ok((source.ok_or(())?, limit, cursor))
+}
+
 fn parse_browse_query(query: &str) -> Result<BrowseRequest, ()> {
     let mut source = None;
     let mut cursor = None;

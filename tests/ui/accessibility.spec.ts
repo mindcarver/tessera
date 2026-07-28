@@ -33,11 +33,11 @@ test("keyboard rescan posts successfully and announces ordered progress", async 
   // line carries "Agent Memory" and never "Codex" (or any other provider
   // name), so adding a second provider does not require a copy sweep. Pinned
   // by an assertion so a future Codex-only regression fails loudly.
-  const candidateRegion = page.getByRole("region", { name: "Discovered candidate sources" });
+  const candidateRegion = page.getByRole("region", { name: "发现的候选来源" });
   await expect(candidateRegion).toContainText("Agent Memory");
   await expect(candidateRegion).not.toContainText("Codex");
 
-  const rescan = page.getByRole("button", { name: "Rescan", exact: true });
+  const rescan = page.getByRole("button", { name: "重新扫描", exact: true });
   await expect(rescan).toBeVisible();
   const rescanResponse = page.waitForResponse(
     (response) =>
@@ -47,22 +47,22 @@ test("keyboard rescan posts successfully and announces ordered progress", async 
   await page.keyboard.press("Enter");
 
   expect((await rescanResponse).status()).toBe(200);
-  await expect(page.getByRole("button", { name: "Cancel rescan" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "取消扫描" })).toBeVisible();
   await page.waitForTimeout(300);
   expect(eventCalls).toBeGreaterThan(0);
-  const cancel = page.getByRole("button", { name: "Cancel rescan" });
+  const cancel = page.getByRole("button", { name: "取消扫描" });
   await cancel.focus();
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("rescan-progress")).toContainText("Rescan cancelled.");
-  await expect(page.getByRole("region", { name: "Source inventory" }).getByText("Health", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "来源清单" }).getByText("健康状态", { exact: true })).toBeVisible();
 });
 
 test("keyboard search renders provenance, empty states, pagination, and safe API errors", async ({ page }) => {
   await page.goto("/");
-  const confirm = page.getByRole("button", { name: "Confirm" });
+  const confirm = page.getByRole("button", { name: "确认" });
   await expect(confirm).toBeVisible();
   await confirm.press("Enter");
-  await expect(page.getByRole("button", { name: "Rescan", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "重新扫描", exact: true })).toBeVisible();
   let stalePage = 0;
   let openCalls = 0;
   const openBodies: string[] = [];
@@ -267,7 +267,7 @@ test("renders Claude Code candidates with each claude_* discovery basis", async 
   );
   await page.goto("/");
 
-  const candidateRegion = page.getByRole("region", { name: "Discovered candidate sources" });
+  const candidateRegion = page.getByRole("region", { name: "发现的候选来源" });
 
   // Each candidate must render with the provider name and its full-coverage
   // description. A dropped `claude_*` basis in `VALID_DISCOVERY_BASES` would
@@ -276,7 +276,7 @@ test("renders Claude Code candidates with each claude_* discovery basis", async 
   // error `role="alert"` instead of a candidate list — every assertion below
   // would fail in that case.
   await expect(candidateRegion).toContainText("claude_code");
-  await expect(candidateRegion).toContainText("Full coverage");
+  await expect(candidateRegion).toContainText("完整覆盖");
 
   // The load-bearing assertion: all three candidates render as list items.
   // The list only renders when candidates.kind === "ok" AND value.length > 0,
@@ -633,17 +633,17 @@ test("multi-provider inventory groups cards by provider with a health summary", 
   );
   await page.goto("/");
 
-  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
+  const inventoryRegion = page.getByRole("region", { name: "来源清单" });
 
   // Health-summary header states the totals — cross-source health comparable
   // at a glance. Attention-first ordering surfaces the actionable `error`
   // token (the "one source down" AC) alongside degraded/healthy.
   const summary = inventoryRegion.getByTestId("inventory-summary");
   await expect(summary).toBeVisible();
-  await expect(summary).toContainText("3 sources");
-  await expect(summary).toContainText("1 error");
-  await expect(summary).toContainText("1 degraded");
-  await expect(summary).toContainText("1 healthy");
+  await expect(summary).toContainText("共 3 个来源");
+  await expect(summary).toContainText("1 个错误");
+  await expect(summary).toContainText("1 个降级");
+  await expect(summary).toContainText("1 个正常");
 
   // The summary sits ABOVE the grouped list in DOM order (not just both
   // visible). compareDocumentPosition: the first group is "following" the
@@ -666,8 +666,8 @@ test("multi-provider inventory groups cards by provider with a health summary", 
 
   // Provider grouping: one section per provider, each with its group heading
   // (accessible region name) and a stable `data-provider-group` container.
-  await expect(inventoryRegion.getByRole("region", { name: "Codex provider group" })).toBeVisible();
-  await expect(inventoryRegion.getByRole("region", { name: "Claude Code provider group" })).toBeVisible();
+  await expect(inventoryRegion.getByRole("region", { name: "Codex 来源分组" })).toBeVisible();
+  await expect(inventoryRegion.getByRole("region", { name: "Claude Code 来源分组" })).toBeVisible();
   await expect(inventoryRegion.locator('[data-provider-group="codex"]')).toBeVisible();
   await expect(inventoryRegion.locator('[data-provider-group="claude_code"]')).toBeVisible();
 
@@ -681,7 +681,7 @@ test("multi-provider inventory groups cards by provider with a health summary", 
   // All three cards' full status renders — the panorama must NOT narrow the AC
   // field set. Three "Health" `<dt>` labels means every card rendered its
   // status row.
-  await expect(inventoryRegion.getByText("Health", { exact: true })).toHaveCount(3);
+  await expect(inventoryRegion.getByText("健康状态", { exact: true })).toHaveCount(3);
 
   // The `error`-health source (one source down) carries its `latest_error`;
   // the `degraded` source carries its own. Both render — the panorama reflects
@@ -701,7 +701,7 @@ test("multi-provider inventory groups cards by provider with a health summary", 
     .evaluateAll((cards) =>
       cards.map((card) => {
         for (const dt of card.querySelectorAll("dt")) {
-          if (dt.textContent === "Health") {
+          if (dt.textContent === "健康状态") {
             return dt.nextElementSibling?.textContent ?? "";
           }
         }
@@ -713,8 +713,8 @@ test("multi-provider inventory groups cards by provider with a health summary", 
   // Honest per-Coverage record counts render and are pluralized correctly
   // (count === 1 → "record", otherwise "records"). The non-Full "unavailable"
   // copy is exercised by the dedicated inventory-coverage test below.
-  await expect(inventoryRegion.getByText("2 complete indexed records.", { exact: true })).toBeVisible();
-  await expect(inventoryRegion.getByText("1 complete indexed record.", { exact: true })).toBeVisible();
+  await expect(inventoryRegion.getByText("已完整索引 2 条记录。", { exact: true })).toBeVisible();
+  await expect(inventoryRegion.getByText("已完整索引 1 条记录。", { exact: true })).toBeVisible();
 });
 
 /**
@@ -747,13 +747,13 @@ test("non-full inventory source renders the honest unavailable count copy", asyn
   );
   await page.goto("/");
 
-  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
+  const inventoryRegion = page.getByRole("region", { name: "来源清单" });
 
   // The honest unavailable-count copy renders for the non-Full source.
-  await expect(inventoryRegion.getByText("Complete count unavailable: coverage is limited.")).toBeVisible();
+  await expect(inventoryRegion.getByText("覆盖范围有限，无法提供完整数量。")).toBeVisible();
   // No per-source complete-count line renders for it (only Full coverage claims
   // a count).
-  await expect(inventoryRegion.getByText(/complete indexed records?\./)).toHaveCount(0);
+  await expect(inventoryRegion.getByText(/已完整索引 \d+ 条记录。/)).toHaveCount(0);
 });
 
 /**
@@ -851,7 +851,7 @@ test("keyboard browse enters from inventory paginates and renders three empty st
 
   // The Inventory card for the confirmed source carries a keyboard-reachable
   // Browse button. Story 3.1 AC: "enter from inventory via keyboard".
-  const browseButton = page.getByRole("button", { name: "Browse", exact: true });
+  const browseButton = page.getByRole("button", { name: "浏览", exact: true });
   await expect(browseButton).toBeVisible();
   await browseButton.focus();
   await page.keyboard.press("Enter");
@@ -888,7 +888,7 @@ test("keyboard browse enters from inventory paginates and renders three empty st
   await sourcesButton.focus();
   await page.keyboard.press("Enter");
   // The Inventory region is visible again.
-  await expect(page.getByRole("region", { name: "Source inventory" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "来源清单" })).toBeVisible();
 
   // Three-state empty coverage: swap the inventory's source_id between
   // confirmed sources so the same Browse button activates Browse for each
@@ -911,7 +911,7 @@ test("keyboard browse enters from inventory paginates and renders three empty st
     );
     await page.reload();
     // The Browse button is keyboard-reachable after reload too.
-    const reloadBrowse = page.getByRole("button", { name: "Browse", exact: true });
+    const reloadBrowse = page.getByRole("button", { name: "浏览", exact: true });
     await reloadBrowse.focus();
     await page.keyboard.press("Enter");
     await expect(page.getByRole("region", { name: "Memory browse" })).toBeVisible();
@@ -1004,7 +1004,7 @@ test("browse surfaces partial-unavailability banner and recovers from cursor_sta
   await page.goto("/");
 
   // Enter Browse via keyboard.
-  const browseButton = page.getByRole("button", { name: "Browse", exact: true });
+  const browseButton = page.getByRole("button", { name: "浏览", exact: true });
   await browseButton.focus();
   await page.keyboard.press("Enter");
   const browseRegion = page.getByRole("region", { name: "Memory browse" });
@@ -1091,10 +1091,10 @@ test("rebuild action is keyboard-reachable with a clear warning before the destr
 
   await page.goto("/");
 
-  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
+  const inventoryRegion = page.getByRole("region", { name: "来源清单" });
 
   // The "Rebuild index" button is keyboard-reachable.
-  const rebuildButton = inventoryRegion.getByRole("button", { name: "Rebuild index", exact: true });
+  const rebuildButton = inventoryRegion.getByRole("button", { name: "重建索引", exact: true });
   await expect(rebuildButton).toBeVisible();
   await rebuildButton.focus();
   await page.keyboard.press("Enter");
@@ -1102,14 +1102,14 @@ test("rebuild action is keyboard-reachable with a clear warning before the destr
   // The inline confirm region renders with a `role="alert"` warning BEFORE
   // any destructive call is dispatched. The warning names exactly what is
   // and is not deleted.
-  const confirmRegion = inventoryRegion.getByRole("group", { name: "Rebuild index confirmation" });
+  const confirmRegion = inventoryRegion.getByRole("group", { name: "确认重建索引" });
   await expect(confirmRegion).toBeVisible();
   const warning = confirmRegion.getByRole("alert");
   await expect(warning).toBeVisible();
-  await expect(warning).toContainText("Tessera-derived index data");
-  await expect(warning).toContainText("Confirmed sources");
-  await expect(warning).toContainText("project mappings");
-  await expect(warning).toContainText("Source files are never modified");
+  await expect(warning).toContainText("Tessera 派生索引数据");
+  await expect(warning).toContainText("已确认来源");
+  await expect(warning).toContainText("项目映射");
+  await expect(warning).toContainText("绝不会修改来源文件");
   // Focus moved into the confirm region so a keyboard user lands on the
   // warning before reaching the destructive action.
   await expect(confirmRegion).toBeFocused();
@@ -1118,7 +1118,7 @@ test("rebuild action is keyboard-reachable with a clear warning before the destr
   // pressing it (NOT the outer "Rebuild index") is what fires the call. Pin
   // zero calls before this activation.
   expect(rebuildCalls).toBe(0);
-  const rebuildNow = confirmRegion.getByRole("button", { name: "Rebuild now", exact: true });
+  const rebuildNow = confirmRegion.getByRole("button", { name: "立即重建", exact: true });
   await rebuildNow.focus();
   const rebuildResponse = page.waitForResponse(
     (response) => response.url().endsWith("/api/index/rebuild") && response.request().method() === "POST",
@@ -1127,7 +1127,7 @@ test("rebuild action is keyboard-reachable with a clear warning before the destr
   expect((await rebuildResponse).status()).toBe(200);
 
   // The polite rebuild-status region announces "Rebuilding…".
-  await expect(page.getByTestId("rebuild-status")).toContainText("Rebuilding");
+  await expect(page.getByTestId("rebuild-status")).toContainText("正在重建");
 
   // The "Rebuild now" activation dispatched exactly one rebuild call.
   expect(rebuildCalls).toBe(1);
@@ -1171,12 +1171,12 @@ test("rebuild confirm region closes on Escape without firing the destructive cal
   });
   await page.goto("/");
 
-  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
-  const rebuildButton = inventoryRegion.getByRole("button", { name: "Rebuild index", exact: true });
+  const inventoryRegion = page.getByRole("region", { name: "来源清单" });
+  const rebuildButton = inventoryRegion.getByRole("button", { name: "重建索引", exact: true });
   await rebuildButton.focus();
   await page.keyboard.press("Enter");
 
-  const confirmRegion = inventoryRegion.getByRole("group", { name: "Rebuild index confirmation" });
+  const confirmRegion = inventoryRegion.getByRole("group", { name: "确认重建索引" });
   await expect(confirmRegion).toBeVisible();
 
   // Esc closes the confirm region.
@@ -1190,7 +1190,7 @@ test("rebuild confirm region closes on Escape without firing the destructive cal
   await rebuildButton.focus();
   await page.keyboard.press("Enter");
   await expect(confirmRegion).toBeVisible();
-  const cancelButton = inventoryRegion.getByRole("button", { name: "Cancel", exact: true });
+  const cancelButton = inventoryRegion.getByRole("button", { name: "取消", exact: true });
   await cancelButton.focus();
   await page.keyboard.press("Enter");
   await expect(confirmRegion).toHaveCount(0);
@@ -1243,14 +1243,14 @@ test("rebuild 409 surfaces a safe rebuild_failed alert", async ({ page }) => {
   );
   await page.goto("/");
 
-  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
-  const rebuildButton = inventoryRegion.getByRole("button", { name: "Rebuild index", exact: true });
+  const inventoryRegion = page.getByRole("region", { name: "来源清单" });
+  const rebuildButton = inventoryRegion.getByRole("button", { name: "重建索引", exact: true });
   await rebuildButton.focus();
   await page.keyboard.press("Enter");
 
-  const confirmRegion = inventoryRegion.getByRole("group", { name: "Rebuild index confirmation" });
+  const confirmRegion = inventoryRegion.getByRole("group", { name: "确认重建索引" });
   await expect(confirmRegion).toBeVisible();
-  const rebuildNow = confirmRegion.getByRole("button", { name: "Rebuild now", exact: true });
+  const rebuildNow = confirmRegion.getByRole("button", { name: "立即重建", exact: true });
   await rebuildNow.focus();
   await page.keyboard.press("Enter");
 
@@ -1371,7 +1371,7 @@ test("browse memory-type filter is keyboard-reachable and narrows results", asyn
   await page.goto("/");
 
   // Enter Browse via keyboard.
-  const browseButton = page.getByRole("button", { name: "Browse", exact: true });
+  const browseButton = page.getByRole("button", { name: "浏览", exact: true });
   await browseButton.focus();
   await page.keyboard.press("Enter");
   const browseRegion = page.getByRole("region", { name: "Memory browse" });
@@ -1431,7 +1431,7 @@ test("browse memory-type filter is keyboard-reachable and narrows results", asyn
   const sourcesButton = breadcrumb.getByRole("button", { name: "Sources" });
   await sourcesButton.focus();
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("region", { name: "Source inventory" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "来源清单" })).toBeVisible();
 });
 
 /**
@@ -1554,10 +1554,10 @@ test("browse breadcrumb surfaces provider and native-project hierarchy and is ke
   });
 
   await page.goto("/");
-  const inventoryRegion = page.getByRole("region", { name: "Source inventory" });
+  const inventoryRegion = page.getByRole("region", { name: "来源清单" });
 
   // --- Codex branch: native_project == null → leaf says "Global memory". ---
-  const codexBrowse = inventoryRegion.locator('[data-provider="codex"]').getByRole("button", { name: "Browse", exact: true });
+  const codexBrowse = inventoryRegion.locator('[data-provider="codex"]').getByRole("button", { name: "浏览", exact: true });
   await codexBrowse.focus();
   await page.keyboard.press("Enter");
   let browseRegion = page.getByRole("region", { name: "Memory browse" });
@@ -1592,10 +1592,10 @@ test("browse breadcrumb surfaces provider and native-project hierarchy and is ke
   // returns to the Inventory.
   await sourcesButton.focus();
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("region", { name: "Source inventory" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "来源清单" })).toBeVisible();
 
   // --- Claude branch: native_project = "proj-claude" → leaf shows it verbatim. ---
-  const claudeBrowse = inventoryRegion.locator('[data-provider="claude_code"]').getByRole("button", { name: "Browse", exact: true });
+  const claudeBrowse = inventoryRegion.locator('[data-provider="claude_code"]').getByRole("button", { name: "浏览", exact: true });
   await claudeBrowse.focus();
   await page.keyboard.press("Enter");
   browseRegion = page.getByRole("region", { name: "Memory browse" });

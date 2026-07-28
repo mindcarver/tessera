@@ -89,6 +89,74 @@ pub struct StagedDiagnostic {
     pub observed_path: String,
 }
 
+/// A Knowledge record row read back for Browse (Story 6.9). Parallel to
+/// `SearchResult` but for the Knowledge domain: carries the Vault-relative
+/// path, derived excerpt, and provenance without Agent-Memory-specific fields
+/// (`native_project`, `provider_memory_type`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnowledgeRecordRow {
+    pub record_id: String,
+    /// The note's derived title (first # heading or filename stem).
+    pub title: String,
+    /// First ~320 chars of the note body (derived presentation).
+    pub excerpt: String,
+    pub provider: String,
+    pub source_id: SourceId,
+    /// Vault-relative path (the user-visible provenance + identity input).
+    pub vault_relative_path: String,
+    /// Same as vault_relative_path for Knowledge (no line-range refinement).
+    pub display_locator: String,
+    pub observed_at: i64,
+    pub coverage_level: String,
+    /// RFC 3339 source modification time when available.
+    pub modified_time: Option<String>,
+    pub health_state: HealthState,
+}
+
+/// Truncate note body to a browse-friendly excerpt (mirrors the Agent-Memory
+/// `excerpt` helper but operates on title+body for Knowledge notes).
+fn knowledge_excerpt(title: &str, body: &str) -> String {
+    let combined = if title.is_empty() {
+        body.to_string()
+    } else {
+        format!("{title}\n\n{body}")
+    };
+    let chars: Vec<char> = combined.chars().collect();
+    if chars.len() <= 320 {
+        combined
+    } else {
+        let mut s: String = chars[..320].iter().collect();
+        s.push('…');
+        s
+    }
+}
+
+/// A staged Knowledge record pending atomic generation activation (Story 6.5
+/// follow-up / Phase C.0). Mirrors [`StagedRecord`] but for the independent
+/// `knowledge_records` table (AD-19/AD-38): `krec_` identity, file-level
+/// `note` units, Vault-relative locators, Knowledge parser version, and no
+/// `native_project`/`provider_memory_type` (Obsidian Vaults have no
+/// Agent-Memory project concept). Built by the Knowledge scan pipeline from
+/// `enumerate_notes` output + per-note content hashes.
+#[derive(Debug, Clone)]
+pub struct StagedKnowledgeRecord {
+    pub record_id: String,
+    pub source_rowid: i64,
+    pub provider: String,
+    pub unit_kind: String,
+    pub native_unit_id: String,
+    pub native_locator: String,
+    pub content_hash: String,
+    pub parser_version: String,
+    pub modified_time: Option<String>,
+    /// Story 6.9 — derived presentation columns for Browse/Search.
+    pub title: String,
+    pub body: String,
+    pub display_locator: String,
+    pub observed_at: i64,
+    pub coverage_level: String,
+}
+
 /// A single row read back from `scan_runs` for status reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanRunRow {
@@ -270,8 +338,51 @@ impl<'a> ScanStore<'a> {
         tx.commit()
     }
 
-    /// Commit a staging generation as the new active generation, atomically
-    /// (AD-32).
+    /// Stage Knowledge records into the independent `knowledge_records` table
+    /// (Story 6.5 follow-up / AD-38). Mirrors [`stage_records`] but writes the
+    /// Knowledge canonical table, not `memory_records`. The composite
+    /// `(record_id, generation)` PK means the same `krec_` staged under a NEW
+    /// generation is distinct from the active generation's row — staging can
+    /// never overwrite the active Knowledge index.
+    pub fn stage_knowledge_records(
+        &self,
+        generation: &Generation,
+        records: &[StagedKnowledgeRecord],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO knowledge_records
+                    (record_id, source_id, generation, provider, unit_kind,
+                     native_unit_id, native_locator, content_hash, parser_version,
+                     modified_time, title, body, display_locator, observed_at, coverage_level)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            )?;
+            for r in records {
+                stmt.execute(params![
+                    r.record_id,
+                    r.source_rowid,
+                    generation.0,
+                    r.provider,
+                    r.unit_kind,
+                    r.native_unit_id,
+                    r.native_locator,
+                    r.content_hash,
+                    r.parser_version,
+                    r.modified_time,
+                    r.title,
+                    r.body,
+                    r.display_locator,
+                    r.observed_at,
+                    r.coverage_level,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+
     ///
     /// Single transaction:
     /// 1. **CAS UPDATE** — `SET state='succeeded', finished_at=? WHERE id=?
@@ -349,6 +460,15 @@ impl<'a> ScanStore<'a> {
         )?;
         tx.execute(
             "DELETE FROM scan_diagnostics WHERE source_id = ?1 AND generation != ?2",
+            params![source_rowid, generation.0],
+        )?;
+        // Story 6.5 follow-up: a Knowledge Source's records live in the
+        // independent `knowledge_records` table. Old generations are rebuildable
+        // derived data and must be GC'd identically (AD-2/AD-38). For an Agent
+        // Source this DELETE is a 0-row no-op (no knowledge_records rows exist
+        // for that source), and vice versa — the table partition is clean.
+        tx.execute(
+            "DELETE FROM knowledge_records WHERE source_id = ?1 AND generation != ?2",
             params![source_rowid, generation.0],
         )?;
         tx.commit()?;
@@ -702,6 +822,23 @@ impl<'a> ScanStore<'a> {
         Ok(count as u64)
     }
 
+    /// Count Knowledge records in a specific (staging) generation (Story 6.5
+    /// follow-up). Mirrors [`count_generation_records`] for the independent
+    /// `knowledge_records` table. Used by the Knowledge pipeline to report
+    /// `records_indexed` before the CAS commit.
+    pub fn count_generation_knowledge_records(
+        &self,
+        source_rowid: i64,
+        generation: &Generation,
+    ) -> rusqlite::Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_records WHERE source_id = ?1 AND generation = ?2",
+            params![source_rowid, generation.0],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// Count the records in the currently-active generation for a source
     /// (`0` when there is no active generation). Used by `get_scan_status`.
     pub fn count_active_records(&self, source_rowid: i64) -> rusqlite::Result<u64> {
@@ -715,6 +852,215 @@ impl<'a> ScanStore<'a> {
             |row| row.get(0),
         )?;
         Ok(count as u64)
+    }
+
+    /// Count active Knowledge records for a Source (Story 6.6). Mirrors
+    /// [`count_active_records`] but reads the independent `knowledge_records`
+    /// table (AD-19/AD-38), not `memory_records`. Returns 0 when the Source
+    /// has no active generation yet (never scanned).
+    pub fn count_active_knowledge_records(&self, source_rowid: i64) -> rusqlite::Result<u64> {
+        let active = self.active_generation(source_rowid)?;
+        let Some(gen) = active else {
+            return Ok(0);
+        };
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_records WHERE source_id = ?1 AND generation = ?2",
+            params![source_rowid, gen.0],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Browse Knowledge records for a single confirmed Vault (Story 6.9).
+    /// Mirrors the Agent-Memory `browse_records` shape but reads the independent
+    /// `knowledge_records` table. Single-source, query-less, no memory_type
+    /// filter (Obsidian Vaults have no Agent-Memory project/type concept).
+    /// Cursor is a simple `record_id` lexicographic "strictly-after" (the
+    /// natural ordering is by Vault-relative path, which is the display order
+    /// the user expects when browsing a Vault's notes).
+    ///
+    /// Returns `(page, has_more)` where `page` is up to `limit` records and
+    /// `has_more` indicates a next page exists (caller encodes the cursor from
+    /// the last record's `record_id`).
+    pub fn browse_knowledge_records(
+        &self,
+        source_rowid: i64,
+        limit: u32,
+        after_record_id: Option<&str>,
+    ) -> rusqlite::Result<(Vec<KnowledgeRecordRow>, bool)> {
+        let page_size = i64::try_from(limit + 1).expect("limit is bounded");
+        let cursor_present: i64 = if after_record_id.is_some() { 1 } else { 0 };
+        let cursor_id: Option<&str> = after_record_id;
+        let mut stmt = self.conn.prepare(
+            "SELECT k.record_id, k.title, k.body, k.provider, k.source_id,
+                    k.native_locator, k.display_locator, k.observed_at,
+                    k.coverage_level, k.modified_time, s.health_state
+             FROM knowledge_records k
+             JOIN source_registry s ON s.id = k.source_id
+             JOIN tessera_meta active ON active.key = ('active_generation:' || k.source_id)
+                                       AND active.value = k.generation
+             WHERE s.lifecycle_state = 'confirmed'
+               AND k.source_id = ?1
+               AND (?2 = 0 OR k.record_id > ?3)
+             ORDER BY k.native_locator ASC, k.record_id ASC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![source_rowid, cursor_present, cursor_id, page_size],
+            |row| {
+                let health: String = row.get(10)?;
+                let health_state = HealthState::parse_str(&health)
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                let title: String = row.get(1)?;
+                let body: String = row.get(2)?;
+                Ok(KnowledgeRecordRow {
+                    record_id: row.get(0)?,
+                    title: title.clone(),
+                    excerpt: knowledge_excerpt(&title, &body),
+                    provider: row.get(3)?,
+                    source_id: SourceId::from_rowid(row.get(4)?),
+                    vault_relative_path: row.get(5)?,
+                    display_locator: row.get(6)?,
+                    observed_at: row.get(7)?,
+                    coverage_level: row.get(8)?,
+                    modified_time: row.get(9)?,
+                    health_state,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        let has_more = out.len() as u32 > limit;
+        if has_more {
+            out.truncate(limit as usize);
+        }
+        Ok((out, has_more))
+    }
+
+    /// Search Knowledge records across ALL confirmed Knowledge sources with a
+    /// usable active generation (Story 6.9). Mirrors the Agent-Memory
+    /// `search_records` SQL pattern but reads `knowledge_records` and uses
+    /// simpler Knowledge-domain filters (source, folder-prefix, since).
+    ///
+    /// Keyword matching is `instr(title || char(10) || body, ?query) > 0`
+    /// (substring, no FTS5). Results are ordered by title-match rank first,
+    /// then Vault-relative path, then record_id. The cursor is a record_id
+    /// lexicographic strictly-after within the same title-match tier.
+    ///
+    /// `source_filter`: `Some(rowid)` narrows to one Vault; `None` searches all.
+    /// `folder_prefix`: `Some("Notes/sub")` narrows to notes whose
+    /// `native_locator` starts with the prefix. `since`: `Some(epoch_sec)`
+    /// filters by observed_at >= threshold.
+    pub fn search_knowledge_records(
+        &self,
+        query: &str,
+        limit: u32,
+        after_record_id: Option<&str>,
+        after_title_match: Option<bool>,
+        after_locator: Option<&str>,
+        source_filter: Option<i64>,
+        folder_prefix: Option<&str>,
+        since: Option<i64>,
+    ) -> rusqlite::Result<(Vec<KnowledgeRecordRow>, bool)> {
+        let page_size = i64::try_from(limit + 1).expect("limit is bounded");
+        // Cursor: present flag + title_match rank + record_id. The cursor
+        // encodes the last result's (title_match, record_id) so the next page
+        // continues within the correct tier. A title-match=true row sorts
+        // before title-match=false; within a tier, record_id ASC.
+        let cursor_present: i64 = if after_record_id.is_some() { 1 } else { 0 };
+        let cursor_title_rank: i64 = match after_title_match {
+            Some(true) => 0,
+            Some(false) => 1,
+            None => 0,
+        };
+        let cursor_locator: Option<&str> = after_locator;
+        let cursor_id: Option<&str> = after_record_id;
+        let source_present: i64 = if source_filter.is_some() { 1 } else { 0 };
+        let source_value: Option<i64> = source_filter;
+        let folder_present: i64 = if folder_prefix.is_some() { 1 } else { 0 };
+        // Escape LIKE wildcards (%, _) and the escape char (\) in the
+        // folder prefix so it is a literal prefix, not a wildcard pattern
+        // (review finding: folder=Notes/%25 would match everything).
+        let escaped_folder: Option<String> = folder_prefix.map(|f| {
+            f.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        });
+        let since_present: i64 = if since.is_some() { 1 } else { 0 };
+        let since_value: Option<i64> = since;
+        let mut stmt = self.conn.prepare(
+            "SELECT k.record_id, k.title, k.body, k.provider, k.source_id,
+                    k.native_locator, k.display_locator, k.observed_at,
+                    k.coverage_level, k.modified_time, s.health_state
+             FROM knowledge_records k
+             JOIN source_registry s ON s.id = k.source_id
+             JOIN tessera_meta active ON active.key = ('active_generation:' || k.source_id)
+                                       AND active.value = k.generation
+             WHERE s.lifecycle_state = 'confirmed'
+               AND instr(k.title || char(10) || k.body, ?1) > 0
+               AND (
+                   ?2 = 0
+                   OR (CASE WHEN instr(k.title, ?1) > 0 THEN 0 ELSE 1 END) > ?3
+                   OR ((CASE WHEN instr(k.title, ?1) > 0 THEN 0 ELSE 1 END) = ?3
+                       AND k.native_locator > ?4)
+                   OR ((CASE WHEN instr(k.title, ?1) > 0 THEN 0 ELSE 1 END) = ?3
+                       AND k.native_locator = ?4
+                       AND k.record_id > ?5)
+               )
+               AND (?6 = 0 OR k.source_id = ?7)
+               AND (?8 = 0 OR k.native_locator LIKE ?9 || '%' ESCAPE CHAR(92))
+               AND (?10 = 0 OR k.observed_at >= ?11)
+             ORDER BY
+               (CASE WHEN instr(k.title, ?1) > 0 THEN 0 ELSE 1 END) ASC,
+               k.native_locator ASC,
+               k.record_id ASC
+             LIMIT ?12",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                query,
+                cursor_present,
+                cursor_title_rank,
+                cursor_locator,
+                cursor_id,
+                source_present,
+                source_value,
+                folder_present,
+                escaped_folder.as_deref(),
+                since_present,
+                since_value,
+                page_size,
+            ],
+            |row| {
+                let health: String = row.get(10)?;
+                let health_state = HealthState::parse_str(&health)
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                let title: String = row.get(1)?;
+                let body: String = row.get(2)?;
+                Ok(KnowledgeRecordRow {
+                    record_id: row.get(0)?,
+                    title: title.clone(),
+                    excerpt: knowledge_excerpt(&title, &body),
+                    provider: row.get(3)?,
+                    source_id: SourceId::from_rowid(row.get(4)?),
+                    vault_relative_path: row.get(5)?,
+                    display_locator: row.get(6)?,
+                    observed_at: row.get(7)?,
+                    coverage_level: row.get(8)?,
+                    modified_time: row.get(9)?,
+                    health_state,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        let has_more = out.len() as u32 > limit;
+        if has_more {
+            out.truncate(limit as usize);
+        }
+        Ok((out, has_more))
     }
 
     /// Most recent successfully completed scan. It is intentionally separate

@@ -46,6 +46,11 @@ pub enum SourceError {
     /// A `source_id`-keyed operation targeted an id that does not match any
     /// row. Maps to stable code `source_not_found`.
     SourceNotFound,
+    /// Confirm was blocked because the candidate root overlaps an already
+    /// Confirmed Source root (Story 6.3 — contains / is-contained-by / equal).
+    /// The caller must resolve ownership explicitly before re-confirming.
+    /// Maps to stable code `root_overlap`.
+    RootOverlap,
     /// An unexpected internal error from the registry (SQLite failure). Maps
     /// to the existing stable code `internal`.
     Internal,
@@ -465,6 +470,222 @@ fn flip_lifecycle(
         Ok(None) => Err(SourceError::SourceNotFound),
         Err(_) => Err(SourceError::Internal),
     }
+}
+
+/// Discover local Obsidian Vault Candidates (Story 6.2 / Phase C.0).
+///
+/// This is the Knowledge-pipeline counterpart to [`discover_sources`], but it
+/// deliberately does NOT route through [`adapter_for`] / `ProviderAdapter`
+/// (Story 6.1 AC: "source-kind dispatch cannot route Knowledge through
+/// `ProviderAdapter`"). Knowledge Sources use an independent canonical table,
+/// identity prefix, and parser version (AD-19/AD-38); discovery is the one
+/// surface they safely share with Agent Memory because [`CandidateSource`] is
+/// generic pre-confirmation metadata, not an Agent-Memory canonical model.
+///
+/// Returns candidates plus an optional diagnostic when the Obsidian registry
+/// was missing/corrupt/unreadable (AD-37). A registry problem never blocks
+/// Agent Memory — this function is called from a separate discovery path and
+/// any error is source-scoped (AD-13).
+pub fn discover_obsidian_vaults() -> crate::adapters::obsidian::DiscoveryResult {
+    crate::adapters::obsidian::discover()
+}
+
+// ---------------------------------------------------------------------------
+// Story 6.3 — Knowledge (Obsidian Vault) confirm / reject / disable + overlap
+// ---------------------------------------------------------------------------
+
+/// The outcome of a Rust-owned native folder-picker request (Story 6.3). The
+/// browser invokes the action and receives one of these; it never submits a
+/// path, URI, or filesystem handle (AD-37).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum VaultPickerOutcome {
+    /// The user selected an existing directory. Rust has validated it is a
+    /// directory but has NOT yet confirmed it is an Obsidian Vault (no
+    /// `.obsidian` check is required for confirmation — the registry/fallback
+    /// path is the source of truth). The candidate is returned for the UI to
+    /// show a Candidate card; it is NOT auto-confirmed.
+    Selected(CandidateSource),
+    /// The user cancelled the native dialog. The UI restores focus and
+    /// persists nothing.
+    Cancelled,
+    /// The selected directory is unreadable or outside the policy boundary.
+    /// The error is safe (no path leakage beyond the already user-visible
+    /// selection).
+    Invalid,
+}
+
+/// Request the native OS folder picker for an existing Obsidian Vault
+/// (Story 6.3 AC). Rust-owned: the browser only triggers the action and
+/// receives a [`VaultPickerOutcome`]; it never supplies a path. The selected
+/// path is canonicalized and validated as an existing directory before being
+/// returned as a Candidate. No Source is persisted here — confirmation is a
+/// separate explicit step.
+pub fn request_existing_vault_picker() -> VaultPickerOutcome {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Select an existing Obsidian Vault")
+        .pick_folder()
+    else {
+        return VaultPickerOutcome::Cancelled;
+    };
+    // Canonicalize + validate as an existing directory (NFR-5/6). A selection
+    // that vanished between pick and validate, or is not a directory, is
+    // Invalid — cancellation is a distinct, user-intentional outcome.
+    let root = match policy::canonicalize_root(&path) {
+        Ok(r) => r,
+        Err(_) => return VaultPickerOutcome::Invalid,
+    };
+    let Some(path_str) = root.normalized_path.to_str() else {
+        return VaultPickerOutcome::Invalid;
+    };
+    VaultPickerOutcome::Selected(CandidateSource {
+        provider: crate::adapters::obsidian::PROVIDER_ID.to_string(),
+        root_path: path_str.to_string(),
+        basis: crate::domain::ports::provider_adapter::DiscoveryBasis::ObsidianVaultRegistry,
+        coverage_level: crate::domain::ports::provider_adapter::CoverageLevel::Full,
+        native_project: None,
+    })
+}
+
+/// Confirm an Obsidian Vault Candidate as a `local_knowledge` Source
+/// (Story 6.3). Mirrors [`confirm_source`]'s canonicalize → fingerprint →
+/// idempotent-upsert shape, but:
+/// - persists `source_kind = LocalKnowledge` (never `AgentMemory`);
+/// - does NOT route through [`adapter_for`] (Story 6.1 AC);
+/// - blocks when the candidate root overlaps an already-Confirmed Source root
+///   (Story 6.3 AC) until the user resolves ownership.
+///
+/// Overlap is detected against EVERY Confirmed Source (Knowledge and
+/// Agent-Memory alike), because two confirmed roots must never own overlapping
+/// filesystem trees (AD-4 read-boundary uniqueness).
+pub fn confirm_knowledge_source(
+    registry: &SourceRegistry<'_>,
+    candidate: &CandidateSource,
+) -> Result<Source, SourceError> {
+    // Only Obsidian/Knowledge candidates may be confirmed through this path.
+    if candidate.provider != crate::adapters::obsidian::PROVIDER_ID {
+        return Err(SourceError::ConfirmFailed);
+    }
+
+    // Step 1: canonicalize (NFR-5/6).
+    let root = policy::canonicalize_root(std::path::Path::new(&candidate.root_path))
+        .map_err(|_| SourceError::ConfirmFailed)?;
+    let normalized_str = root
+        .normalized_path
+        .to_str()
+        .ok_or(SourceError::ConfirmFailed)?;
+
+    // Step 2: build fingerprint.
+    let fingerprint = build_fingerprint(
+        &candidate.provider,
+        ROOT_KIND_DIR,
+        &root.normalized_path,
+        root.identity,
+    );
+
+    // Step 3: idempotent wake-up — if this exact fingerprint is already a row,
+    // flip it to confirmed (no overlap check needed; it IS the owner).
+    if let Some(existing) = registry
+        .find_by_fingerprint(&fingerprint)
+        .map_err(|_| SourceError::Internal)?
+    {
+        return flip_lifecycle(registry, &existing.source_id, SourceLifecycle::Confirmed);
+    }
+
+    // Step 4: overlap guard. Block if the normalized root contains, is
+    // contained by, or equals any OTHER Confirmed Source's root.
+    let confirmed = registry.list().map_err(|_| SourceError::Internal)?;
+    for other in &confirmed {
+        if other.lifecycle_state != SourceLifecycle::Confirmed {
+            continue;
+        }
+        if roots_overlap(&root.normalized_path, &other.normalized_root_path) {
+            return Err(SourceError::RootOverlap);
+        }
+    }
+
+    // Step 5: insert new local_knowledge Source.
+    let inserted = registry
+        .upsert_by_fingerprint(&SourceInsert {
+            provider: &candidate.provider,
+            source_kind: SourceKind::LocalKnowledge,
+            lifecycle_state: SourceLifecycle::Confirmed,
+            health_state: HealthState::Unknown,
+            coverage_level: candidate.coverage_level,
+            normalized_root_path: normalized_str,
+            fingerprint: &fingerprint,
+            native_project: None,
+            health_cause: HealthCause::None,
+        })
+        .map_err(|_| SourceError::Internal)?;
+    Ok(inserted)
+}
+
+/// Reject a Knowledge Vault Candidate. Symmetric idempotency with
+/// [`reject_source`]: persists a `rejected` row keyed by fingerprint so the
+/// decision survives restart. Never routes through `ProviderAdapter`.
+pub fn reject_knowledge_source(
+    registry: &SourceRegistry<'_>,
+    candidate: &CandidateSource,
+) -> Result<Source, SourceError> {
+    if candidate.provider != crate::adapters::obsidian::PROVIDER_ID {
+        return Err(SourceError::ConfirmFailed);
+    }
+    let root = policy::canonicalize_root(std::path::Path::new(&candidate.root_path))
+        .map_err(|_| SourceError::ConfirmFailed)?;
+    let fingerprint = build_fingerprint(
+        &candidate.provider,
+        ROOT_KIND_DIR,
+        &root.normalized_path,
+        root.identity,
+    );
+    if let Some(existing) = registry
+        .find_by_fingerprint(&fingerprint)
+        .map_err(|_| SourceError::Internal)?
+    {
+        return flip_lifecycle(registry, &existing.source_id, SourceLifecycle::Rejected);
+    }
+    let normalized_str = root
+        .normalized_path
+        .to_str()
+        .ok_or(SourceError::ConfirmFailed)?;
+    let inserted = registry
+        .upsert_by_fingerprint(&SourceInsert {
+            provider: &candidate.provider,
+            source_kind: SourceKind::LocalKnowledge,
+            lifecycle_state: SourceLifecycle::Rejected,
+            health_state: HealthState::Unknown,
+            coverage_level: candidate.coverage_level,
+            normalized_root_path: normalized_str,
+            fingerprint: &fingerprint,
+            native_project: None,
+            health_cause: HealthCause::None,
+        })
+        .map_err(|_| SourceError::Internal)?;
+    Ok(inserted)
+}
+
+/// Detect whether two normalized root paths overlap (one contains the other,
+/// or they are equal). Story 6.3 AC: overlapping roots cannot both be
+/// confirmed until ownership is resolved.
+///
+/// Uses component-wise comparison on the normalized paths so trailing-slash
+/// differences do not cause false negatives. Pure function — testable without
+/// a registry.
+fn roots_overlap(a: &std::path::Path, b: &str) -> bool {
+    let pa: Vec<_> = a.components().collect();
+    let pb: Vec<_> = std::path::Path::new(b).components().collect();
+    if pa == pb {
+        return true;
+    }
+    // a contains b, or b contains a.
+    contains_prefix(&pa, &pb) || contains_prefix(&pb, &pa)
+}
+
+/// True when `longer` starts with all components of `shorter` (shorter is an
+/// ancestor of longer). Equal-length prefixes that differ return false.
+fn contains_prefix(shorter: &[std::path::Component<'_>], longer: &[std::path::Component<'_>]) -> bool {
+    longer.len() > shorter.len() && longer[..shorter.len()] == *shorter
 }
 
 #[cfg(test)]

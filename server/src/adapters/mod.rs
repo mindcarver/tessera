@@ -14,3 +14,7 @@ pub mod codex;
 /// (Story 2.2 extraction). Re-exported by `codex` for backward compat; new
 /// providers import from this module directly. One parser, many version tags.
 pub mod markdown;
+/// Read-only Obsidian Vault discovery (Story 6.2, Phase C.0). Parses the host
+/// vault registry and emits `local_knowledge` Candidates. Knowledge uses an
+/// independent pipeline (AD-19/AD-38); this module is NOT a `ProviderAdapter`.
+pub mod obsidian;

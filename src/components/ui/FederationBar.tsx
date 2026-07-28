@@ -23,9 +23,9 @@ interface FederationBarProps {
 export function FederationBar({ healthy, attention, unknown = 0 }: FederationBarProps): ReactElement {
   const total = healthy + attention + unknown;
   const legend = [
-    { key: "healthy", count: healthy, label: "healthy", mod: "ok" as const },
-    { key: "attention", count: attention, label: "need attention", mod: "bad" as const },
-    { key: "unknown", count: unknown, label: "unknown", mod: "unknown" as const },
+    { key: "healthy", count: healthy, label: "个正常", mod: "ok" as const },
+    { key: "attention", count: attention, label: "个需要处理", mod: "bad" as const },
+    { key: "unknown", count: unknown, label: "个未知", mod: "unknown" as const },
   ].filter((entry) => entry.count > 0);
 
   return (
@@ -33,7 +33,7 @@ export function FederationBar({ healthy, attention, unknown = 0 }: FederationBar
       <div
         className="tsr-fed-bar"
         role="img"
-        aria-label={`${healthy} healthy, ${attention} need attention${unknown ? `, ${unknown} unknown` : ""} of ${total} sources`}
+        aria-label={`共 ${total} 个来源：${healthy} 个正常，${attention} 个需要处理${unknown ? `，${unknown} 个未知` : ""}`}
       >
         {total === 0 ? <span className="tsr-fed-bar__empty" /> : null}
         {healthy > 0 ? <span className="tsr-fed-bar__seg tsr-fed-bar__seg--ok" style={{ flexGrow: healthy }} /> : null}
@@ -44,7 +44,7 @@ export function FederationBar({ healthy, attention, unknown = 0 }: FederationBar
         {legend.map((entry) => (
           <span key={entry.key} className={`tsr-fed-legend__item tsr-fed-legend__item--${entry.mod}`}>
             <i aria-hidden="true" />
-            {entry.count} {entry.label}
+            {entry.count}{entry.label}
           </span>
         ))}
       </div>

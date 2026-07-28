@@ -68,7 +68,7 @@ impl<'a> SourceRegistry<'a> {
         ))?;
         let mut rows = stmt.query(params![fingerprint.0])?;
         match rows.next()? {
-            Some(row) => Ok(Some(row_to_source(row))),
+            Some(row) => Ok(Some(row_to_source(row)?)),
             None => Ok(None),
         }
     }
@@ -174,9 +174,11 @@ impl<'a> SourceRegistry<'a> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {SELECT_COLS} FROM source_registry ORDER BY id ASC"
         ))?;
-        // `query_map` requires a `FnMut(&Row) -> Result<T>` closure; wrap the
-        // infallible mapper so the signature matches.
-        let rows = stmt.query_map([], |row| Ok(row_to_source(row)))?;
+        // `query_map` requires a `FnMut(&Row) -> Result<T>` closure;
+        // `row_to_source` now returns `rusqlite::Result<Source>` itself
+        // (Story 6.1 fail-closed on unknown source_kind), so it composes
+        // directly.
+        let rows = stmt.query_map([], row_to_source)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -190,7 +192,7 @@ impl<'a> SourceRegistry<'a> {
         ))?;
         let mut rows = stmt.query(params![rowid])?;
         match rows.next()? {
-            Some(row) => Ok(Some(row_to_source(row))),
+            Some(row) => Ok(Some(row_to_source(row)?)),
             None => Ok(None),
         }
     }
@@ -279,10 +281,19 @@ pub struct SourceInsert<'a> {
 }
 
 /// Map a `rusqlite::Row` into a [`Source`]. Field order MUST match
-/// [`SELECT_COLS`]. Returns `Source` directly (not `Result`) so it can be used
-/// with both `query_map` (which wraps it in `Result` via the closure) and
-/// manual `next()`.
-fn row_to_source(row: &Row<'_>) -> Source {
+/// [`SELECT_COLS`]. Returns `rusqlite::Result<Source>` so that an unknown
+/// persisted `source_kind` can fail closed with a safe corruption error
+/// (Story 6.1 AC) instead of being silently coerced to `agent_memory`.
+///
+/// `source_kind` is the one field that fails hard on corruption: it selects
+/// which canonical pipeline owns the row, so silently defaulting it would
+/// route a Knowledge row through the Agent-Memory adapter (or vice versa) —
+/// a domain-boundary violation (AD-19). The other enum columns
+/// (`lifecycle_state`, `health_state`, `coverage_level`, `health_cause`) are
+/// display/scalar fields and retain their tolerant `unwrap_or` defaults: a
+/// corrupted display hint should not crash the read path, but a corrupted
+/// owning kind must.
+fn row_to_source(row: &Row<'_>) -> rusqlite::Result<Source> {
     // Columns (per SELECT_COLS): id, provider, source_kind, lifecycle_state,
     // health_state, coverage_level, normalized_root_path, fingerprint,
     // native_project, health_cause.
@@ -307,10 +318,23 @@ fn row_to_source(row: &Row<'_>) -> Source {
         .and_then(HealthCause::parse_str)
         .unwrap_or(HealthCause::None);
 
-    Source {
+    // Story 6.1 — fail closed on an unknown persisted source_kind. The
+    // application layer maps this rusqlite error to a safe `source_kind_corrupt`
+    // diagnostic; it never coerces the row into the Agent-Memory pipeline.
+    let source_kind = SourceKind::parse_str(&source_kind).ok_or_else(|| {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(format!(
+                "source_registry row id={rowid} has unrecognized source_kind {source_kind:?}; \
+                 refusing to coerce (AD-19 / Story 6.1 fail-closed)"
+            )),
+        )
+    })?;
+
+    Ok(Source {
         source_id: SourceId::from_rowid(rowid),
         provider,
-        source_kind: SourceKind::parse_str(&source_kind).unwrap_or(SourceKind::AgentMemory),
+        source_kind,
         lifecycle_state: lifecycle_from_str(&lifecycle_state).unwrap_or(SourceLifecycle::Confirmed),
         health_state: HealthState::parse_str(&health_state).unwrap_or(HealthState::Unknown),
         coverage_level: coverage_from_str(&coverage_level).unwrap_or(CoverageLevel::Full),
@@ -318,7 +342,7 @@ fn row_to_source(row: &Row<'_>) -> Source {
         native_project,
         fingerprint: SourceFingerprint(fingerprint),
         health_cause,
-    }
+    })
 }
 
 fn lifecycle_to_str(state: SourceLifecycle) -> &'static str {

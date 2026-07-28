@@ -101,15 +101,22 @@ pub enum SourceLifecycle {
     Rejected,
 }
 
-/// Domain kind of a Source (AD-10/A-19). MVP ships only Agent Memory; future
-/// Knowledge Source kinds (`local_knowledge`, `remote_knowledge`) get their
-/// own namespace, identity prefix, parser and migration history and must NOT
-/// alias Agent Memory canonical schema (AD-19).
+/// Domain kind of a Source (AD-10/A-19). Each kind gets its own namespace,
+/// identity prefix, parser and migration history and must NOT alias another
+/// kind's canonical schema (AD-19). Phase A ships Agent Memory; Phase C.0
+/// (Story 6.1) activates Local Knowledge (Obsidian Vaults). `remote_knowledge`
+/// remains deferred and is intentionally absent so it cannot be persisted by
+/// accident — adding it requires a new migration and explicit registry wiring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
-    /// Codex / Claude Code auto-generated Agent Memory. The only MVP value.
+    /// Codex / Claude Code auto-generated Agent Memory. The Phase A value.
     AgentMemory,
+    /// Local, read-only Knowledge Source (Phase C.0 — Obsidian Vaults). Uses
+    /// an independent `knowledge_records` canonical table, `krec_` identity
+    /// prefix, and its own parser version (AD-19/AD-38). It does NOT reuse
+    /// `memory_records`, `rec_`, or `native_project`.
+    LocalKnowledge,
 }
 
 impl SourceKind {
@@ -117,18 +124,30 @@ impl SourceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             SourceKind::AgentMemory => "agent_memory",
+            SourceKind::LocalKnowledge => "local_knowledge",
         }
     }
 
     /// Parse the stable wire string back. Returns `None` on an unknown value
     /// so the registry layer can surface corruption rather than silently
-    /// coerce. Named `parse_str` (not `from_str`) to avoid clashing with the
+    /// coerce (Story 6.1 AC: unknown persisted source kinds fail closed).
+    /// Named `parse_str` (not `from_str`) to avoid clashing with the
     /// `std::str::FromStr` trait method.
     pub fn parse_str(s: &str) -> Option<Self> {
         match s {
             "agent_memory" => Some(SourceKind::AgentMemory),
+            "local_knowledge" => Some(SourceKind::LocalKnowledge),
             _ => None,
         }
+    }
+
+    /// Whether this kind is routed through the Agent-Memory `ProviderAdapter`
+    /// pipeline (`memory_records` / `rec_`). Knowledge Sources use an
+    /// independent pipeline and must never be dispatched through
+    /// `ProviderAdapter` (Story 6.1 AC: "source-kind dispatch cannot route
+    /// Knowledge through `ProviderAdapter`").
+    pub fn is_agent_memory(self) -> bool {
+        matches!(self, SourceKind::AgentMemory)
     }
 }
 
@@ -646,7 +665,46 @@ mod tests {
             SourceKind::parse_str("agent_memory"),
             Some(SourceKind::AgentMemory)
         );
+        // Story 6.1 — Local Knowledge (Obsidian) is now a persisted kind.
+        assert_eq!(SourceKind::LocalKnowledge.as_str(), "local_knowledge");
+        assert_eq!(
+            SourceKind::parse_str("local_knowledge"),
+            Some(SourceKind::LocalKnowledge)
+        );
         assert_eq!(SourceKind::parse_str("nope"), None);
+        // remote_knowledge is deferred: it must NOT parse (no accidental
+        // persistence before its migration/namespace exist).
+        assert_eq!(SourceKind::parse_str("remote_knowledge"), None);
+    }
+
+    /// Story 6.1 — serde wire string and `as_str` persistence string MUST be
+    /// identical for every variant, or round-tripping through `parse_str`
+    /// breaks (same invariant `health_cause_serde_matches_as_str_for_every_variant`
+    /// pins for HealthCause).
+    #[test]
+    fn source_kind_serde_matches_as_str_for_every_variant() {
+        for kind in [SourceKind::AgentMemory, SourceKind::LocalKnowledge] {
+            let serde_str = serde_json::to_string(&kind)
+                .expect("serde_json::to_string")
+                .trim_matches('"')
+                .to_string();
+            assert_eq!(
+                serde_str,
+                kind.as_str(),
+                "serde wire string {:?} != as_str {:?} for {:?} — round-trip would break",
+                serde_str,
+                kind.as_str(),
+                kind,
+            );
+        }
+    }
+
+    /// Story 6.1 — only Agent Memory routes through `ProviderAdapter`;
+    /// Local Knowledge uses an independent pipeline.
+    #[test]
+    fn source_kind_is_agent_memory_partition() {
+        assert!(SourceKind::AgentMemory.is_agent_memory());
+        assert!(!SourceKind::LocalKnowledge.is_agent_memory());
     }
 
     #[test]

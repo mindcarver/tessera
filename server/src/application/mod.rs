@@ -30,8 +30,9 @@ pub mod source;
 // Re-export so IPC and lib.rs can name `application::discover_sources` etc.
 // without a path change from 1.2.
 pub use source::{
-    confirm_source, disable_source, discover_sources, list_sources, native_project_for_root,
-    rebind_source, reject_source, SourceError,
+    confirm_knowledge_source, confirm_source, disable_source, discover_obsidian_vaults,
+    discover_sources, list_sources, native_project_for_root, rebind_source, reject_knowledge_source,
+    reject_source, request_existing_vault_picker, SourceError, VaultPickerOutcome,
 };
 
 // Story 5.1 — Tessera Project orchestration. Re-exported so IPC and tests
@@ -52,12 +53,12 @@ pub use rebuild::{rebuild_index, RebuildError};
 pub use open::{
     open_original_location, reset_open_path_for_tests, set_open_path_for_tests, OpenError,
 };
-pub use query::{browse, search};
+pub use query::{browse, browse_knowledge, search, search_knowledge};
 pub use reconcile::{
     reserve_run, trigger_reconcile, HintQueue, ReconcileConfig, ReconcileSupervisor, TriggerError,
     DEFAULT_DEBOUNCE, DEFAULT_PERIOD,
 };
 pub use scan::{
-    cancel_rescan, get_scan_status, list_inventory, recover_scans, scan_reserved_source,
-    scan_source, scan_source_with,
+    cancel_rescan, get_scan_status, list_inventory, list_knowledge_inventory, recover_scans,
+    scan_reserved_source, scan_source, scan_source_with,
 };

@@ -11,7 +11,7 @@
  */
 import type { ReactElement } from "react";
 
-type NavId = "inventory" | "projects" | "search";
+type NavId = "inventory" | "knowledge" | "projects" | "search";
 
 interface NavItem {
   id: NavId;
@@ -20,7 +20,8 @@ interface NavItem {
 }
 
 const NAV: readonly NavItem[] = [
-  { id: "inventory", label: "Inventory", href: "#tessera-sources" },
+  { id: "inventory", label: "来源", href: "#tessera-sources" },
+  { id: "knowledge", label: "知识库", href: "#tessera-obsidian" },
   { id: "projects", label: "Projects", href: "#tessera-projects" },
   { id: "search", label: "Search", href: "#tessera-search" },
 ];

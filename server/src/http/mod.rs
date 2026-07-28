@@ -37,7 +37,7 @@ use std::sync::MutexGuard;
 
 use crate::application;
 use crate::application::query::QueryError;
-use crate::application::{OpenError, ProjectError, SourceError};
+use crate::application::{OpenError, ProjectError, SourceError, VaultPickerOutcome};
 use crate::domain::open::{OpenRequest, OpenResult};
 use crate::domain::project::{
     CreateProjectRequest, DeleteProjectRequest, DeleteProjectResponse, MappingRequest,
@@ -107,6 +107,43 @@ fn wrap_discover(candidates: Vec<CandidateSource>) -> Envelope<Vec<CandidateSour
     }
 }
 
+/// Story 6.2 — Knowledge (Obsidian Vault) discovery response payload. Carries
+/// the candidate vaults plus a stable diagnostic code when the Obsidian
+/// registry was missing/corrupt/unreadable (AD-37), so the UI can distinguish
+/// "no vaults registered" from "registry unreadable" without a silent empty
+/// set.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KnowledgeDiscoveryPayload {
+    pub candidates: Vec<CandidateSource>,
+    /// Stable snake_case wire string (`registry_missing` / `registry_unreadable`
+    /// / `registry_corrupt`), or `None` when the registry parsed cleanly.
+    pub diagnostic: Option<String>,
+}
+
+/// Story 6.2 — discover registered Obsidian Vaults. Routes through the
+/// independent Knowledge pipeline (`discover_obsidian_vaults`), never through
+/// `ProviderAdapter` (Story 6.1 AC).
+pub fn discover_knowledge_sources() -> Envelope<KnowledgeDiscoveryPayload> {
+    let result = application::discover_obsidian_vaults();
+    let diagnostic = result.diagnostic.map(|d| {
+        let code = match d {
+            crate::adapters::obsidian::RegistryDiagnostic::RegistryMissing => "registry_missing",
+            crate::adapters::obsidian::RegistryDiagnostic::RegistryUnreadable => {
+                "registry_unreadable"
+            }
+            crate::adapters::obsidian::RegistryDiagnostic::RegistryCorrupt => "registry_corrupt",
+        };
+        code.to_string()
+    });
+    Envelope {
+        api_version: API_VERSION,
+        payload: KnowledgeDiscoveryPayload {
+            candidates: result.candidates,
+            diagnostic,
+        },
+    }
+}
+
 // --- Story 1.3: confirm / reject / disable / list -------------------------
 //
 // These four handlers share the same shape: they take a typed input (a
@@ -164,6 +201,53 @@ pub fn reject_source(
     drop(conn);
     stop_watch_best_effort(state, &source.source_id);
     Ok(wrap_source(source))
+}
+
+// --- Story 6.3: Knowledge (Obsidian Vault) confirm / reject / picker --------
+//
+// Independent pipeline (AD-19): routes through confirm_knowledge_source /
+// reject_knowledge_source, never through ProviderAdapter (6.1 AC). The picker
+// is Rust-owned: the browser only triggers the action and receives a
+// VaultPickerOutcome; it never submits a path, URI, or filesystem handle.
+
+/// `confirm_knowledge_source` — confirm an Obsidian Vault as a
+/// `local_knowledge` Source (Story 6.3). Blocks on root overlap with
+/// `root_overlap`.
+pub fn confirm_knowledge_source(
+    candidate: &CandidateSource,
+    state: &IndexState,
+) -> Result<Envelope<Source>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let source = application::confirm_knowledge_source(&registry, candidate)
+        .map_err(|err| map_source_error(err, None))?;
+    drop(conn);
+    start_watch_best_effort(state, &source.source_id, &source.normalized_root_path);
+    Ok(wrap_source(source))
+}
+
+/// `reject_knowledge_source` — reject an Obsidian Vault Candidate (Story 6.3).
+pub fn reject_knowledge_source(
+    candidate: &CandidateSource,
+    state: &IndexState,
+) -> Result<Envelope<Source>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let source = application::reject_knowledge_source(&registry, candidate)
+        .map_err(|err| map_source_error(err, None))?;
+    drop(conn);
+    stop_watch_best_effort(state, &source.source_id);
+    Ok(wrap_source(source))
+}
+
+/// `request_vault_picker` — trigger the Rust-owned native OS folder picker
+/// (Story 6.3). The browser receives a `VaultPickerOutcome`; it never supplies
+/// a path. Returns the versioned envelope wrapping the outcome.
+pub fn request_vault_picker() -> Envelope<VaultPickerOutcome> {
+    Envelope {
+        api_version: API_VERSION,
+        payload: application::request_existing_vault_picker(),
+    }
 }
 
 /// `disable_source` — disable a confirmed Source by `source_id` (AD-4: only
@@ -327,6 +411,67 @@ pub fn browse(
     })
 }
 
+/// `GET /api/knowledge/browse?source=<src_n>&limit=<n>&cursor=<kb.xxx>` —
+/// browse Knowledge notes for a single confirmed Vault (Story 6.9). Routes
+/// through the independent Knowledge pipeline.
+pub fn browse_knowledge(
+    source_id: &str,
+    limit: u32,
+    cursor: Option<&str>,
+    state: &IndexState,
+) -> Result<Envelope<crate::application::query::KnowledgeBrowsePage>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let source_id = SourceId(source_id.to_string());
+    let page =
+        application::browse_knowledge(&registry, &conn, &source_id, limit, cursor).map_err(
+            |error| match error {
+                QueryError::BadRequest => ErrorEnvelope::bad_request("knowledge_browse"),
+                QueryError::CursorStale => ErrorEnvelope::cursor_stale("knowledge_browse"),
+                QueryError::Internal => ErrorEnvelope::internal_for(None, "knowledge_browse"),
+            },
+        )?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: page,
+    })
+}
+
+/// `GET /api/knowledge/search?q=&limit=&cursor=&source=&folder=&since=` —
+/// keyword-search Knowledge notes across all confirmed Vaults (Story 6.9).
+pub fn search_knowledge(
+    query: &str,
+    limit: u32,
+    cursor: Option<&str>,
+    source: Option<&str>,
+    folder: Option<&str>,
+    since: Option<i64>,
+    state: &IndexState,
+) -> Result<Envelope<crate::application::query::KnowledgeSearchPage>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let source_id = source.map(|s| SourceId(s.to_string()));
+    let page = application::search_knowledge(
+        &registry,
+        &conn,
+        query,
+        limit,
+        cursor,
+        source_id.as_ref(),
+        folder,
+        since,
+    )
+    .map_err(|error| match error {
+        QueryError::BadRequest => ErrorEnvelope::bad_request("knowledge_search"),
+        QueryError::CursorStale => ErrorEnvelope::cursor_stale("knowledge_search"),
+        QueryError::Internal => ErrorEnvelope::internal_for(None, "knowledge_search"),
+    })?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: page,
+    })
+}
+
 pub fn open_original_location(
     request: OpenRequest,
     state: &IndexState,
@@ -349,6 +494,23 @@ pub fn source_inventory(
     let registry = SourceRegistry::new(&conn);
     let inventory = application::list_inventory(&registry, &conn)
         .map_err(|_| ErrorEnvelope::internal_for(None, "inventory"))?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: inventory,
+    })
+}
+
+/// `GET /api/knowledge/inventory` — Knowledge (Obsidian Vault) Inventory
+/// (Story 6.6). One row per confirmed local_knowledge Source, with supported-
+/// note count, coverage, health, last-success scan, stale state, and safe
+/// latest error. Agent-Memory Sources are never included (AD-19).
+pub fn knowledge_inventory(
+    state: &IndexState,
+) -> Result<Envelope<Vec<crate::domain::scan::KnowledgeInventory>>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let inventory = application::list_knowledge_inventory(&registry, &conn)
+        .map_err(|_| ErrorEnvelope::internal_for(None, "knowledge_inventory"))?;
     Ok(Envelope {
         api_version: API_VERSION,
         payload: inventory,
@@ -879,6 +1041,7 @@ fn map_source_error(err: SourceError, source_id: Option<&str>) -> ErrorEnvelope 
     match err {
         SourceError::ConfirmFailed => ErrorEnvelope::confirm_failed(source_id, "source"),
         SourceError::SourceNotFound => ErrorEnvelope::source_not_found(source_id, "source"),
+        SourceError::RootOverlap => ErrorEnvelope::root_overlap(source_id, "source"),
         SourceError::Internal => ErrorEnvelope::internal_for(source_id, "source"),
     }
 }

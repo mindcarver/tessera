@@ -258,6 +258,71 @@ fn own_loopback_origin_is_accepted() {
     );
 }
 
+/// Story 6.2 — the Knowledge (Obsidian Vault) discovery endpoint is on the wire
+/// with the versioned envelope and the `{candidates, diagnostic}` payload
+/// shape. The endpoint reads the host's real registry, so the candidate count
+/// varies by host; we assert the structural contract (envelope + payload keys +
+/// provider id for any candidate present) rather than a fixed count.
+#[test]
+fn knowledge_discover_endpoint_returns_versioned_envelope_with_diagnostic_field() {
+    let port = boot_test_server();
+    let response = raw_http(
+        port,
+        &format!(
+            "GET /api/knowledge/discover HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    assert!(
+        response.contains("\"api_version\":\"1\""),
+        "got:\n{response}"
+    );
+    let body = response.split("\r\n\r\n").nth(1).expect("knowledge body");
+    let page: serde_json::Value = serde_json::from_str(body).expect("versioned knowledge JSON");
+    // The payload MUST carry both keys regardless of host state.
+    assert!(
+        page["payload"]["candidates"].is_array(),
+        "candidates must be an array; got: {body}"
+    );
+    assert!(
+        page["payload"].get("diagnostic").is_some(),
+        "diagnostic key must be present (null when registry is clean); got: {body}"
+    );
+    // Every candidate, if any, is an Obsidian local_knowledge candidate.
+    for c in page["payload"]["candidates"].as_array().unwrap() {
+        assert_eq!(c["provider"], "obsidian", "got: {body}");
+        assert_eq!(c["basis"], "obsidian_vault_registry", "got: {body}");
+    }
+}
+
+/// Story 6.6 — the Knowledge Inventory endpoint returns a versioned envelope
+/// with one row per confirmed local_knowledge Source, and never includes
+/// Agent-Memory Sources (AD-19). On a fresh scratch DB with no Knowledge
+/// Sources, it returns an empty array (honest empty state).
+#[test]
+fn knowledge_inventory_endpoint_returns_versioned_envelope_empty_on_fresh_db() {
+    let port = boot_test_server();
+    let response = raw_http(
+        port,
+        &format!(
+            "GET /api/knowledge/inventory HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    let body = response.split("\r\n\r\n").nth(1).expect("inventory body");
+    let page: serde_json::Value = serde_json::from_str(body).expect("versioned inventory JSON");
+    assert_eq!(page["api_version"], "1");
+    assert!(
+        page["payload"].is_array(),
+        "inventory payload must be an array; got: {body}"
+    );
+    assert_eq!(
+        page["payload"].as_array().unwrap().len(),
+        0,
+        "fresh DB has no Knowledge Sources; got: {body}"
+    );
+}
+
 /// A malformed JSON body on a `source_id` endpoint surfaces `bad_request`,
 /// never an internal error or a panic (AD-13/AD-17 bounded contracts).
 #[test]

@@ -169,6 +169,13 @@ pub enum DiscoveryBasis {
     /// the `projects/*` candidates by canonicalized path. Invalid / missing /
     /// unparseable values safe-degrade to no candidate.
     ClaudeAutoMemoryDir,
+    /// Candidate discovered via the Obsidian vault registry
+    /// (`~/Library/Application Support/obsidian/obsidian.json` on macOS). One
+    /// candidate per registered vault whose root currently exists. Story 6.2 —
+    /// see `adapters::obsidian`. The registry is an observed surface, not a
+    /// stable API (AD-37); a missing/corrupt registry produces a visible
+    /// diagnostic rather than a silently-empty set.
+    ObsidianVaultRegistry,
 }
 
 /// Candidate Source metadata produced by discovery (AD-4 / Story 1.2).
