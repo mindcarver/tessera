@@ -2,7 +2,7 @@
 title: 'Knowledge Search: cross-vault keyword search'
 type: 'feature'
 created: '2026-07-28'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: 'd418597'
 context:
@@ -92,3 +92,37 @@ The search SQL mirrors the Agent-Memory `search_records` pattern but simplified 
 - `cargo test --manifest-path server/Cargo.toml` -- all suites green, new knowledge_scan search tests pass
 - `REAL_VAULTS=1 cargo test --manifest-path server/Cargo.toml --test obsidian_real_e2e -- --nocapture` -- real-vault scan + search smoke (optional)
 - `npm run build` -- frontend compiles
+
+## Suggested Review Order
+
+**Search query + cursor orchestration**
+
+- Entry point: search_knowledge orchestrator — scope hash, cursor decode/encode, empty state
+  [`query.rs:800`](../../server/src/application/query.rs#L800)
+
+- Core SQL: instr() substring match, 3-key cursor predicate, folder LIKE with ESCAPE
+  [`scan_store.rs:956`](../../server/src/index/scan_store.rs#L956)
+
+- HTTP route + query param parser (percent-decode, limit/since, bad_request)
+  [`server.rs:353`](../../server/src/http/server.rs#L353)
+
+**Review hardening**
+
+- Cursor \x1f delimiter + scope hash (filter-swap detection)
+  [`query.rs:825`](../../server/src/application/query.rs#L825)
+
+- LIKE wildcard escaping (folder_prefix % and _ are literal)
+  [`scan_store.rs:988`](../../server/src/index/scan_store.rs#L988)
+
+**Frontend**
+
+- Search input + results view with vault-name labels + pagination
+  [`Obsidian.tsx:248`](../../src/features/obsidian/Obsidian.tsx#L248)
+
+- Typed API client with envelope validation
+  [`obsidian.ts:375`](../../src/api/obsidian.ts#L375)
+
+**Tests**
+
+- 12 search tests: cross-vault, filters, empty states, pagination, LIKE escaping, title_match
+  [`knowledge_scan.rs:282`](../../server/tests/knowledge_scan.rs#L282)
