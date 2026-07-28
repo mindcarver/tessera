@@ -73,7 +73,7 @@ fn confirm_real_vault_then_it_appears_in_knowledge_inventory() {
     assert_eq!(confirm["payload"]["provider"], "obsidian");
     assert_eq!(confirm["payload"]["lifecycle_state"], "confirmed");
 
-    // 3. Knowledge Inventory now lists dev-repo.
+    // 3. Knowledge Inventory now lists dev-repo (before scan: count is null).
     let inv_body = http_get(port, "/api/knowledge/inventory");
     let inv: serde_json::Value = serde_json::from_str(&inv_body).expect("inventory json");
     let rows = inv["payload"].as_array().expect("inventory array");
@@ -81,11 +81,82 @@ fn confirm_real_vault_then_it_appears_in_knowledge_inventory() {
     assert_eq!(rows[0]["vault_name"], "dev-repo");
     assert_eq!(rows[0]["provider"], "obsidian");
     assert_eq!(rows[0]["lifecycle_state"], "confirmed");
-    // Note count is null until the staging write path lands (out-of-slice);
-    // the Inventory must NOT fabricate a number.
+    let source_id = rows[0]["source_id"].as_str().expect("source_id").to_string();
+
+    // Before scanning, note count is null (not scanned, not a fabricated zero).
     assert!(
         rows[0]["complete_note_count"].is_null(),
-        "note count must be null (staging not wired), not fabricated; got: {inv_body}"
+        "pre-scan count must be null, not fabricated; got: {inv_body}"
     );
-    println!("e2e OK: confirmed dev-repo, appears in Knowledge Inventory: {inv_body}");
+
+    // 4. Scan the vault through the scan endpoint (routes by source_kind).
+    let scan_body = http_post(port, "/api/scan", &format!(r#"{{"source_id":"{source_id}"}}"#));
+    let scan: serde_json::Value = serde_json::from_str(&scan_body).expect("scan json");
+    // scan_source returns the outcome directly (not nested under a job for the
+    // synchronous path). The records_indexed should match the ground truth.
+    let indexed = scan["payload"]["records_indexed"].as_u64().or_else(|| {
+        // Some scan paths return the outcome nested; check both shapes.
+        scan["records_indexed"].as_u64()
+    });
+    assert!(
+        indexed.is_some(),
+        "scan must report records_indexed; got: {scan_body}"
+    );
+
+    // 5. Knowledge Inventory now shows the real note count.
+    let inv2_body = http_get(port, "/api/knowledge/inventory");
+    let inv2: serde_json::Value = serde_json::from_str(&inv2_body).expect("inventory json");
+    let count = inv2["payload"][0]["complete_note_count"]
+        .as_u64()
+        .or_else(|| inv2["payload"][0]["complete_note_count"].as_f64().map(|f| f as u64))
+        .unwrap_or(0);
+    assert!(
+        count >= 1,
+        "post-scan count must show real notes (>= 1); got: {inv2_body}"
+    );
+    println!(
+        "e2e OK: confirmed + scanned dev-repo, note count = {count}"
+    );
+}
+
+/// Scan the 91ai vault (932 notes) to confirm the pipeline handles real scale.
+#[test]
+fn scan_real_91ai_vault_reports_note_count() {
+    if std::env::var("REAL_VAULTS").map(|v| v != "1").unwrap_or(true) {
+        eprintln!("skipping real 91ai test (set REAL_VAULTS=1)");
+        return;
+    }
+    let (port, _state) = boot_server();
+    // Confirm 91ai directly.
+    let candidate = serde_json::json!({
+        "provider": "obsidian",
+        "root_path": "/Users/carver/workspace/mindcarver/91ai",
+        "basis": "obsidian_vault_registry",
+        "coverage_level": "full",
+        "native_project": null,
+    });
+    let confirm_body = http_post(
+        port,
+        "/api/knowledge/confirm",
+        &format!(r#"{{"candidate":{candidate}}}"#),
+    );
+    let confirm: serde_json::Value = serde_json::from_str(&confirm_body).expect("confirm");
+    let source_id = confirm["payload"]["source_id"]
+        .as_str()
+        .expect("source_id")
+        .to_string();
+    // Scan it.
+    let scan_body = http_post(port, "/api/scan", &format!(r#"{{"source_id":"{source_id}"}}"#));
+    let scan: serde_json::Value = serde_json::from_str(&scan_body).expect("scan json");
+    let indexed = scan["payload"]["records_indexed"].as_u64().expect("records_indexed");
+    assert_eq!(indexed, 932, "91ai must index 932 notes; got {scan_body}");
+    // Inventory shows the real count.
+    let inv_body = http_get(port, "/api/knowledge/inventory");
+    let inv: serde_json::Value = serde_json::from_str(&inv_body).expect("inventory");
+    let count = inv["payload"][0]["complete_note_count"]
+        .as_u64()
+        .or_else(|| inv["payload"][0]["complete_note_count"].as_f64().map(|f| f as u64))
+        .unwrap_or(0);
+    assert_eq!(count, 932, "Inventory shows 932; got {inv_body}");
+    println!("e2e OK: scanned 91ai, note count = {count}");
 }

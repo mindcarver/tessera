@@ -89,6 +89,26 @@ pub struct StagedDiagnostic {
     pub observed_path: String,
 }
 
+/// A staged Knowledge record pending atomic generation activation (Story 6.5
+/// follow-up / Phase C.0). Mirrors [`StagedRecord`] but for the independent
+/// `knowledge_records` table (AD-19/AD-38): `krec_` identity, file-level
+/// `note` units, Vault-relative locators, Knowledge parser version, and no
+/// `native_project`/`provider_memory_type` (Obsidian Vaults have no
+/// Agent-Memory project concept). Built by the Knowledge scan pipeline from
+/// `enumerate_notes` output + per-note content hashes.
+#[derive(Debug, Clone)]
+pub struct StagedKnowledgeRecord {
+    pub record_id: String,
+    pub source_rowid: i64,
+    pub provider: String,
+    pub unit_kind: String,
+    pub native_unit_id: String,
+    pub native_locator: String,
+    pub content_hash: String,
+    pub parser_version: String,
+    pub modified_time: Option<String>,
+}
+
 /// A single row read back from `scan_runs` for status reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanRunRow {
@@ -270,8 +290,46 @@ impl<'a> ScanStore<'a> {
         tx.commit()
     }
 
-    /// Commit a staging generation as the new active generation, atomically
-    /// (AD-32).
+    /// Stage Knowledge records into the independent `knowledge_records` table
+    /// (Story 6.5 follow-up / AD-38). Mirrors [`stage_records`] but writes the
+    /// Knowledge canonical table, not `memory_records`. The composite
+    /// `(record_id, generation)` PK means the same `krec_` staged under a NEW
+    /// generation is distinct from the active generation's row — staging can
+    /// never overwrite the active Knowledge index.
+    pub fn stage_knowledge_records(
+        &self,
+        generation: &Generation,
+        records: &[StagedKnowledgeRecord],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO knowledge_records
+                    (record_id, source_id, generation, provider, unit_kind,
+                     native_unit_id, native_locator, content_hash, parser_version,
+                     modified_time)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for r in records {
+                stmt.execute(params![
+                    r.record_id,
+                    r.source_rowid,
+                    generation.0,
+                    r.provider,
+                    r.unit_kind,
+                    r.native_unit_id,
+                    r.native_locator,
+                    r.content_hash,
+                    r.parser_version,
+                    r.modified_time,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+
     ///
     /// Single transaction:
     /// 1. **CAS UPDATE** — `SET state='succeeded', finished_at=? WHERE id=?
@@ -349,6 +407,15 @@ impl<'a> ScanStore<'a> {
         )?;
         tx.execute(
             "DELETE FROM scan_diagnostics WHERE source_id = ?1 AND generation != ?2",
+            params![source_rowid, generation.0],
+        )?;
+        // Story 6.5 follow-up: a Knowledge Source's records live in the
+        // independent `knowledge_records` table. Old generations are rebuildable
+        // derived data and must be GC'd identically (AD-2/AD-38). For an Agent
+        // Source this DELETE is a 0-row no-op (no knowledge_records rows exist
+        // for that source), and vice versa — the table partition is clean.
+        tx.execute(
+            "DELETE FROM knowledge_records WHERE source_id = ?1 AND generation != ?2",
             params![source_rowid, generation.0],
         )?;
         tx.commit()?;
@@ -696,6 +763,23 @@ impl<'a> ScanStore<'a> {
     ) -> rusqlite::Result<u64> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM memory_records WHERE source_id = ?1 AND generation = ?2",
+            params![source_rowid, generation.0],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Count Knowledge records in a specific (staging) generation (Story 6.5
+    /// follow-up). Mirrors [`count_generation_records`] for the independent
+    /// `knowledge_records` table. Used by the Knowledge pipeline to report
+    /// `records_indexed` before the CAS commit.
+    pub fn count_generation_knowledge_records(
+        &self,
+        source_rowid: i64,
+        generation: &Generation,
+    ) -> rusqlite::Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_records WHERE source_id = ?1 AND generation = ?2",
             params![source_rowid, generation.0],
             |row| row.get(0),
         )?;

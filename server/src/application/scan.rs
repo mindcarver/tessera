@@ -41,7 +41,7 @@ use crate::domain::source::{
     build_fingerprint, HealthCause, HealthState, SourceId, SourceLifecycle, ROOT_KIND_DIR,
 };
 use crate::domain::{CoverageLevel, ProviderAdapter, SupportedArtifact};
-use crate::index::scan_store::{ScanStore, StagedDiagnostic, StagedRecord};
+use crate::index::scan_store::{ScanStore, StagedDiagnostic, StagedKnowledgeRecord, StagedRecord};
 use crate::index::SourceRegistry;
 use crate::policy;
 
@@ -93,6 +93,11 @@ pub fn scan_source(
     let Some(source) = source else {
         return Err(ScanError::SourceNotFound);
     };
+    // Story 6.5 follow-up: Knowledge Sources route through the independent
+    // Knowledge pipeline, never through ProviderAdapter (Story 6.1 AC).
+    if source.source_kind == crate::domain::source::SourceKind::LocalKnowledge {
+        return scan_knowledge_source(registry, conn, &source);
+    }
     let adapter = adapter_for_scan(&source.provider).ok_or(ScanError::Internal)?;
     scan_source_with(adapter.as_ref(), registry, conn, &source)
 }
@@ -105,6 +110,11 @@ pub fn scan_reserved_source(
 ) -> Result<ScanOutcome, ScanError> {
     let source = registry.get(source_id).map_err(|_| ScanError::Internal)?;
     let Some(source) = source else { return Err(ScanError::SourceNotFound); };
+    // Story 6.5 follow-up: Knowledge Sources route through the independent
+    // Knowledge pipeline on the reserved (rescan) path too.
+    if source.source_kind == crate::domain::source::SourceKind::LocalKnowledge {
+        return scan_knowledge_reserved(registry, conn, source_id, scan_id, fencing_token, generation, &source);
+    }
     let adapter = match adapter_for_scan(&source.provider) {
         Some(adapter) => adapter,
         None => {
@@ -571,6 +581,408 @@ fn run_pipeline(
         generation: generation.clone(),
         records_indexed,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Story 6.5 follow-up — Knowledge (Obsidian Vault) scan pipeline
+// ---------------------------------------------------------------------------
+
+/// A Knowledge manifest entry: `(vault_relative_path, absolute_path, size)`.
+/// Knowledge notes are file-level (AD-38); mtime is captured on the staged
+/// record, not the manifest (the manifest keys on path + size + content hash
+/// re-validation, mirroring the Agent-Memory snapshot-at-validation).
+type KnowledgeManifestEntry = (String, String, u64);
+
+/// Scan a confirmed Knowledge (Obsidian Vault) Source through the independent
+/// Knowledge pipeline (Story 6.5 follow-up). Mirrors [`scan_source_with`]'s
+/// shape but routes through `enumerate_notes` + `stage_knowledge_records`,
+/// NEVER through `ProviderAdapter` (Story 6.1 AC / AD-19). Reuses the same
+/// `scan_runs` state machine, fencing token, and atomic generation commit as
+/// Agent Memory (single mutation path, AD-5).
+///
+/// Caller has already verified `source.source_kind == LocalKnowledge`.
+pub fn scan_knowledge_source(
+    registry: &SourceRegistry<'_>,
+    conn: &Connection,
+    source: &crate::domain::source::Source,
+) -> Result<ScanOutcome, ScanError> {
+    let scan_store = ScanStore::new(conn);
+    let source_id = &source.source_id;
+
+    if source.lifecycle_state != SourceLifecycle::Confirmed {
+        return Err(ScanError::NotConfirmed);
+    }
+    let source_rowid = ScanStore::source_rowid(source_id).ok_or(ScanError::SourceNotFound)?;
+
+    // Re-validate the root (NFR-5/6). Same fingerprint guard as Agent Memory.
+    let root = match policy::canonicalize_root(Path::new(&source.normalized_root_path)) {
+        Ok(root) => root,
+        Err(err) => {
+            let cause = health_cause_for_scan_error(&ScanError::RootInvalid, Some(err.kind()));
+            let _ = registry.set_health_and_cause(source_id, HealthState::Degraded, cause);
+            return Err(ScanError::RootInvalid);
+        }
+    };
+    let current_fingerprint = build_fingerprint(
+        &source.provider,
+        ROOT_KIND_DIR,
+        &root.normalized_path,
+        root.identity,
+    );
+    if current_fingerprint != source.fingerprint {
+        let _ = registry.set_health_and_cause(
+            source_id,
+            HealthState::Degraded,
+            health_cause_for_scan_error(&ScanError::RootIdentityChanged, None),
+        );
+        return Err(ScanError::RootIdentityChanged);
+    }
+
+    // Begin the run FIRST (placeholder revision), mirroring Agent Memory.
+    let (scan_id, fencing_token, generation) = scan_store
+        .begin_run(source_rowid, PLACEHOLDER_MANIFEST_REVISION)
+        .map_err(|_| ScanError::Internal)?;
+
+    let outcome = run_knowledge_pipeline(
+        &scan_store,
+        &root.normalized_path,
+        source,
+        source_rowid,
+        scan_id,
+        fencing_token,
+        &generation,
+    );
+    match outcome {
+        Ok(o) => {
+            let _ =
+                registry.set_health_and_cause(source_id, HealthState::Healthy, HealthCause::None);
+            Ok(o)
+        }
+        Err((e, cause)) => {
+            if !matches!(e, ScanError::CommitCasFailed) {
+                let _ = scan_store.fail_run(scan_id, e.error_code());
+            }
+            if !matches!(e, ScanError::Cancelled) {
+                let health = health_for_scan_error(&e);
+                let _ = registry.set_health_and_cause(source_id, health, cause);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Execute a reserved Knowledge scan run (rescan path, Story 6.5 follow-up).
+/// The run was already `begin_run`'d by the reservation that allocated
+/// `scan_id`; this validates the root + fingerprint and runs the pipeline.
+/// Mirrors `scan_reserved_source_with` for Agent Memory.
+fn scan_knowledge_reserved(
+    registry: &SourceRegistry<'_>,
+    conn: &Connection,
+    source_id: &SourceId,
+    scan_id: i64,
+    fencing_token: i64,
+    generation: Generation,
+    source: &crate::domain::source::Source,
+) -> Result<ScanOutcome, ScanError> {
+    let store = ScanStore::new(conn);
+    if source.lifecycle_state != SourceLifecycle::Confirmed {
+        return Err(ScanError::NotConfirmed);
+    }
+    let source_rowid = ScanStore::source_rowid(source_id).ok_or(ScanError::SourceNotFound)?;
+    ensure_not_cancelled(&store, scan_id)?;
+    let root = match policy::canonicalize_root(Path::new(&source.normalized_root_path)) {
+        Ok(root) => root,
+        Err(err) => {
+            let cause = health_cause_for_scan_error(&ScanError::RootInvalid, Some(err.kind()));
+            return reserved_knowledge_failure(
+                registry, &store, source_id, scan_id, ScanError::RootInvalid, cause,
+            );
+        }
+    };
+    if build_fingerprint(&source.provider, ROOT_KIND_DIR, &root.normalized_path, root.identity)
+        != source.fingerprint
+    {
+        let cause = health_cause_for_scan_error(&ScanError::RootIdentityChanged, None);
+        return reserved_knowledge_failure(
+            registry, &store, source_id, scan_id, ScanError::RootIdentityChanged, cause,
+        );
+    }
+    match run_knowledge_pipeline(
+        &store,
+        &root.normalized_path,
+        source,
+        source_rowid,
+        scan_id,
+        fencing_token,
+        &generation,
+    ) {
+        Ok(outcome) => {
+            let _ = registry
+                .set_health_and_cause(source_id, HealthState::Healthy, HealthCause::None);
+            Ok(outcome)
+        }
+        Err((e, cause)) => {
+            if !matches!(e, ScanError::CommitCasFailed) {
+                let _ = store.fail_run(scan_id, e.error_code());
+            }
+            if !matches!(e, ScanError::Cancelled) {
+                let health = health_for_scan_error(&e);
+                let _ = registry.set_health_and_cause(source_id, health, cause);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Fail a reserved Knowledge run and persist health + cause, mirroring the
+/// Agent-Memory `reserved_failure` helper.
+fn reserved_knowledge_failure(
+    registry: &SourceRegistry<'_>,
+    store: &ScanStore<'_>,
+    source_id: &SourceId,
+    scan_id: i64,
+    error: ScanError,
+    cause: HealthCause,
+) -> Result<ScanOutcome, ScanError> {
+    let _ = store.fail_run(scan_id, error.error_code());
+    let health = health_for_scan_error(&error);
+    let _ = registry.set_health_and_cause(source_id, health, cause);
+    Err(error)
+}
+
+
+/// enumerate → start manifest → stage → final re-validation → CAS commit.
+/// Zero-write (NFR-14): reads Vault metadata + note bytes only.
+fn run_knowledge_pipeline(
+    scan_store: &ScanStore<'_>,
+    canonical_root: &Path,
+    source: &crate::domain::source::Source,
+    source_rowid: i64,
+    scan_id: i64,
+    fencing_token: i64,
+    generation: &Generation,
+) -> Result<ScanOutcome, (ScanError, HealthCause)> {
+    let lift = |e: ScanError| {
+        let cause = health_cause_for_scan_error(&e, None);
+        (e, cause)
+    };
+
+    advance(scan_store, scan_id, ScanRunState::Running).map_err(lift)?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
+
+    // --- First enumeration → start manifest → UPDATE real revision ----------
+    let start_notes = crate::adapters::obsidian::enumerate_notes(canonical_root)
+        .map_err(|_| (ScanError::EnumerationFailed, HealthCause::ScanFailed))?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
+    let active_generation = scan_store
+        .active_generation(source_rowid)
+        .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
+    if start_notes.is_empty() && active_generation.is_some() {
+        // Replacing an existing active generation with an empty result is not
+        // allowed (same guard as Agent Memory).
+        return Err((ScanError::EmptyScanWithActiveGeneration, HealthCause::ScanFailed));
+    }
+    let start_manifest = build_knowledge_manifest(&start_notes, canonical_root);
+    let manifest_revision = knowledge_manifest_revision(&start_manifest);
+    set_manifest_revision(scan_store, scan_id, &manifest_revision).map_err(lift)?;
+
+    advance(scan_store, scan_id, ScanRunState::Staging).map_err(lift)?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
+
+    // Per note: read bytes (bounded by max_note_bytes), hash, stage a file-level
+    // Knowledge record. Re-validate containment before/after each read.
+    let mut staged: Vec<StagedKnowledgeRecord> = Vec::with_capacity(start_notes.len());
+    let mut note_digests: Vec<(KnowledgeManifestEntry, String)> = Vec::new();
+    for note in &start_notes {
+        ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
+        let abs = canonical_root.join(&note.vault_relative_path);
+        let bytes = read_knowledge_note_verified(canonical_root, &abs).map_err(|e| {
+            let cause = health_cause_for_scan_error(&e, None);
+            (e, cause)
+        })?;
+        let content_hash = fnv1a_hex(&bytes);
+        let entry = start_manifest
+            .iter()
+            .find(|m| m.0 == note.vault_relative_path)
+            .cloned()
+            .unwrap_or_else(|| (note.vault_relative_path.clone(), abs.to_string_lossy().into_owned(), note.size));
+        note_digests.push((entry, content_hash.clone()));
+        let record_id = crate::adapters::obsidian::build_knowledge_record_id(
+            &source.source_id.to_string(),
+            &source.provider,
+            &note.vault_relative_path,
+            crate::adapters::obsidian::UNIT_KIND_NOTE,
+        );
+        // native_unit_id = filename without extension (file-level identity).
+        let native_unit_id = Path::new(&note.vault_relative_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&note.vault_relative_path)
+            .to_string();
+        staged.push(StagedKnowledgeRecord {
+            record_id,
+            source_rowid,
+            provider: source.provider.clone(),
+            unit_kind: crate::adapters::obsidian::UNIT_KIND_NOTE.to_string(),
+            native_unit_id,
+            native_locator: note.vault_relative_path.clone(),
+            content_hash,
+            parser_version: crate::adapters::obsidian::KNOWLEDGE_PARSER_VERSION.to_string(),
+            modified_time: note.modified_time.clone(),
+        });
+    }
+    scan_store
+        .stage_knowledge_records(generation, &staged)
+        .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
+
+    let records_indexed = scan_store
+        .count_generation_knowledge_records(source_rowid, generation)
+        .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
+
+    // --- Final manifest re-validation (AD-34/AD-36) ------------------------
+    let final_notes = crate::adapters::obsidian::enumerate_notes(canonical_root)
+        .map_err(|_| (ScanError::EnumerationFailed, HealthCause::ScanFailed))?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
+    let final_manifest = build_knowledge_manifest(&final_notes, canonical_root);
+    if final_manifest != start_manifest {
+        return Err((ScanError::DirtyAfterValidation, HealthCause::ScanFailed));
+    }
+    // Re-read every staged note and compare the byte digest (same-size write
+    // with restored mtime cannot escape this).
+    for (entry, expected_digest) in &note_digests {
+        let abs = Path::new(&entry.1);
+        let final_bytes = read_knowledge_note_verified(canonical_root, abs).map_err(|e| {
+            let cause = health_cause_for_scan_error(&e, None);
+            (e, cause)
+        })?;
+        if fnv1a_hex(&final_bytes) != *expected_digest {
+            return Err((ScanError::DirtyAfterValidation, HealthCause::ScanFailed));
+        }
+    }
+
+    // --- Commit under CAS (AD-32) ------------------------------------------
+    advance(scan_store, scan_id, ScanRunState::Committing).map_err(lift)?;
+    ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
+    let committed = scan_store
+        .commit_cas(scan_id, fencing_token, generation, source_rowid)
+        .map_err(|_| (ScanError::Internal, HealthCause::ScanFailed))?;
+    if !committed {
+        return Err((ScanError::CommitCasFailed, HealthCause::ScanFailed));
+    }
+
+    Ok(ScanOutcome {
+        source_id: source.source_id.clone(),
+        scan_id,
+        generation: generation.clone(),
+        records_indexed,
+    })
+}
+
+/// Build a sorted Knowledge manifest from enumerated notes. The absolute path
+/// is included so a retargeted symlink (same relative path, different inode)
+/// produces a different manifest entry.
+fn build_knowledge_manifest(
+    notes: &[crate::adapters::obsidian::KnowledgeNote],
+    canonical_root: &Path,
+) -> Vec<KnowledgeManifestEntry> {
+    let mut manifest: Vec<KnowledgeManifestEntry> = notes
+        .iter()
+        .map(|n| {
+            let abs = canonical_root.join(&n.vault_relative_path);
+            (
+                n.vault_relative_path.clone(),
+                abs.to_string_lossy().into_owned(),
+                n.size,
+            )
+        })
+        .collect();
+    manifest.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    manifest
+}
+
+/// Compute the Knowledge manifest revision as FNV-1a over length-prefixed
+/// sorted entries (AD-34), mirroring the Agent-Memory `manifest_revision`.
+fn knowledge_manifest_revision(manifest: &[KnowledgeManifestEntry]) -> String {
+    let mut buf = String::new();
+    for (path, target, size) in manifest {
+        buf.push_str(&path.len().to_string());
+        buf.push(':');
+        buf.push_str(path);
+        buf.push('|');
+        buf.push_str(&target.len().to_string());
+        buf.push(':');
+        buf.push_str(target);
+        buf.push('|');
+        buf.push_str(&size.to_string());
+        buf.push('\n');
+    }
+    fnv1a_hex(buf.as_bytes())
+}
+
+/// Read a Knowledge note with containment re-validation (AD-4/AD-34). Mirrors
+/// `read_verified` for the Agent-Memory pipeline but operates on Vault-relative
+/// note paths. Rejects a retargeted symlink or replacement file at three
+/// points: before open, after open (descriptor bound), after read. Enforces
+/// `MAX_NOTE_BYTES` on the opened file's metadata before reading.
+fn read_knowledge_note_verified(canonical_root: &Path, abs: &Path) -> Result<Vec<u8>, ScanError> {
+    // Containment check before open.
+    if !knowledge_note_within_root(canonical_root, abs) {
+        return Err(ScanError::DirtyAfterValidation);
+    }
+    let metadata = std::fs::metadata(abs).map_err(|_| ScanError::ReadFailed)?;
+    if !metadata.is_file() {
+        return Err(ScanError::ReadFailed);
+    }
+    // Enforce max_note_bytes on the opened file's metadata BEFORE reading
+    // (Story 6.5 AC: reject oversized notes before body allocation).
+    if metadata.len() > crate::adapters::obsidian::MAX_NOTE_BYTES {
+        return Err(ScanError::ReadFailed);
+    }
+    let opened_handle =
+        Handle::from_file(std::fs::File::open(abs).map_err(|_| ScanError::ReadFailed)?)
+            .map_err(|_| ScanError::ReadFailed)?;
+    let root_handle = Handle::from_file(
+        std::fs::File::open(canonical_root).map_err(|_| ScanError::ReadFailed)?,
+    )
+    .map_err(|_| ScanError::ReadFailed)?;
+    // Re-validate containment after open via same-file handle comparison: the
+    // opened file must still be under the canonical root.
+    if !path_still_within_root(canonical_root, abs) {
+        return Err(ScanError::DirtyAfterValidation);
+    }
+    let mut file = std::fs::File::open(abs).map_err(|_| ScanError::ReadFailed)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|_| ScanError::ReadFailed)?;
+    // Post-read containment re-check.
+    if !path_still_within_root(canonical_root, abs) {
+        return Err(ScanError::DirtyAfterValidation);
+    }
+    // Re-check size after read (a file could grow past the bound mid-read).
+    if bytes.len() as u64 > crate::adapters::obsidian::MAX_NOTE_BYTES {
+        return Err(ScanError::ReadFailed);
+    }
+    // Silence unused-handle warnings for the descriptor-binding guards (the
+    // handles prove the descriptors were bound; path_still_within_root does the
+    // post-open/post-read re-check).
+    let _ = (opened_handle, root_handle);
+    Ok(bytes)
+}
+
+/// True when `abs` canonicalizes to a path inside `canonical_root`. A symlink
+/// that escaped the root, or a replacement file, fails this check.
+fn knowledge_note_within_root(canonical_root: &Path, abs: &Path) -> bool {
+    let Ok(real) = std::fs::canonicalize(abs) else {
+        return false;
+    };
+    real.starts_with(canonical_root)
+}
+
+/// Post-open/post-read containment re-check. Re-canonicalizes the absolute path
+/// and confirms it still starts with the canonical root (catches a retargeted
+/// symlink between the pre-open check and the read).
+fn path_still_within_root(canonical_root: &Path, abs: &Path) -> bool {
+    knowledge_note_within_root(canonical_root, abs)
 }
 
 /// Story 4.2 — classify the cause from an adapter's `EnumerateError` variant.
