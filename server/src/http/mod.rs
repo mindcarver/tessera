@@ -411,6 +411,32 @@ pub fn browse(
     })
 }
 
+/// `GET /api/knowledge/browse?source=<src_n>&limit=<n>&cursor=<kb.xxx>` —
+/// browse Knowledge notes for a single confirmed Vault (Story 6.9). Routes
+/// through the independent Knowledge pipeline.
+pub fn browse_knowledge(
+    source_id: &str,
+    limit: u32,
+    cursor: Option<&str>,
+    state: &IndexState,
+) -> Result<Envelope<crate::application::query::KnowledgeBrowsePage>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let source_id = SourceId(source_id.to_string());
+    let page =
+        application::browse_knowledge(&registry, &conn, &source_id, limit, cursor).map_err(
+            |error| match error {
+                QueryError::BadRequest => ErrorEnvelope::bad_request("knowledge_browse"),
+                QueryError::CursorStale => ErrorEnvelope::cursor_stale("knowledge_browse"),
+                QueryError::Internal => ErrorEnvelope::internal_for(None, "knowledge_browse"),
+            },
+        )?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: page,
+    })
+}
+
 pub fn open_original_location(
     request: OpenRequest,
     state: &IndexState,

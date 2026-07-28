@@ -42,12 +42,12 @@ use crate::domain::ports::provider_adapter::ProviderMemoryType;
 use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
-    add_mapping, browse, cancel_rescan_request, confirm_knowledge_source, confirm_source,
-    create_project, delete_project, disable_source, discover_knowledge_sources, discover_sources,
-    get_scan_status, knowledge_inventory, list_projects, list_sources, open_original_location, ping,
-    rebind_source, reject_knowledge_source, reject_source, remove_mapping, rename_project,
-    request_vault_picker, rescan_events, scan_source, search, source_inventory, start_rebuild,
-    start_rescan,
+    add_mapping, browse, browse_knowledge, cancel_rescan_request, confirm_knowledge_source,
+    confirm_source, create_project, delete_project, disable_source, discover_knowledge_sources,
+    discover_sources, get_scan_status, knowledge_inventory, list_projects, list_sources,
+    open_original_location, ping, rebind_source, reject_knowledge_source, reject_source,
+    remove_mapping, rename_project, request_vault_picker, rescan_events, scan_source, search,
+    source_inventory, start_rebuild, start_rescan,
 };
 use crate::IndexState;
 
@@ -336,6 +336,20 @@ fn route(
             };
             respond_result(request, browse(request_dto, state))
         }
+        // Story 6.9 — Knowledge Browse (per-vault note list).
+        (Method::Get, "/api/knowledge/browse") => {
+            let (ksource, klimit, kcursor) = match parse_knowledge_browse_query(query) {
+                Ok(v) => v,
+                Err(()) => {
+                    return request.respond(json_error(
+                        StatusCode(400),
+                        "bad_request",
+                        "The request did not match Tessera's knowledge browse contract.",
+                    ))
+                }
+            };
+            respond_result(request, browse_knowledge(&ksource, klimit, kcursor.as_deref(), state))
+        }
         (Method::Post, "/api/scan") => {
             let source_id = match read_source_id_body(&mut request) {
                 Ok(id) => id,
@@ -577,6 +591,25 @@ fn parse_search_query(query: &str) -> Result<SearchRequest, ()> {
 /// `memory_type` handling). An invalid value returns `Err(())` → `400
 /// bad_request` (phase `browse`), matching Search's invalid-memory-type
 /// behavior so the two surfaces share one vocabulary.
+/// Story 6.9 — parse the Knowledge Browse query params: `source` (required
+/// `src_<n>`), `limit` (default 20, max 100), `cursor` (optional `kb.<id>`).
+fn parse_knowledge_browse_query(query: &str) -> Result<(String, u32, Option<String>), ()> {
+    let mut source: Option<String> = None;
+    let mut limit: u32 = 20;
+    let mut cursor: Option<String> = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "source" => source = Some(percent_decode_bounded(value, 256).ok_or(())?),
+            "limit" => limit = value.parse::<u32>().map_err(|_| ())?.clamp(1, 100),
+            "cursor" => cursor = Some(percent_decode_bounded(value, 1024).ok_or(())?),
+            "" => {}
+            _ => return Err(()),
+        }
+    }
+    Ok((source.ok_or(())?, limit, cursor))
+}
+
 fn parse_browse_query(query: &str) -> Result<BrowseRequest, ()> {
     let mut source = None;
     let mut cursor = None;

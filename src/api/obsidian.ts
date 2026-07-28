@@ -265,3 +265,87 @@ export async function getKnowledgeInventory(): Promise<Envelope<KnowledgeInvento
     "Tessera core Knowledge Inventory response did not match the versioned envelope contract.",
   );
 }
+
+// --- Story 6.9 — Knowledge Browse -------------------------------------------
+
+/** A single Knowledge note result (mirrors Rust KnowledgeNoteResult). */
+export interface KnowledgeNoteResult {
+  record_id: string;
+  excerpt: string;
+  provider: string;
+  source_id: string;
+  vault_relative_path: string;
+  display_locator: string;
+  observed_at: number;
+  coverage_level: string;
+  modified_time: string | null;
+  health_state: string;
+}
+
+/** A BrowsePage for Knowledge notes (mirrors Rust KnowledgeBrowsePage). */
+export interface KnowledgeBrowsePage {
+  results: KnowledgeNoteResult[];
+  next_cursor: string | null;
+  empty_state: "not_yet_scanned" | "no_indexable_notes" | "source_unavailable" | "none";
+}
+
+function asKnowledgeNoteResult(value: unknown): KnowledgeNoteResult | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  if (
+    !isString(v.record_id) ||
+    !isString(v.excerpt) ||
+    !isString(v.provider) ||
+    !isString(v.source_id) ||
+    !isString(v.vault_relative_path) ||
+    !isString(v.display_locator) ||
+    !isNumber(v.observed_at) ||
+    !isString(v.coverage_level) ||
+    isOptionalStringOrNull(v.modified_time) === false ||
+    !isString(v.health_state)
+  ) {
+    return null;
+  }
+  return v as unknown as KnowledgeNoteResult;
+}
+
+/**
+ * Browse Knowledge notes for a single confirmed Vault (Story 6.9).
+ * Pass the Vault's `source_id`, a page `limit`, and the `next_cursor` from the
+ * previous page (or omit on page 1).
+ */
+export async function browseKnowledge(
+  sourceId: string,
+  limit: number,
+  cursor?: string,
+): Promise<Envelope<KnowledgeBrowsePage>> {
+  let path = `/api/knowledge/browse?source=${encodeURIComponent(sourceId)}&limit=${limit}`;
+  if (cursor) {
+    path += `&cursor=${encodeURIComponent(cursor)}`;
+  }
+  const raw = (await apiGet(path)) as unknown;
+  const envelope = raw as Envelope<unknown> | null;
+  if (envelope && envelope.api_version === API_VERSION && envelope.payload && typeof envelope.payload === "object") {
+    const payload = envelope.payload as Record<string, unknown>;
+    const validStates = new Set(["not_yet_scanned", "no_indexable_notes", "source_unavailable", "none"]);
+    if (
+      Array.isArray(payload.results) &&
+      payload.results.every((r) => asKnowledgeNoteResult(r) !== null) &&
+      isOptionalStringOrNull(payload.next_cursor) &&
+      typeof payload.empty_state === "string" &&
+      validStates.has(payload.empty_state)
+    ) {
+      return {
+        api_version: envelope.api_version,
+        payload: {
+          results: payload.results.map((r) => asKnowledgeNoteResult(r) as KnowledgeNoteResult),
+          next_cursor: (payload.next_cursor as string | null) ?? null,
+          empty_state: payload.empty_state as KnowledgeBrowsePage["empty_state"],
+        },
+      };
+    }
+  }
+  throwContractError(
+    "Tessera core Knowledge Browse response did not match the versioned envelope contract.",
+  );
+}

@@ -208,3 +208,71 @@ fn walk_snap(
         }
     }
 }
+
+/// Story 6.9 — Knowledge Browse returns paginated notes for a scanned Vault.
+#[test]
+fn browse_knowledge_returns_notes_after_scan() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("browse-vault");
+    fs::create_dir_all(vault.join("Notes")).unwrap();
+    fs::write(vault.join("Notes/alpha.md"), "# Alpha\nfirst note").unwrap();
+    fs::write(vault.join("Notes/beta.md"), "# Beta\nsecond note").unwrap();
+    fs::write(vault.join("Notes/gamma.md"), "no heading here").unwrap();
+
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source =
+        application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault)).unwrap();
+    application::scan_source(&registry, &conn, &source.source_id).unwrap();
+
+    // Browse with limit 2 → first page of 2, has_more.
+    let page = application::browse_knowledge(
+        &registry,
+        &conn,
+        &source.source_id,
+        2,
+        None,
+    )
+    .expect("browse");
+    assert_eq!(page.results.len(), 2, "first page has 2 notes");
+    assert!(page.next_cursor.is_some(), "has_more → next_cursor");
+    assert_eq!(page.empty_state, application::query::KnowledgeBrowseEmptyState::None);
+
+    // The titles are derived: Alpha/Beta (sorted by path: alpha < beta < gamma).
+    assert_eq!(page.results[0].excerpt.contains("Alpha"), true, "first is alpha");
+    assert_eq!(page.results[1].excerpt.contains("Beta"), true, "second is beta");
+
+    // Page 2: the remaining note (gamma), no next cursor.
+    let cursor = page.next_cursor.unwrap();
+    let page2 = application::browse_knowledge(
+        &registry,
+        &conn,
+        &source.source_id,
+        2,
+        Some(&cursor),
+    )
+    .expect("browse page 2");
+    assert_eq!(page2.results.len(), 1, "second page has 1 note (gamma)");
+    assert!(page2.next_cursor.is_none(), "last page");
+}
+
+/// Story 6.9 — Browse of a confirmed-but-never-scanned Vault returns an
+/// honest `not_yet_scanned` empty state.
+#[test]
+fn browse_knowledge_unscanned_vault_returns_not_yet_scanned() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vault = tmp.path().join("unscanned");
+    fs::create_dir_all(&vault).unwrap();
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+    let source =
+        application::confirm_knowledge_source(&registry, &knowledge_candidate(&vault)).unwrap();
+    // Note: NOT scanned.
+    let page =
+        application::browse_knowledge(&registry, &conn, &source.source_id, 20, None).unwrap();
+    assert!(page.results.is_empty());
+    assert_eq!(
+        page.empty_state,
+        application::query::KnowledgeBrowseEmptyState::NotYetScanned
+    );
+}

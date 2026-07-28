@@ -628,6 +628,129 @@ fn derive_status(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Story 6.9 — Knowledge (Obsidian Vault) Browse
+// ---------------------------------------------------------------------------
+
+/// A single Knowledge note result for Browse (Story 6.9). Mirrors the
+/// Agent-Memory `SearchResult` essentials but for the Knowledge domain.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnowledgeNoteResult {
+    pub record_id: String,
+    pub excerpt: String,
+    pub provider: String,
+    pub source_id: String,
+    /// Vault-relative path (user-visible provenance).
+    pub vault_relative_path: String,
+    pub display_locator: String,
+    pub observed_at: i64,
+    pub coverage_level: String,
+    pub modified_time: Option<String>,
+    pub health_state: String,
+}
+
+/// A BrowsePage for Knowledge notes (Story 6.9). Carries the page of notes,
+/// an optional next-page cursor (the last record's `record_id`), and an
+/// honest empty-state enum.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KnowledgeBrowsePage {
+    pub results: Vec<KnowledgeNoteResult>,
+    /// Opaque next-page cursor (`kb.<hex>`), or `None` on the last page.
+    pub next_cursor: Option<String>,
+    pub empty_state: KnowledgeBrowseEmptyState,
+}
+
+/// Knowledge Browse empty states (mirrors BrowseEmptyState semantics):
+/// not-yet-scanned / no-indexable-notes / source-unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeBrowseEmptyState {
+    NotYetScanned,
+    NoIndexableNotes,
+    SourceUnavailable,
+    None,
+}
+
+/// Browse Knowledge notes for a single confirmed Vault (Story 6.9).
+/// Single-source, query-less, `record_id`-cursor pagination. The cursor is
+/// `kb.<hex>` where hex encodes the last record's `record_id` (opaque to the
+/// caller). Returns the page + honest empty state on page 1.
+pub fn browse_knowledge(
+    registry: &SourceRegistry<'_>,
+    conn: &Connection,
+    source_id: &SourceId,
+    limit: u32,
+    cursor: Option<&str>,
+) -> Result<KnowledgeBrowsePage, QueryError> {
+    let store = ScanStore::new(conn);
+    let source = registry
+        .get(source_id)
+        .map_err(|_| QueryError::Internal)?
+        .ok_or(QueryError::BadRequest)?;
+    if source.lifecycle_state != SourceLifecycle::Confirmed {
+        return Err(QueryError::BadRequest);
+    }
+    let source_rowid =
+        ScanStore::source_rowid(source_id).ok_or(QueryError::BadRequest)?;
+    // Decode cursor: `kb.<record_id>` (the record_id is already opaque/hex-safe
+    // since it starts with `krec_`). None on page 1.
+    let after = match cursor {
+        Some(c) if c.starts_with("kb.") => Some(&c[3..]),
+        Some(_) => return Err(QueryError::CursorStale),
+        None => None,
+    };
+    let (rows, has_more) = store
+        .browse_knowledge_records(source_rowid, limit, after)
+        .map_err(|_| QueryError::Internal)?;
+    let results: Vec<KnowledgeNoteResult> = rows
+        .iter()
+        .map(|r| KnowledgeNoteResult {
+            record_id: r.record_id.clone(),
+            excerpt: r.excerpt.clone(),
+            provider: r.provider.clone(),
+            source_id: r.source_id.to_string(),
+            vault_relative_path: r.vault_relative_path.clone(),
+            display_locator: r.display_locator.clone(),
+            observed_at: r.observed_at,
+            coverage_level: r.coverage_level.clone(),
+            modified_time: r.modified_time.clone(),
+            health_state: r.health_state.as_str().to_string(),
+        })
+        .collect();
+    let next_cursor = if has_more {
+        results.last().map(|r| format!("kb.{}", r.record_id))
+    } else {
+        None
+    };
+    // Empty state on page 1 only.
+    let empty_state = if results.is_empty() && cursor.is_none() {
+        knowledge_browse_empty_state(&store, source_rowid)
+    } else {
+        KnowledgeBrowseEmptyState::None
+    };
+    Ok(KnowledgeBrowsePage {
+        results,
+        next_cursor,
+        empty_state,
+    })
+}
+
+fn knowledge_browse_empty_state(
+    store: &ScanStore<'_>,
+    source_rowid: i64,
+) -> KnowledgeBrowseEmptyState {
+    let active = store.active_generation(source_rowid).ok().flatten();
+    if let Some(latest) = store.latest_run(source_rowid).ok().flatten() {
+        if matches!(latest.state, ScanRunState::Failed | ScanRunState::Retry) {
+            return KnowledgeBrowseEmptyState::SourceUnavailable;
+        }
+    }
+    match active {
+        Some(_) => KnowledgeBrowseEmptyState::NoIndexableNotes,
+        None => KnowledgeBrowseEmptyState::NotYetScanned,
+    }
+}
+
 fn empty_state(
     registry: &SourceRegistry<'_>,
     store: &ScanStore<'_>,

@@ -15,6 +15,7 @@
  */
 import { useCallback, useEffect, useState, type ReactElement } from "react";
 import {
+  browseKnowledge,
   confirmKnowledgeSource,
   discoverKnowledgeSources,
   getKnowledgeInventory,
@@ -22,6 +23,7 @@ import {
   requestVaultPicker,
   type KnowledgeCandidate,
   type KnowledgeInventory,
+  type KnowledgeNoteResult,
 } from "../../api/obsidian";
 import { readTesseraErrorMessage } from "../../api/errors";
 import type { HealthState } from "../../api/sources";
@@ -94,9 +96,11 @@ function asHealthState(s: string): HealthState {
 function VaultCard({
   item,
   onRefresh,
+  onBrowse,
 }: {
   item: KnowledgeInventory;
   onRefresh: () => void;
+  onBrowse: () => void;
 }): ReactElement {
   const attention = item.health_state === "degraded" || item.health_state === "error";
   return (
@@ -121,6 +125,11 @@ function VaultCard({
           <div className="tsr-card__aside">
             <HealthPill state={asHealthState(item.health_state)} compact label={describeHealth(item.health_state)} />
             <div className="tsr-card__actions">
+              {item.complete_note_count !== null && item.complete_note_count > 0 ? (
+                <button type="button" className="tsr-btn tsr-btn--primary" onClick={onBrowse}>
+                  浏览笔记
+                </button>
+              ) : null}
               <button type="button" className="tsr-btn" onClick={onRefresh}>
                 刷新
               </button>
@@ -149,6 +158,15 @@ export function Obsidian(): ReactElement {
   const [inventory, setInventory] = useState<LoadState<KnowledgeInventory[]>>({ kind: "loading" });
   const [message, setMessage] = useState("");
   const [pickerBusy, setPickerBusy] = useState(false);
+  // Story 6.9 — Browse view state: which vault is being browsed + its notes.
+  const [browseVault, setBrowseVault] = useState<{ sourceId: string; vaultName: string } | null>(
+    null,
+  );
+  const [browseNotes, setBrowseNotes] = useState<LoadState<KnowledgeNoteResult[]>>({
+    kind: "loading",
+  });
+  const [browseCursor, setBrowseCursor] = useState<string | null>(null);
+  const browsePageSize = 20;
 
   const refreshInventory = useCallback(() => {
     getKnowledgeInventory()
@@ -175,6 +193,47 @@ export function Obsidian(): ReactElement {
     refreshDiscovery();
     refreshInventory();
   }, [refreshDiscovery, refreshInventory]);
+
+  // Story 6.9 — load the first page of notes for a vault.
+  const loadBrowse = useCallback(
+    (sourceId: string, vaultName: string) => {
+      setBrowseVault({ sourceId, vaultName });
+      setBrowseCursor(null);
+      setBrowseNotes({ kind: "loading" });
+      browseKnowledge(sourceId, browsePageSize)
+        .then((page) => {
+          setBrowseNotes({ kind: "ok", value: page.payload.results });
+          setBrowseCursor(page.payload.next_cursor);
+        })
+        .catch((error: unknown) =>
+          setBrowseNotes({ kind: "error", message: readTesseraErrorMessage(error) }),
+        );
+    },
+    [browsePageSize],
+  );
+
+  // Load more notes (next page), appending to the existing list.
+  const loadMoreNotes = useCallback(() => {
+    if (!browseVault || !browseCursor) return;
+    const cursor = browseCursor;
+    browseKnowledge(browseVault.sourceId, browsePageSize, cursor)
+      .then((page) => {
+        setBrowseNotes((prev) =>
+          prev.kind === "ok"
+            ? { kind: "ok", value: [...prev.value, ...page.payload.results] }
+            : prev,
+        );
+        setBrowseCursor(page.payload.next_cursor);
+      })
+      .catch((error: unknown) => setMessage(readTesseraErrorMessage(error)));
+  }, [browseVault, browseCursor]);
+
+  const exitBrowse = useCallback(() => {
+    setBrowseVault(null);
+    setBrowseNotes({ kind: "loading" });
+    setBrowseCursor(null);
+    refreshInventory();
+  }, [refreshInventory]);
 
   const resolveCandidate = useCallback(
     (candidate: KnowledgeCandidate, action: "confirm" | "reject") => {
@@ -215,6 +274,61 @@ export function Obsidian(): ReactElement {
 
   const diagnosticText =
     discovery.kind === "ok" ? describeDiagnostic(discovery.value.diagnostic) : null;
+
+  // Story 6.9 — Browse view (notes list for a single vault).
+  if (browseVault) {
+    return (
+      <section aria-label={`浏览 ${browseVault.vaultName} 笔记`} id="tessera-obsidian" className="tsr-section">
+        <h2 className="tsr-section__title">{browseVault.vaultName} · 笔记列表</h2>
+        <p aria-live="polite" className="visually-hidden-text">{message}</p>
+        <div className="tsr-rebuild">
+          <button type="button" className="tsr-btn" onClick={exitBrowse}>
+            ← 返回知识库清单
+          </button>
+        </div>
+        {browseNotes.kind === "loading" ? (
+          <p className="tsr-prose">正在加载笔记…</p>
+        ) : null}
+        {browseNotes.kind === "error" ? (
+          <p role="alert" className="tsr-prose">{browseNotes.message}</p>
+        ) : null}
+        {browseNotes.kind === "ok" && browseNotes.value.length === 0 ? (
+          <p className="tsr-prose">此知识库暂无可浏览的笔记。</p>
+        ) : null}
+        {browseNotes.kind === "ok" && browseNotes.value.length > 0 ? (
+          <>
+            <ul className="tsr-cards">
+              {browseNotes.value.map((note) => (
+                <li key={note.record_id} className="tsr-card">
+                  <article className="tsr-card__body">
+                    <div className="tsr-card__row">
+                      <div className="tsr-card__main">
+                        <div className="tsr-card__name">{note.vault_relative_path}</div>
+                        <code className="tsr-card__path">{note.display_locator}</code>
+                        <p className="tsr-card__meta">
+                          {new Date(note.observed_at * 1000).toLocaleString("zh-CN")}
+                        </p>
+                        <p className="tsr-prose" style={{ whiteSpace: "pre-wrap", marginTop: "0.5rem" }}>
+                          {note.excerpt}
+                        </p>
+                      </div>
+                    </div>
+                  </article>
+                </li>
+              ))}
+            </ul>
+            {browseCursor ? (
+              <div className="tsr-rebuild">
+                <button type="button" className="tsr-btn" onClick={loadMoreNotes}>
+                  加载更多
+                </button>
+              </div>
+            ) : null}
+          </>
+        ) : null}
+      </section>
+    );
+  }
 
   return (
     <section aria-label="Obsidian 知识库" id="tessera-obsidian" className="tsr-section">
@@ -314,7 +428,12 @@ export function Obsidian(): ReactElement {
         {inventory.kind === "ok" && inventory.value.length > 0 ? (
           <ul className="tsr-cards">
             {inventory.value.map((item) => (
-              <VaultCard key={item.source_id} item={item} onRefresh={refreshInventory} />
+              <VaultCard
+                key={item.source_id}
+                item={item}
+                onRefresh={refreshInventory}
+                onBrowse={() => loadBrowse(item.source_id, item.vault_name)}
+              />
             ))}
           </ul>
         ) : null}
