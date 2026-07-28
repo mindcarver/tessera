@@ -467,7 +467,7 @@ fn migrations_apply_canonical_records_and_rescan_cancellation_schema() {
     // `local_knowledge` Source kind for Phase C.0 Obsidian Knowledge); Story
     // 6.4 bumped 9→10 with the v9_knowledge_records migration (independent
     // Knowledge canonical table, AD-38).
-    assert_eq!(v, "10");
+    assert_eq!(v, "11");
 
     for table in ["scan_runs", "memory_records", "scan_diagnostics"] {
         let n: i64 = conn

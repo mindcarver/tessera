@@ -769,6 +769,7 @@ fn run_knowledge_pipeline(
 
     advance(scan_store, scan_id, ScanRunState::Running).map_err(lift)?;
     ensure_not_cancelled(scan_store, scan_id).map_err(lift)?;
+    let observed_at = unix_seconds_now();
 
     // --- First enumeration → start manifest → UPDATE real revision ----------
     let start_notes = crate::adapters::obsidian::enumerate_notes(canonical_root)
@@ -819,6 +820,12 @@ fn run_knowledge_pipeline(
             .and_then(|s| s.to_str())
             .unwrap_or(&note.vault_relative_path)
             .to_string();
+        // Story 6.9 — derive presentation fields from the note bytes. title =
+        // first `#`-heading line (or filename stem as fallback); body = the
+        // full UTF-8 note text (used for Browse excerpt display). display_locator
+        // = Vault-relative path (the user-visible provenance).
+        let body_str = String::from_utf8_lossy(&bytes).into_owned();
+        let title = knowledge_note_title(&body_str, &native_unit_id);
         staged.push(StagedKnowledgeRecord {
             record_id,
             source_rowid,
@@ -829,6 +836,11 @@ fn run_knowledge_pipeline(
             content_hash,
             parser_version: crate::adapters::obsidian::KNOWLEDGE_PARSER_VERSION.to_string(),
             modified_time: note.modified_time.clone(),
+            title,
+            body: body_str,
+            display_locator: note.vault_relative_path.clone(),
+            observed_at,
+            coverage_level: coverage_level_string(source.coverage_level).to_string(),
         });
     }
     scan_store
@@ -983,6 +995,22 @@ fn knowledge_note_within_root(canonical_root: &Path, abs: &Path) -> bool {
 /// symlink between the pre-open check and the read).
 fn path_still_within_root(canonical_root: &Path, abs: &Path) -> bool {
     knowledge_note_within_root(canonical_root, abs)
+}
+
+/// Derive a display title for a Knowledge note (Story 6.9). Uses the first
+/// Markdown `#`-heading line when present; otherwise falls back to the
+/// filename stem. Pure function of the note body + fallback, no I/O.
+fn knowledge_note_title(body: &str, fallback: &str) -> String {
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("# ") {
+            let title = rest.trim();
+            if !title.is_empty() {
+                return title.to_string();
+            }
+        }
+    }
+    fallback.to_string()
 }
 
 /// Story 4.2 — classify the cause from an adapter's `EnumerateError` variant.

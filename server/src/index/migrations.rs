@@ -114,11 +114,22 @@ pub static MIGRATIONS: &[Migration] = &[
     // locators, and a Knowledge parser version. Reuses the existing
     // `scan_runs` state machine and generation staging pattern (single mutation
     // path) but partitions records by table. Agent tables are untouched.
-    Migration {
-        id: 10,
-        name: "v9_knowledge_records",
-        apply: v9_knowledge_records,
-    },
+            Migration {
+                id: 10,
+                name: "v9_knowledge_records",
+                apply: v9_knowledge_records,
+            },
+            // Story 6.9 — add query-side columns to knowledge_records so Browse
+            // and Search can read derived title/body/locator/coverage without a
+            // second table. Mirrors what v3_canonical_memory_records did for
+            // memory_records. Additive ALTER TABLE ADD COLUMN (each with a
+            // safe NOT NULL DEFAULT); existing rows back-fill. No Agent-Memory
+            // table is touched (AD-19).
+            Migration {
+                id: 11,
+                name: "v10_knowledge_query_columns",
+                apply: v10_knowledge_query_columns,
+            },
 ];
 
 /// Ensure the meta tables exist on a fresh DB so [`apply`] can read
@@ -517,7 +528,26 @@ fn v9_knowledge_records(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Apply all pending migrations atomically (AD-29).
+/// v10 (migration id `11`) — add query-side columns to `knowledge_records`
+/// (Story 6.9). Mirrors what `v3_canonical_memory_records` did for
+/// `memory_records`: the staging table gains the derived presentation columns
+/// the read path (Browse/Search) needs. Each ADD COLUMN is NOT NULL with a
+/// safe default so existing rows back-fill; the scan pipeline overwrites them
+/// on the next scan. No Agent-Memory table is touched (AD-19).
+fn v10_knowledge_query_columns(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE knowledge_records ADD COLUMN title TEXT NOT NULL DEFAULT '';
+        ALTER TABLE knowledge_records ADD COLUMN body TEXT NOT NULL DEFAULT '';
+        ALTER TABLE knowledge_records ADD COLUMN display_locator TEXT NOT NULL DEFAULT '';
+        ALTER TABLE knowledge_records ADD COLUMN observed_at INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE knowledge_records ADD COLUMN coverage_level TEXT NOT NULL DEFAULT '';
+        "#,
+    )?;
+    Ok(())
+}
+
+
 ///
 /// Semantics:
 /// - Bring meta tables into existence so `schema_version` is readable on a
@@ -631,7 +661,7 @@ mod tests {
         // appended the local_knowledge source-kind activation (id 9), and
         // Story 6.4 appended the knowledge_records canonical table (id 10).
         // The `0` value remains reserved as the pre-migration sentinel.
-        assert_eq!(v, "10");
+        assert_eq!(v, "11");
     }
 
     #[test]
@@ -668,8 +698,8 @@ mod tests {
         // brings it to six; Story 5.1's v6_tessera_projects brings it to seven;
         // Story 5.2's v7_project_mapping_revision brings it to eight; Story 6.1's
         // v8_local_knowledge_source_kind brings it to nine; Story 6.4's
-        // v9_knowledge_records brings it to ten.
-        assert_eq!(count, 10, "exactly ten audit rows after idempotent re-run");
+        // v9_knowledge_records brings it to ten; Story 6.9's v10_knowledge_query_columns brings it to eleven.
+        assert_eq!(count, 11, "exactly eleven audit rows after idempotent re-run");
     }
 
     /// AD-29 / A-7: migration is atomic. If a later migration fails mid-batch,
@@ -697,7 +727,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema_version readable");
-        assert_eq!(pre_version, "10");
+        assert_eq!(pre_version, "11");
 
         // Simulate a failing follow-up migration. The failing migration
         // writes a sentinel table first, then errors; the atomic batch must
@@ -764,6 +794,11 @@ mod tests {
             },
             Migration {
                 id: 11,
+                name: "v10_knowledge_query_columns",
+                apply: v10_knowledge_query_columns,
+            },
+            Migration {
+                id: 12,
                 name: "partial_then_fail",
                 apply: partial_then_fail,
             },
@@ -820,7 +855,7 @@ mod tests {
             )
             .expect("schema_version still readable after rollback");
         assert_eq!(
-            post_version, "10",
+            post_version, "11",
             "schema_version must not advance on failure"
         );
 
@@ -832,7 +867,7 @@ mod tests {
             )
             .expect("count");
         assert_eq!(
-            audit_count, 10,
+            audit_count, 11,
             "no audit row recorded for the failed migration"
         );
 

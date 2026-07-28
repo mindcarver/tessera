@@ -117,7 +117,7 @@ fn migration_v1_source_registry_applies_and_sets_current_schema_version() {
         .expect("schema_version readable");
     assert_eq!(
         v, "10",
-        "schema_version must be 10 after Story 6.4 v9_knowledge_records migration"
+        "schema_version must be 11 after Story 6.9 v10_knowledge_query_columns migration"
     );
 
     // The table + unique index exist.

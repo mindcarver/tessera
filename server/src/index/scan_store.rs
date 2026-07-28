@@ -107,6 +107,12 @@ pub struct StagedKnowledgeRecord {
     pub content_hash: String,
     pub parser_version: String,
     pub modified_time: Option<String>,
+    /// Story 6.9 — derived presentation columns for Browse/Search.
+    pub title: String,
+    pub body: String,
+    pub display_locator: String,
+    pub observed_at: i64,
+    pub coverage_level: String,
 }
 
 /// A single row read back from `scan_runs` for status reporting.
@@ -307,8 +313,8 @@ impl<'a> ScanStore<'a> {
                 "INSERT INTO knowledge_records
                     (record_id, source_id, generation, provider, unit_kind,
                      native_unit_id, native_locator, content_hash, parser_version,
-                     modified_time)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     modified_time, title, body, display_locator, observed_at, coverage_level)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?;
             for r in records {
                 stmt.execute(params![
@@ -322,6 +328,11 @@ impl<'a> ScanStore<'a> {
                     r.content_hash,
                     r.parser_version,
                     r.modified_time,
+                    r.title,
+                    r.body,
+                    r.display_locator,
+                    r.observed_at,
+                    r.coverage_level,
                 ])?;
             }
         }
