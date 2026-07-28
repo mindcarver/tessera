@@ -182,6 +182,36 @@ pub struct SourceInventory {
     pub stale: bool,
 }
 
+/// A Knowledge (Obsidian Vault) Inventory row (Story 6.6). Parallel to
+/// [`SourceInventory`] but for `local_knowledge` Sources: carries the Vault
+/// identity, supported-note count, coverage, health, last-success scan, stale
+/// state, and safe latest error. The note count is sourced from the
+/// independent `knowledge_records` table (AD-38), never `memory_records`.
+///
+/// Truthful empty and failure states remain distinct (Story 6.6 AC): confirmed
+/// but never scanned, successful scan with zero notes, disabled, degraded with
+/// stale data, error with no usable generation, and scan-in-progress while the
+/// previous generation remains queryable are all distinguishable via
+/// `health_state` + `complete_note_count` + `stale`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeInventory {
+    pub source_id: SourceId,
+    /// Vault display name derived from the root path's final component.
+    pub vault_name: String,
+    pub provider: String,
+    pub root: String,
+    pub coverage_level: String,
+    pub health_state: crate::domain::source::HealthState,
+    pub last_successful_scan: Option<i64>,
+    /// Supported Markdown-note count when the Source has an active generation
+    /// and declares full coverage; `None` otherwise (never a disguised zero).
+    pub complete_note_count: Option<u64>,
+    pub latest_error: Option<String>,
+    pub cause: Option<crate::domain::source::HealthCause>,
+    pub stale: bool,
+    pub lifecycle_state: crate::domain::source::SourceLifecycle,
+}
+
 /// Application-layer scan error. Each variant maps onto a stable IPC error
 /// code in the IPC layer (AD-13). No body / credential / path detail is
 /// carried — the safe message lives in the IPC envelope constructor.

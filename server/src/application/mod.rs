@@ -59,6 +59,6 @@ pub use reconcile::{
     DEFAULT_DEBOUNCE, DEFAULT_PERIOD,
 };
 pub use scan::{
-    cancel_rescan, get_scan_status, list_inventory, recover_scans, scan_reserved_source,
-    scan_source, scan_source_with,
+    cancel_rescan, get_scan_status, list_inventory, list_knowledge_inventory, recover_scans,
+    scan_reserved_source, scan_source, scan_source_with,
 };

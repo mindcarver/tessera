@@ -717,6 +717,23 @@ impl<'a> ScanStore<'a> {
         Ok(count as u64)
     }
 
+    /// Count active Knowledge records for a Source (Story 6.6). Mirrors
+    /// [`count_active_records`] but reads the independent `knowledge_records`
+    /// table (AD-19/AD-38), not `memory_records`. Returns 0 when the Source
+    /// has no active generation yet (never scanned).
+    pub fn count_active_knowledge_records(&self, source_rowid: i64) -> rusqlite::Result<u64> {
+        let active = self.active_generation(source_rowid)?;
+        let Some(gen) = active else {
+            return Ok(0);
+        };
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_records WHERE source_id = ?1 AND generation = ?2",
+            params![source_rowid, gen.0],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// Most recent successfully completed scan. It is intentionally separate
     /// from `latest_run`: a failed/cancelled rescan must not erase this fact.
     pub fn last_successful_finished_at(&self, source_rowid: i64) -> rusqlite::Result<Option<i64>> {

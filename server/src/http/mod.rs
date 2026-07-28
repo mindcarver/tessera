@@ -439,6 +439,23 @@ pub fn source_inventory(
     })
 }
 
+/// `GET /api/knowledge/inventory` — Knowledge (Obsidian Vault) Inventory
+/// (Story 6.6). One row per confirmed local_knowledge Source, with supported-
+/// note count, coverage, health, last-success scan, stale state, and safe
+/// latest error. Agent-Memory Sources are never included (AD-19).
+pub fn knowledge_inventory(
+    state: &IndexState,
+) -> Result<Envelope<Vec<crate::domain::scan::KnowledgeInventory>>, ErrorEnvelope> {
+    let conn = lock_conn(state)?;
+    let registry = SourceRegistry::new(&conn);
+    let inventory = application::list_knowledge_inventory(&registry, &conn)
+        .map_err(|_| ErrorEnvelope::internal_for(None, "knowledge_inventory"))?;
+    Ok(Envelope {
+        api_version: API_VERSION,
+        payload: inventory,
+    })
+}
+
 // --- Story 5.1: Tessera Project mapping surface ---------------------------
 //
 // Six versioned, loopback-only endpoints under `/api/projects`. They all

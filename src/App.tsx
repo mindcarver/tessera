@@ -31,6 +31,7 @@
 import { useEffect, useState, type ReactElement } from "react";
 import { ping, type Pong } from "./api/ping";
 import { Sources } from "./features/sources/Sources";
+import { Obsidian } from "./features/obsidian/Obsidian";
 import { Search } from "./features/search/Search";
 import { Browse } from "./features/browse/Browse";
 import { Projects } from "./features/projects/Projects";
@@ -128,6 +129,7 @@ export function App(): ReactElement {
             })
           }
         />
+        <Obsidian />
         <Projects />
         <Search />
         <section aria-label="API ping status">{renderPingState(state)}</section>

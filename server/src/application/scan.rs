@@ -888,6 +888,71 @@ pub fn list_inventory(
         .collect()
 }
 
+/// List Knowledge (Obsidian Vault) Inventory rows (Story 6.6). Filters the
+/// Source Registry to `local_knowledge` Sources only and counts notes from
+/// the independent `knowledge_records` table. Agent-Memory Sources are never
+/// included (AD-19 domain separation).
+pub fn list_knowledge_inventory(
+    registry: &SourceRegistry<'_>,
+    conn: &Connection,
+) -> Result<Vec<crate::domain::scan::KnowledgeInventory>, ScanError> {
+    let store = ScanStore::new(conn);
+    registry
+        .list()
+        .map_err(|_| ScanError::Internal)?
+        .into_iter()
+        .filter(|s| {
+            s.source_kind == crate::domain::source::SourceKind::LocalKnowledge
+        })
+        .map(|source| {
+            let source_rowid =
+                ScanStore::source_rowid(&source.source_id).ok_or(ScanError::Internal)?;
+            let latest = store
+                .latest_run(source_rowid)
+                .map_err(|_| ScanError::Internal)?;
+            let latest_error = latest.as_ref().and_then(|run| {
+                (run.state == ScanRunState::Failed)
+                    .then(|| safe_error_reason(run.error_code.as_deref()))
+            });
+            let complete_note_count = matches!(source.coverage_level, CoverageLevel::Full)
+                .then(|| store.count_active_knowledge_records(source_rowid))
+                .transpose()
+                .map_err(|_| ScanError::Internal)?;
+            let active_generation = store
+                .active_generation(source_rowid)
+                .map_err(|_| ScanError::Internal)?;
+            let stale = matches!(
+                source.health_state,
+                HealthState::Degraded | HealthState::Error
+            ) && active_generation.is_some();
+            let cause = (source.health_cause != HealthCause::None)
+                .then_some(source.health_cause);
+            // Vault display name = final path component of the normalized root.
+            let vault_name = std::path::Path::new(&source.normalized_root_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&source.normalized_root_path)
+                .to_string();
+            Ok(crate::domain::scan::KnowledgeInventory {
+                source_id: source.source_id,
+                vault_name,
+                provider: source.provider,
+                root: source.normalized_root_path,
+                coverage_level: coverage_level_string(source.coverage_level).to_string(),
+                health_state: source.health_state,
+                last_successful_scan: store
+                    .last_successful_finished_at(source_rowid)
+                    .map_err(|_| ScanError::Internal)?,
+                complete_note_count,
+                latest_error: latest_error.or_else(|| (source.health_state == HealthState::Degraded).then(|| "Tessera could not access this vault.".to_string())),
+                cause,
+                stale,
+                lifecycle_state: source.lifecycle_state,
+            })
+        })
+        .collect()
+}
+
 fn safe_error_reason(error_code: Option<&str>) -> String {
     match error_code {
         Some("cancelled") => "The last rescan was cancelled.".to_string(),
