@@ -914,13 +914,25 @@ pub fn list_knowledge_inventory(
                 (run.state == ScanRunState::Failed)
                     .then(|| safe_error_reason(run.error_code.as_deref()))
             });
-            let complete_note_count = matches!(source.coverage_level, CoverageLevel::Full)
-                .then(|| store.count_active_knowledge_records(source_rowid))
-                .transpose()
-                .map_err(|_| ScanError::Internal)?;
             let active_generation = store
                 .active_generation(source_rowid)
                 .map_err(|_| ScanError::Internal)?;
+            // complete_note_count is Some ONLY when the Source declares full
+            // coverage AND has an active generation. A never-scanned Source
+            // returns None (truthful "not yet counted"), never Some(0) — a
+            // missing value must not masquerade as a real zero. A scanned
+            // Vault that genuinely has zero supported notes is Some(0).
+            let complete_note_count = if matches!(source.coverage_level, CoverageLevel::Full)
+                && active_generation.is_some()
+            {
+                Some(
+                    store
+                        .count_active_knowledge_records(source_rowid)
+                        .map_err(|_| ScanError::Internal)?,
+                )
+            } else {
+                None
+            };
             let stale = matches!(
                 source.health_state,
                 HealthState::Degraded | HealthState::Error
