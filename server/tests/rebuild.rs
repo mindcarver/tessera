@@ -1009,7 +1009,7 @@ fn reset_derived_data_wipes_four_targets_preserves_schema_version() {
             |row| row.get(0),
         )
         .expect("schema_version readable");
-    assert_eq!(schema_version, "8", "schema_version preserved");
+    assert_eq!(schema_version, "9", "schema_version preserved");
     let reserved: String = conn
         .query_row(
             "SELECT value FROM tessera_meta WHERE key = 'reserved'",

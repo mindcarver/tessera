@@ -91,6 +91,22 @@ pub static MIGRATIONS: &[Migration] = &[
         name: "v7_project_mapping_revision",
         apply: v7_project_mapping_revision,
     },
+    // Story 6.1 — activate the `local_knowledge` Source kind (Phase C.0 Obsidian
+    // Knowledge). This migration is intentionally additive and touches NO
+    // existing table: `source_registry.source_kind` is a free-form `TEXT NOT
+    // NULL` column (no CHECK constraint), so `local_knowledge` was already
+    // storable. The migration exists to (a) record the schema-versioned point
+    // at which Knowledge became a first-class persisted kind, and (b) seed a
+    // knowledge-pipeline marker that Story 6.4's `knowledge_records` table and
+    // `krec_` identity build on. Existing Agent rows are untouched (A-19/AD-19:
+    // Knowledge does not alias the Agent-Memory canonical schema). Unknown
+    // persisted kinds still fail closed at the registry read path
+    // (`row_to_source`), not here.
+    Migration {
+        id: 9,
+        name: "v8_local_knowledge_source_kind",
+        apply: v8_local_knowledge_source_kind,
+    },
 ];
 
 /// Ensure the meta tables exist on a fresh DB so [`apply`] can read
@@ -425,6 +441,27 @@ fn v7_project_mapping_revision(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// v8 (migration id `9`) — activate the `local_knowledge` Source kind
+/// (Story 6.1 / Phase C.0 Obsidian Knowledge).
+///
+/// This migration is **purely additive** and alters no existing table:
+/// `source_registry.source_kind` is `TEXT NOT NULL` with no CHECK constraint,
+/// so `local_knowledge` was already storable. The migration seeds a
+/// `knowledge_pipeline_revision` marker in `tessera_meta` that Story 6.4's
+/// independent `knowledge_records` canonical table and `krec_` identity build
+/// on, and records the schema-versioned point at which Knowledge became a
+/// first-class persisted domain (A-19/AD-19). Existing Agent-Memory rows are
+/// untouched; the kind-discrimination (`is_agent_memory`) and fail-closed
+/// registry read live in domain code, not here.
+fn v8_local_knowledge_source_kind(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO tessera_meta(key, value) \
+         VALUES ('knowledge_pipeline_revision', '0')",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Apply all pending migrations atomically (AD-29).
 ///
 /// Semantics:
@@ -534,10 +571,11 @@ mod tests {
         // (id 3), Story 1.5 appended v3_canonical_memory_records (id 4),
         // Story 1.8 appended durable rescan cancellation (id 5), Story 4.2
         // appended the structured source health cause (id 6), Story 5.1
-        // appended the Tessera Project mapping layer (id 7), and Story 5.2
-        // appended the project_mapping_revision seed (id 8).
+        // appended the Tessera Project mapping layer (id 7), Story 5.2
+        // appended the project_mapping_revision seed (id 8), and Story 6.1
+        // appended the local_knowledge source-kind activation (id 9).
         // The `0` value remains reserved as the pre-migration sentinel.
-        assert_eq!(v, "8");
+        assert_eq!(v, "9");
     }
 
     #[test]
@@ -572,8 +610,9 @@ mod tests {
         // v3_canonical_memory_records and v4_rescan_cancellation make the
         // idempotent baseline five audit rows; Story 4.2's v5_source_health_cause
         // brings it to six; Story 5.1's v6_tessera_projects brings it to seven;
-        // Story 5.2's v7_project_mapping_revision brings it to eight.
-        assert_eq!(count, 8, "exactly eight audit rows after idempotent re-run");
+        // Story 5.2's v7_project_mapping_revision brings it to eight; Story 6.1's
+        // v8_local_knowledge_source_kind brings it to nine.
+        assert_eq!(count, 9, "exactly nine audit rows after idempotent re-run");
     }
 
     /// AD-29 / A-7: migration is atomic. If a later migration fails mid-batch,
@@ -587,13 +626,13 @@ mod tests {
     /// v4_rescan_cancellation (id 5), v5_source_health_cause (id 6),
     /// v6_tessera_projects (id 7), and v7_project_mapping_revision (id 8).
     /// This test starts from a fully-migrated DB and simulates a failing
-    /// migration id 9.
+    /// migration id 10.
     #[test]
     fn failed_migration_batch_rolls_back_atomically() {
         let mut conn = Connection::open_in_memory().expect("open db");
         apply(&mut conn).expect("all shipping migrations apply on first boot");
 
-        // After all shipping migrations: schema_version = 8, eight audit rows.
+        // After all shipping migrations: schema_version = 9, nine audit rows.
         let pre_version: String = conn
             .query_row(
                 "SELECT value FROM tessera_meta WHERE key = 'schema_version'",
@@ -601,7 +640,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema_version readable");
-        assert_eq!(pre_version, "8");
+        assert_eq!(pre_version, "9");
 
         // Simulate a failing follow-up migration. The failing migration
         // writes a sentinel table first, then errors; the atomic batch must
@@ -658,6 +697,11 @@ mod tests {
             },
             Migration {
                 id: 9,
+                name: "v8_local_knowledge_source_kind",
+                apply: v8_local_knowledge_source_kind,
+            },
+            Migration {
+                id: 10,
                 name: "partial_then_fail",
                 apply: partial_then_fail,
             },
@@ -714,7 +758,7 @@ mod tests {
             )
             .expect("schema_version still readable after rollback");
         assert_eq!(
-            post_version, "8",
+            post_version, "9",
             "schema_version must not advance on failure"
         );
 
@@ -726,7 +770,7 @@ mod tests {
             )
             .expect("count");
         assert_eq!(
-            audit_count, 8,
+            audit_count, 9,
             "no audit row recorded for the failed migration"
         );
 

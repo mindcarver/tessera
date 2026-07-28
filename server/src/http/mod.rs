@@ -107,6 +107,43 @@ fn wrap_discover(candidates: Vec<CandidateSource>) -> Envelope<Vec<CandidateSour
     }
 }
 
+/// Story 6.2 — Knowledge (Obsidian Vault) discovery response payload. Carries
+/// the candidate vaults plus a stable diagnostic code when the Obsidian
+/// registry was missing/corrupt/unreadable (AD-37), so the UI can distinguish
+/// "no vaults registered" from "registry unreadable" without a silent empty
+/// set.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KnowledgeDiscoveryPayload {
+    pub candidates: Vec<CandidateSource>,
+    /// Stable snake_case wire string (`registry_missing` / `registry_unreadable`
+    /// / `registry_corrupt`), or `None` when the registry parsed cleanly.
+    pub diagnostic: Option<String>,
+}
+
+/// Story 6.2 — discover registered Obsidian Vaults. Routes through the
+/// independent Knowledge pipeline (`discover_obsidian_vaults`), never through
+/// `ProviderAdapter` (Story 6.1 AC).
+pub fn discover_knowledge_sources() -> Envelope<KnowledgeDiscoveryPayload> {
+    let result = application::discover_obsidian_vaults();
+    let diagnostic = result.diagnostic.map(|d| {
+        let code = match d {
+            crate::adapters::obsidian::RegistryDiagnostic::RegistryMissing => "registry_missing",
+            crate::adapters::obsidian::RegistryDiagnostic::RegistryUnreadable => {
+                "registry_unreadable"
+            }
+            crate::adapters::obsidian::RegistryDiagnostic::RegistryCorrupt => "registry_corrupt",
+        };
+        code.to_string()
+    });
+    Envelope {
+        api_version: API_VERSION,
+        payload: KnowledgeDiscoveryPayload {
+            candidates: result.candidates,
+            diagnostic,
+        },
+    }
+}
+
 // --- Story 1.3: confirm / reject / disable / list -------------------------
 //
 // These four handlers share the same shape: they take a typed input (a

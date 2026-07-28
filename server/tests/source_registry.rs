@@ -116,8 +116,8 @@ fn migration_v1_source_registry_applies_and_sets_current_schema_version() {
         )
         .expect("schema_version readable");
     assert_eq!(
-        v, "8",
-        "schema_version must be 8 after Story 5.2 v7_project_mapping_revision migration"
+        v, "9",
+        "schema_version must be 9 after Story 6.1 v8_local_knowledge_source_kind migration"
     );
 
     // The table + unique index exist.
@@ -148,6 +148,86 @@ fn migration_v1_source_registry_applies_and_sets_current_schema_version() {
         .expect("v1 audit row");
     assert_eq!(id, 2);
     assert_eq!(name, "v1_source_registry");
+}
+
+// ---------------------------------------------------------------------------
+// Story 6.1 — local_knowledge Source kind activation + fail-closed corruption
+// ---------------------------------------------------------------------------
+
+/// Story 6.1 AC: "persisted `source_kind=local_knowledge` becomes valid" and
+/// "unknown persisted source kinds fail closed with a safe corruption error".
+///
+/// This test inserts a `local_knowledge` row directly (simulating the Phase C.0
+/// Knowledge confirm path that Story 6.3 will exercise end-to-end) and asserts
+/// it round-trips back through `row_to_source` without coercion. It then
+/// inserts an unknown kind and asserts the registry read **errors** rather
+/// than silently defaulting to `agent_memory` (the pre-6.1 behavior).
+#[test]
+fn local_knowledge_source_kind_round_trips_and_unknown_fails_closed() {
+    let conn = fresh_db();
+    let registry = SourceRegistry::new(&conn);
+
+    // Insert a local_knowledge row directly (the Knowledge confirm path in
+    // Story 6.3 will go through the registry; here we exercise persistence +
+    // read-back in isolation).
+    conn.execute(
+        "INSERT INTO source_registry \
+         (provider, source_kind, lifecycle_state, health_state, coverage_level, \
+          normalized_root_path, fingerprint, native_project, health_cause) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+        rusqlite::params![
+            "obsidian",
+            "local_knowledge",
+            "confirmed",
+            "unknown",
+            "full",
+            "/tmp/vault",
+            "root-fingerprint/v1|test-knowledge",
+            "none",
+        ],
+    )
+    .expect("insert local_knowledge row");
+    let rowid = conn.last_insert_rowid();
+
+    let source = registry
+        .get(&SourceId(format!("src_{rowid}")))
+        .expect("registry read ok")
+        .expect("row present");
+    assert_eq!(
+        source.source_kind,
+        tessera_lib::domain::source::SourceKind::LocalKnowledge,
+        "local_knowledge must round-trip without coercion to agent_memory"
+    );
+    assert_eq!(source.provider, "obsidian");
+    assert!(!source.source_kind.is_agent_memory());
+
+    // Now insert a row with an UNKNOWN source_kind and assert the read fails
+    // closed (returns Err), rather than coercing to agent_memory.
+    conn.execute(
+        "INSERT INTO source_registry \
+         (provider, source_kind, lifecycle_state, health_state, coverage_level, \
+          normalized_root_path, fingerprint, native_project, health_cause) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+        rusqlite::params![
+            "mystery",
+            "quantum_knowledge", // not a valid kind
+            "confirmed",
+            "unknown",
+            "full",
+            "/tmp/mystery",
+            "root-fingerprint/v1|test-unknown",
+            "none",
+        ],
+    )
+    .expect("insert unknown-kind row");
+    let bad_rowid = conn.last_insert_rowid();
+
+    let read_result = registry.get(&SourceId(format!("src_{bad_rowid}")));
+    assert!(
+        read_result.is_err(),
+        "unknown source_kind must fail closed (return Err), not coerce; got {:?}",
+        read_result
+    );
 }
 
 // ---------------------------------------------------------------------------

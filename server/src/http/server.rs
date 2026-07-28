@@ -43,9 +43,10 @@ use crate::domain::source::SourceId;
 use crate::domain::CandidateSource;
 use crate::http::{
     add_mapping, browse, cancel_rescan_request, confirm_source, create_project, delete_project,
-    disable_source, discover_sources, get_scan_status, list_projects, list_sources,
-    open_original_location, ping, rebind_source, reject_source, remove_mapping, rename_project,
-    rescan_events, scan_source, search, source_inventory, start_rebuild, start_rescan,
+    disable_source, discover_knowledge_sources, discover_sources, get_scan_status, list_projects,
+    list_sources, open_original_location, ping, rebind_source, reject_source, remove_mapping,
+    rename_project, rescan_events, scan_source, search, source_inventory, start_rebuild,
+    start_rescan,
 };
 use crate::IndexState;
 
@@ -144,6 +145,11 @@ fn route(
     match (method, path) {
         (Method::Get, "/api/ping") => respond_ok(request, ping()),
         (Method::Get, "/api/sources/discover") => respond_ok(request, discover_sources()),
+        // Story 6.2 — Knowledge (Obsidian Vault) discovery. Independent pipeline
+        // (AD-19); never routes through ProviderAdapter (Story 6.1 AC).
+        (Method::Get, "/api/knowledge/discover") => {
+            respond_ok(request, discover_knowledge_sources())
+        }
         (Method::Post, "/api/sources/confirm") => {
             let candidate = match read_json_body::<ConfirmRequest>(&mut request) {
                 Ok(body) => body.candidate,

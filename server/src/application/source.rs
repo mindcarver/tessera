@@ -467,6 +467,24 @@ fn flip_lifecycle(
     }
 }
 
+/// Discover local Obsidian Vault Candidates (Story 6.2 / Phase C.0).
+///
+/// This is the Knowledge-pipeline counterpart to [`discover_sources`], but it
+/// deliberately does NOT route through [`adapter_for`] / `ProviderAdapter`
+/// (Story 6.1 AC: "source-kind dispatch cannot route Knowledge through
+/// `ProviderAdapter`"). Knowledge Sources use an independent canonical table,
+/// identity prefix, and parser version (AD-19/AD-38); discovery is the one
+/// surface they safely share with Agent Memory because [`CandidateSource`] is
+/// generic pre-confirmation metadata, not an Agent-Memory canonical model.
+///
+/// Returns candidates plus an optional diagnostic when the Obsidian registry
+/// was missing/corrupt/unreadable (AD-37). A registry problem never blocks
+/// Agent Memory — this function is called from a separate discovery path and
+/// any error is source-scoped (AD-13).
+pub fn discover_obsidian_vaults() -> crate::adapters::obsidian::DiscoveryResult {
+    crate::adapters::obsidian::discover()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
